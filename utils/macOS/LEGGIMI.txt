@@ -1,0 +1,21 @@
+ASE Studio – simulatore RISC-V (gem5) per Mac con Apple Silicon
+
+INSTALLAZIONE
+  1. Trascina "ASE Studio" nella cartella Applicazioni.
+  2. Primo avvio: l'app non è firmata da uno sviluppatore Apple, quindi
+     macOS la blocca. Aprila una volta, poi vai in
+     Impostazioni di Sistema > Privacy e sicurezza > "Apri comunque".
+     In alternativa, dal Terminale:
+       xattr -dr com.apple.quarantine "/Applications/ASE Studio.app"
+
+USO
+  - ASE Studio si apre nella sua finestra; chiudendola si ferma anche il server.
+  - I tuoi programmi e i risultati sono nella cartella "ASE Studio"
+    dentro la tua cartella Inizio (~/ASE Studio).
+  - Aggiornamenti: quando esce una nuova versione di ASE Studio o dei file
+    del simulatore compare il pulsante "Update"; dopo l'aggiornamento
+    chiudi e riapri l'app. I tuoi programmi e setup_default non vengono toccati.
+  - Log: ~/Library/Logs/ASE Studio.log
+
+Non serve installare altro: Python, gem5 e il compilatore RISC-V sono
+già inclusi nell'app.
