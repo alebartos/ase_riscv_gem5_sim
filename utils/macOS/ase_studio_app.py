@@ -180,15 +180,19 @@ def pull_update(discard_local_changes=False):
 
 
 def space_free(path: Path) -> Path:
-    """Map a path inside the app to the space-free link made by launcher.sh.
+    """Map a path to the space-free links made by launcher.sh.
 
-    The course Makefiles call $(CC) unquoted, and the app lives in
-    "ASE Studio.app"; the backend resolves symlinks, so undo that here."""
-    link = os.environ.get("ASE_STUDIO_TOOLS")
-    if link and " " in str(path):
-        real = Path(link).resolve()
-        if path.is_relative_to(real):
-            return Path(link) / path.relative_to(real)
+    The course Makefiles use $(CC) and $(ASE_STUDIO_DEMO_MK) unquoted, while
+    the app lives in "ASE Studio.app" and the workspace in "~/ASE Studio";
+    the backend resolves symlinks, so undo that here."""
+    if " " not in str(path):
+        return path
+    for variable in ("ASE_STUDIO_TOOLS", "ASE_STUDIO_WORKSPACE_LINK"):
+        link = os.environ.get(variable)
+        if link:
+            real = Path(link).resolve()
+            if path.is_relative_to(real):
+                return Path(link) / path.relative_to(real)
     return path
 
 
@@ -219,6 +223,15 @@ def reveal_submission_folder(archive_path):
 
 
 def main() -> int:
+    if hasattr(backend, "settings_env"):
+        make_env = backend.settings_env
+
+        def settings_env():
+            env = make_env()
+            if env.get("ASE_STUDIO_DEMO_MK"):
+                env["ASE_STUDIO_DEMO_MK"] = str(space_free(Path(env["ASE_STUDIO_DEMO_MK"])))
+            return env
+        backend.settings_env = settings_env
     if hasattr(backend, "toolchain_executables"):
         find_toolchain = backend.toolchain_executables
         backend.toolchain_executables = lambda value: tuple(
