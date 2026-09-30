@@ -43,6 +43,9 @@ mkdir -p "$WS" && /bin/cp -Rn "$RES/project/." "$WS/" 2>/dev/null
 [[ -f "$WS/setup_default" ]] || { echo "Impossibile creare la cartella di lavoro: $WS"; exit 1; }
 cd "$WS" || exit 1
 export ASE_STUDIO_HOST_ROOT="$WS"
+# Stesso motivo degli strumenti: i Makefile includono $(ASE_STUDIO_DEMO_MK)
+# senza virgolette, e la cartella di lavoro si chiama "ASE Studio".
+ln -sfn "$WS" "$LINK_DIR/workspace" && export ASE_STUDIO_WORKSPACE_LINK="$LINK_DIR/workspace"
 
 # ---- 3. ASE Studio aggiornato (se presente e funzionante), altrimenti quello incluso
 export ASE_STUDIO_DIR="$RES/ase_studio"
