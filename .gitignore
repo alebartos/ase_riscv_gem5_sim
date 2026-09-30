@@ -65,3 +65,8 @@ g5v_pipeline.txt
 
 # Default location for installation
 tools/
+
+.ase-studio.pid
+ASE Studio.app/
+Ferma ASE Studio.command
+dist/
