@@ -1,0 +1,30 @@
+# Keeps main aligned with cad-polito-it/ase_riscv_gem5_sim.
+# Uses the same API as GitHub's "Sync fork" button: a fast-forward when
+# possible, otherwise a merge commit on top of the macOS changes of this fork.
+# A conflict makes the run fail; resolve it locally and push.
+name: Sync upstream
+
+on:
+  schedule:
+    - cron: "17 4 * * *"   # every day at 04:17 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Merge upstream main
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          result=$(gh api -X POST "repos/${{ github.repository }}/merge-upstream" -f branch=main)
+          echo "$result"
+          echo "### Sync upstream" >> "$GITHUB_STEP_SUMMARY"
+          echo "$result" | jq -r '"- \(.message) (\(.merge_type))"' >> "$GITHUB_STEP_SUMMARY"
