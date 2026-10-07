@@ -9,14 +9,18 @@ and Python modules via @loader_path), then everything is ad-hoc signed.
 
 Build requirements (on the build machine only):
   brew install python@3.10 riscv64-elf-gcc riscv64-elf-binutils make
-  tools/gem5/build/RISCV/gem5.opt already compiled
+  tools/gem5/build/RISCV/gem5.opt compiled by utils/macOS/build_gem5.sh
 
-Usage:  utils/macOS/build_app.py [--no-dmg]
-Output: dist/ASE Studio.app, dist/ASE-Studio-<version>.dmg
+Usage:  utils/macOS/build_app.py [--no-dmg] [--simulator-repo OWNER/REPO]
+                                 [--gem5-repo OWNER/REPO]
+Output: dist/ASE Studio.app, dist/ASE-Studio-<version>.dmg and the gem5
+        update for the app (dist/gem5-macos-arm64.tar.gz + dist/gem5.json,
+        to attach to the GitHub release named GEM5_RELEASE)
 """
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import plistlib
@@ -24,6 +28,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tarfile
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -43,6 +48,18 @@ GCC = BREW / "opt/riscv64-elf-gcc"
 BINUTILS = BREW / "opt/riscv64-elf-binutils"
 GMAKE = BREW / "opt/make/bin/gmake"
 GEM5 = REPO / "tools/gem5"
+GEM5_PATCHES = HERE / "gem5_patches"
+# GitHub release (in --gem5-repo) that carries the gem5 update of the app.
+GEM5_RELEASE = "gem5-macos-arm64"
+GEM5_ASSET = DIST / f"{GEM5_RELEASE}.tar.gz"
+# Where the app looks for updates. The simulator files follow the official
+# repository whatever clone the app is built from; the gem5 update comes from
+# the release of the repository that publishes the macOS builds.
+SIMULATOR_REPO = "cad-polito-it/ase_riscv_gem5_sim"
+GEM5_MANIFEST = DIST / "gem5.json"
+
+sys.path.insert(0, str(HERE))
+import gem5_selftest  # noqa: E402
 
 # Files of the project that are copied into the user's workspace.
 PROJECT_PATHS = ["programs", "gem5", "setup_default", "ase_studio_branches.json",
@@ -84,6 +101,11 @@ def check_inputs() -> None:
                if not p.exists()]
     if missing:
         sys.exit("Mancano:\n  " + "\n  ".join(map(str, missing)))
+    ok, message = gem5_selftest.check(GEM5 / "build/RISCV/gem5.opt", GCC / "bin")
+    if not ok:
+        sys.exit(f"gem5.opt non è utilizzabile: {message}\n"
+                 "Ricompilalo con utils/macOS/build_gem5.sh")
+    log(f"gem5: {message}")
 
 
 def studio_version() -> str:
@@ -99,12 +121,12 @@ def make_skeleton() -> None:
     run("clang", "-fobjc-arc", "-O2", "-arch", "arm64", "-mmacosx-version-min=11.3",
         "-framework", "Cocoa", "-framework", "WebKit",
         "-o", CONTENTS / "MacOS/ASEStudio", HERE / "launcher.m")
-    for name in ("launcher.sh", "ase_studio_app.py"):
+    for name in ("launcher.sh", "ase_studio_app.py", "gem5_selftest.py"):
         shutil.copy2(HERE / name, RES / name)
     shutil.copy2(HERE / "AppIcon.icns", RES / "AppIcon.icns")
 
 
-def copy_project() -> None:
+def copy_project(simulator_repo: str, gem5_repo: str) -> None:
     log("Progetto modello e ASE Studio")
     tracked = output("git", "-C", REPO, "ls-files", "--", *PROJECT_PATHS).splitlines()
     for rel in tracked:
@@ -114,7 +136,7 @@ def copy_project() -> None:
             dst.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(src, dst)
     copytree(REPO / "ase_studio", RES / "ase_studio", skip={".git"})
-    write_versions()
+    write_versions(simulator_repo, gem5_repo)
 
 
 def github_repo(path: Path) -> str:
@@ -122,18 +144,44 @@ def github_repo(path: Path) -> str:
     return re.sub(r"^.*github\.com[:/]|\.git$", "", url)
 
 
-def write_versions() -> None:
+def write_versions(simulator_repo: str, gem5_repo: str) -> None:
     """Sources the app was built from; the in-app updater compares against them."""
     branches = json.loads((REPO / "ase_studio_branches.json").read_text())
     versions = {
         "studio": {"label": "ASE Studio", "repo": github_repo(REPO / "ase_studio"),
                    "branch": branches["studio"], "commit": ""},
-        "simulator": {"label": "Simulator", "repo": github_repo(REPO),
+        "simulator": {"label": "Simulator", "repo": simulator_repo,
                       "branch": branches["simulator"], "commit": ""},
     }
-    for key, path in (("studio", REPO / "ase_studio"), ("simulator", REPO)):
-        versions[key]["commit"] = output("git", "-C", path, "rev-parse", "HEAD").strip()
+    versions["studio"]["commit"] = output("git", "-C", REPO / "ase_studio",
+                                          "rev-parse", "HEAD").strip()
+    versions["simulator"]["commit"] = simulator_commit(simulator_repo, branches["simulator"])
+    versions["gem5"] = {"label": "gem5", "repo": gem5_repo,
+                        "release": GEM5_RELEASE, "commit": gem5_build_id()}
     (RES / "versions.json").write_text(json.dumps(versions, indent=2) + "\n")
+
+
+def simulator_commit(repo: str, branch: str) -> str:
+    """The commit of `repo` this clone is based on.
+
+    A fork has its own merge commits, which the official repository does not
+    know: compare against the last official commit already in this clone, or
+    the app would offer an update right away."""
+    for remote in output("git", "-C", REPO, "remote").split():
+        url = output("git", "-C", REPO, "remote", "get-url", remote).strip()
+        if re.sub(r"^.*github\.com[:/]|\.git$", "", url) == repo:
+            run("git", "-C", REPO, "fetch", "--quiet", remote, branch)
+            return output("git", "-C", REPO, "merge-base", "HEAD", "FETCH_HEAD").strip()
+    return output("git", "-C", REPO, "rev-parse", "HEAD").strip()
+
+
+def gem5_build_id() -> str:
+    """gem5 source commit plus the macOS patches applied on top of it."""
+    commit = output("git", "-C", GEM5, "rev-parse", "HEAD").strip()
+    patches = hashlib.sha256()
+    for patch in sorted(GEM5_PATCHES.glob("*.patch")):
+        patches.update(patch.read_bytes())
+    return f"{commit[:12]}+{patches.hexdigest()[:12]}"
 
 
 def copy_gem5() -> None:
@@ -294,6 +342,22 @@ def audit() -> None:
         raise SystemExit("Riferimenti non ricollegati:\n  " + "\n  ".join(bad))
 
 
+# --------------------------------------------------------------- gem5 update
+def make_gem5_update() -> None:
+    """Package the relinked, signed gem5.opt for the in-app gem5 update.
+
+    The updater installs it under Application Support next to a link to the
+    app's Frameworks, so @executable_path still finds the bundled Python."""
+    gem5 = RES / "gem5/build/RISCV/gem5.opt"
+    log(f"Aggiornamento gem5: {GEM5_ASSET.relative_to(REPO)}")
+    with tarfile.open(GEM5_ASSET, "w:gz") as tar:
+        tar.add(gem5, arcname="gem5.opt")
+    manifest = {"id": gem5_build_id(), "asset": GEM5_ASSET.name,
+                "sha256": hashlib.sha256(GEM5_ASSET.read_bytes()).hexdigest(),
+                "app": studio_version()}
+    GEM5_MANIFEST.write_text(json.dumps(manifest, indent=2) + "\n")
+
+
 # --------------------------------------------------------------- dmg
 def make_dmg() -> Path:
     dmg = DIST / f"ASE-Studio-{studio_version()}.dmg"
@@ -316,11 +380,16 @@ def make_dmg() -> Path:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--no-dmg", action="store_true", help="build only the .app")
+    parser.add_argument("--simulator-repo", default=SIMULATOR_REPO,
+                        help=f"GitHub repo of the simulator updates (default {SIMULATOR_REPO})")
+    parser.add_argument("--gem5-repo", default=None,
+                        help="GitHub repo whose release carries the gem5 update "
+                             "(default: this clone's origin)")
     args = parser.parse_args()
 
     check_inputs()
     make_skeleton()
-    copy_project()
+    copy_project(args.simulator_repo, args.gem5_repo or github_repo(REPO))
     copy_gem5()
     copy_python()
     copy_toolchain()
@@ -331,6 +400,7 @@ def main() -> int:
     sign()
     size = output("du", "-sh", APP).split()[0]
     log(f"App pronta: {APP} ({size}, richiede macOS {min_os}+)")
+    make_gem5_update()
     if not args.no_dmg:
         dmg = make_dmg()
         log(f"DMG pronto: {dmg} ({output('du', '-sh', dmg).split()[0]})")
