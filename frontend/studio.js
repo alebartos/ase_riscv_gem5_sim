@@ -602,20 +602,28 @@ function submissionAttachment(file) {
 }
 
 const PORTAL_ASE_SHORTCODE = "02GOLYG";
+const PORTAL_WEBSITE = "https://didattica.polito.it/";
 let portalState = {loggedIn: false, username: "", remembered: false, ssoAvailable: false};
+let portalCourses = null;
 let portalCoursesLoaded = false;
 let portalLoginResolver = null;
 let portalSsoUid = null;
+let portalReviewResolver = null;
+let elaboratiCourseId = null;
 
 function jsonRequest(body) {
   return {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)};
 }
 
 function updatePortalAccount() {
-  $("#portal-account-status").textContent = portalState.loggedIn
+  const status = portalState.loggedIn
     ? "Signed in as " + (portalState.username || "student") + "."
     : "Not signed in.";
-  $("#portal-account-button").textContent = portalState.loggedIn ? "Sign out" : "Sign in";
+  const action = portalState.loggedIn ? "Sign out" : "Sign in";
+  $("#portal-account-status").textContent = status;
+  $("#portal-account-button").textContent = action;
+  $("#elaborati-account").textContent = status;
+  $("#elaborati-account-button").textContent = action;
 }
 
 async function refreshPortalStatus() {
@@ -624,39 +632,55 @@ async function refreshPortalStatus() {
   } catch (_error) {
     portalState = {loggedIn: false, username: "", remembered: false, ssoAvailable: false};
   }
+  if (!portalState.loggedIn) portalCourses = null;
   updatePortalAccount();
 }
 
-function resetPortalCourses(label) {
-  const select = $("#portal-course");
-  select.innerHTML = '<option value="">' + escapeHtml(label) + "</option>";
-  select.disabled = true;
-  portalCoursesLoaded = false;
+// Runs a portal request, asking the student to sign in again once if the
+// session is missing or has expired.
+async function portalCall(request) {
+  try {
+    return await request();
+  } catch (error) {
+    if (error.status !== 401) throw error;
+    portalState.loggedIn = false;
+    portalCourses = null;
+    updatePortalAccount();
+    if (!(await portalSignIn())) throw error;
+    return await request();
+  }
 }
 
-async function loadPortalCourses() {
+function resetPortalCourses(select, label) {
+  select.innerHTML = '<option value="">' + escapeHtml(label) + "</option>";
+  select.disabled = true;
+  if (select === $("#portal-course")) portalCoursesLoaded = false;
+}
+
+async function loadPortalCourses(select = $("#portal-course")) {
   if (!portalState.loggedIn) {
-    resetPortalCourses("Sign in to load your courses");
-    return;
+    resetPortalCourses(select, "Sign in to load your courses");
+    return false;
   }
-  const select = $("#portal-course");
-  resetPortalCourses("Loading courses…");
+  resetPortalCourses(select, "Loading courses…");
   try {
-    const data = await api("/api/portal/courses");
+    if (!portalCourses) portalCourses = (await portalCall(() => api("/api/portal/courses"))).courses;
     const saved = localStorage.getItem("ase-studio-portal-course");
-    select.innerHTML = '<option value="">Choose a course</option>' + data.courses.map(course =>
+    select.innerHTML = '<option value="">Choose a course</option>' + portalCourses.map(course =>
       '<option value="' + course.id + '">' + escapeHtml(course.name)
       + (course.shortcode ? " · " + escapeHtml(course.shortcode) : "") + "</option>"
     ).join("");
-    const preferred = data.courses.find(course => String(course.id) === saved)
-      || data.courses.find(course => course.shortcode === PORTAL_ASE_SHORTCODE);
+    const preferred = portalCourses.find(course => String(course.id) === saved)
+      || portalCourses.find(course => course.shortcode === PORTAL_ASE_SHORTCODE);
     select.value = preferred ? String(preferred.id) : "";
     select.disabled = false;
-    portalCoursesLoaded = true;
+    if (select === $("#portal-course")) portalCoursesLoaded = true;
+    return true;
   } catch (error) {
     if (error.status === 401) await refreshPortalStatus();
-    resetPortalCourses(portalState.loggedIn ? "Courses unavailable" : "Sign in to load your courses");
+    resetPortalCourses(select, portalState.loggedIn ? "Courses unavailable" : "Sign in to load your courses");
     await showActionMessage("Portale della Didattica", error.message);
+    return false;
   }
 }
 
@@ -678,6 +702,9 @@ function portalSignIn() {
   $("#portal-username").value = portalState.username || "";
   $("#portal-password").value = "";
   $("#portal-remember").checked = localStorage.getItem("ase-studio-portal-remember") === "1";
+  $("#portal-remember-note").textContent = portalState.keyring
+    ? "(stored in the " + portalState.keyring + ")"
+    : "(stored in a file only you can read)";
   $("#portal-login-sso").hidden = !portalState.ssoAvailable;
   showPortalLoginMessage("");
   setPortalLoginBusy(false);
@@ -696,7 +723,10 @@ function finishPortalLogin(signedIn) {
   if (dialog.open) dialog.close();
   const resolver = portalLoginResolver;
   portalLoginResolver = null;
-  if (signedIn) portalCoursesLoaded = false;
+  if (signedIn) {
+    portalCourses = null;
+    portalCoursesLoaded = false;
+  }
   updatePortalAccount();
   if (resolver) resolver(signedIn);
 }
@@ -754,15 +784,20 @@ async function startPortalSso() {
   }
 }
 
+async function portalSignOut() {
+  try {
+    portalState = await api("/api/portal/logout", jsonRequest({}));
+  } catch (error) {
+    await showActionMessage("Portale della Didattica", error.message);
+  }
+  portalCourses = null;
+  updatePortalAccount();
+  resetPortalCourses($("#portal-course"), "Sign in to load your courses");
+}
+
 async function togglePortalAccount() {
   if (portalState.loggedIn) {
-    try {
-      portalState = await api("/api/portal/logout", jsonRequest({}));
-    } catch (error) {
-      await showActionMessage("Portale della Didattica", error.message);
-    }
-    updatePortalAccount();
-    resetPortalCourses("Sign in to load your courses");
+    await portalSignOut();
     return;
   }
   if (await portalSignIn()) await loadPortalCourses();
@@ -786,27 +821,102 @@ function appendSubmissionLog(text) {
   updateLog();
 }
 
+function formatPortalDate(value) {
+  const date = new Date(value);
+  return value && !Number.isNaN(date.getTime()) ? date.toLocaleString() : (value || "—");
+}
+
+function saveSubmissionZip(archive) {
+  const link = document.createElement("a");
+  link.href = "/api/submission/download?archive=" + encodeURIComponent(archive);
+  link.download = "";
+  document.body.append(link);
+  link.click();
+  link.remove();
+}
+
+async function offerManualUpload(archive, reason) {
+  saveSubmissionZip(archive);
+  appendSubmissionLog("Saving the ZIP for manual upload. Upload it on the Portale della Didattica: "
+    + "open the course, then Elaborati.");
+  const choice = await actionDialog({
+    title: "Save ZIP for manual upload",
+    message: (reason ? reason + "\n\n" : "")
+      + "Choose where to save the ZIP, then upload it yourself on the Portale della Didattica: open the course page and use the Elaborati section.",
+    confirmLabel: "Open Portale", confirmValue: "portal",
+    cancelLabel: "Close"
+  });
+  if (choice === "portal") window.open(PORTAL_WEBSITE, "_blank", "noopener");
+}
+
+function reviewPortalUpload(preview, courseName) {
+  $("#portal-review-course").textContent = courseName;
+  $("#portal-review-file").textContent = preview.filename;
+  $("#portal-review-size").textContent = formatSubmissionFileSize(preview.size);
+  $("#portal-review-description").value = preview.description;
+  $("#portal-review-contents-title").textContent = "Contents · " + preview.entries.length + " file(s)";
+  $("#portal-review-entries").innerHTML = preview.entries.map(entry =>
+    '<div class="submission-file-entry"><strong title="' + escapeHtml(entry.path) + '">' + escapeHtml(entry.path)
+    + "</strong><span>" + formatSubmissionFileSize(entry.size) + "</span></div>"
+  ).join("");
+  $("#portal-review-existing").hidden = !preview.existing.length;
+  $("#portal-review-existing-list").innerHTML = preview.existing.map(entry =>
+    '<div class="submission-file-entry"><strong>' + escapeHtml(entry.filename) + "</strong><span>"
+    + escapeHtml(formatPortalDate(entry.uploadedAt)) + " · " + entry.sizeInKiloBytes + " KiB</span></div>"
+  ).join("");
+  document.querySelector('[name="portal-review-replace"][value="replace"]').checked = true;
+  $("#portal-review-dialog").showModal();
+  $("#portal-review-confirm").focus();
+  return new Promise(resolve => { portalReviewResolver = resolve; });
+}
+
+function finishPortalReview(decision) {
+  const dialog = $("#portal-review-dialog");
+  if (dialog.open) dialog.close();
+  const resolver = portalReviewResolver;
+  portalReviewResolver = null;
+  if (resolver) resolver(decision);
+}
+
+// Returns true when the ZIP was handed off (uploaded or saved for manual
+// upload), false when it stays only in the submission folder.
 async function uploadSubmissionToPortal(archive, courseId, courseName) {
-  appendSubmissionLog("Uploading to the Elaborati of " + courseName + "…");
+  let preview;
+  try {
+    preview = await portalCall(() => api("/api/portal/preview", jsonRequest({archive, courseId})));
+  } catch (error) {
+    appendSubmissionLog("Upload failed: " + error.message);
+    await offerManualUpload(archive, "The upload could not be prepared: " + error.message);
+    return true;
+  }
+  const decision = await reviewPortalUpload(preview, courseName);
+  if (decision.action === "manual") {
+    await offerManualUpload(archive);
+    return true;
+  }
+  if (decision.action !== "upload") {
+    appendSubmissionLog("Upload cancelled. The ZIP is saved in the submission folder only.");
+    return false;
+  }
+  appendSubmissionLog("Uploading " + preview.filename + " to the Elaborati of " + courseName + "…");
   $("#submit").textContent = "Uploading…";
-  let replace = null;
-  let signedInAgain = false;
+  let replace = preview.existing.length ? decision.replace : null;
   while (true) {
     try {
-      const upload = await api("/api/portal/upload", jsonRequest({archive, courseId, replace}));
+      const upload = await portalCall(() => api("/api/portal/upload", jsonRequest({
+        archive, courseId, description: decision.description, replace
+      })));
       if (upload.conflict) {
-        const previous = upload.existing.map(entry =>
-          "• " + entry.filename + " (" + entry.sizeInKiloBytes + " KiB, " + entry.uploadedAt + ")").join("\n");
+        // Someone uploaded the same file since the review; ask again.
         const choice = await actionDialog({
           title: "Elaborato already uploaded",
-          message: "The course's Elaborati already contain:\n" + previous
-            + "\n\nReplace withdraws the previous copy after the new upload is confirmed.",
+          message: "The course's Elaborati now already contain " + upload.existing[0].filename + ".",
           confirmLabel: "Replace", confirmValue: "replace",
           alternateLabel: "Keep both", alternateValue: "keep",
           cancelLabel: "Don't upload"
         });
         if (choice !== "replace" && choice !== "keep") {
-          appendSubmissionLog("Upload skipped. The ZIP is saved locally only.");
+          appendSubmissionLog("Upload cancelled. The ZIP is saved in the submission folder only.");
           return false;
         }
         replace = choice === "replace";
@@ -815,7 +925,7 @@ async function uploadSubmissionToPortal(archive, courseId, courseName) {
       const lines = [];
       if (upload.assignment) {
         lines.push("Uploaded to Elaborati: " + upload.assignment.filename + " ("
-          + upload.assignment.sizeInKiloBytes + " KiB, " + upload.assignment.uploadedAt + ").");
+          + upload.assignment.sizeInKiloBytes + " KiB, " + formatPortalDate(upload.assignment.uploadedAt) + ").");
       } else {
         lines.push("Uploaded " + upload.filename + " to Elaborati.");
       }
@@ -824,16 +934,99 @@ async function uploadSubmissionToPortal(archive, courseId, courseName) {
       appendSubmissionLog(lines.join("\n"));
       return true;
     } catch (error) {
-      if (error.status === 401 && !signedInAgain) {
-        signedInAgain = true;
-        portalState.loggedIn = false;
-        updatePortalAccount();
-        if (await portalSignIn()) continue;
-      }
-      appendSubmissionLog("Upload failed: " + error.message + "\nThe ZIP is saved locally only.");
-      return false;
+      appendSubmissionLog("Upload failed: " + error.message);
+      await offerManualUpload(archive, "The upload failed: " + error.message);
+      return true;
     }
   }
+}
+
+function renderElaboratiMessage(message) {
+  $("#elaborati-list").innerHTML = '<p class="elaborati-empty">' + escapeHtml(message) + "</p>";
+}
+
+function renderElaborati(assignments) {
+  if (!assignments.length) {
+    renderElaboratiMessage("No Elaborati uploaded for this course.");
+    return;
+  }
+  $("#elaborati-list").innerHTML = assignments.map(entry => {
+    const withdrawn = Boolean(entry.deletedAt);
+    const name = entry.url
+      ? '<a href="' + escapeHtml(entry.url) + '" target="_blank" rel="noreferrer" title="Download from the Portale">' + escapeHtml(entry.filename) + "</a>"
+      : escapeHtml(entry.filename);
+    return '<div class="elaborato' + (withdrawn ? " withdrawn" : "") + '">'
+      + '<div class="elaborato-main"><strong>' + name + "</strong>"
+      + "<small>" + escapeHtml(entry.description || "") + "</small></div>"
+      + '<div class="elaborato-meta"><span>' + escapeHtml(formatPortalDate(entry.uploadedAt)) + "</span>"
+      + "<span>" + entry.sizeInKiloBytes + " KiB</span>"
+      + '<span class="elaborato-status">' + (withdrawn ? "Withdrawn " + escapeHtml(formatPortalDate(entry.deletedAt)) : "Active") + "</span></div>"
+      + '<button type="button" data-elaborato="' + entry.id + '" data-filename="' + escapeHtml(entry.filename) + '" data-withdraw="' + (!withdrawn) + '"'
+      + (withdrawn ? ">Restore" : ' class="danger">Withdraw') + "</button></div>";
+  }).join("");
+}
+
+async function loadElaborati() {
+  const courseId = Number($("#elaborati-course").value) || null;
+  elaboratiCourseId = courseId;
+  $("#elaborati-refresh").disabled = !courseId;
+  if (!courseId) {
+    renderElaboratiMessage(portalState.loggedIn ? "Choose a course." : "Sign in to see your Elaborati.");
+    return;
+  }
+  localStorage.setItem("ase-studio-portal-course", String(courseId));
+  renderElaboratiMessage("Loading Elaborati…");
+  try {
+    const data = await portalCall(() => api("/api/portal/assignments?courseId=" + courseId));
+    if (elaboratiCourseId === courseId) renderElaborati(data.assignments);
+  } catch (error) {
+    await refreshPortalStatus();
+    renderElaboratiMessage(error.message);
+  }
+}
+
+async function changeElaborato(button) {
+  const assignmentId = Number(button.dataset.elaborato);
+  const withdrawn = button.dataset.withdraw === "true";
+  const courseId = elaboratiCourseId;
+  if (withdrawn) {
+    const confirmed = await actionDialog({
+      title: "Withdraw Elaborato",
+      message: "Withdraw " + button.dataset.filename + " from the course's Elaborati? You can restore it later.",
+      confirmLabel: "Withdraw", cancelLabel: "Cancel", danger: true
+    });
+    if (confirmed !== true) return;
+  }
+  button.disabled = true;
+  try {
+    const data = await portalCall(() => api("/api/portal/assignment",
+      jsonRequest({courseId, assignmentId, withdrawn})));
+    if (elaboratiCourseId === courseId) renderElaborati(data.assignments);
+  } catch (error) {
+    button.disabled = false;
+    await showActionMessage("Elaborati", error.message);
+  }
+}
+
+async function openElaborati() {
+  await refreshPortalStatus();
+  renderElaboratiMessage(portalState.loggedIn ? "Loading courses…" : "Sign in to see your Elaborati.");
+  resetPortalCourses($("#elaborati-course"), "Sign in to load your courses");
+  $("#elaborati-refresh").disabled = true;
+  $("#elaborati-dialog").showModal();
+  if (!portalState.loggedIn && !(await portalSignIn())) return;
+  if (await loadPortalCourses($("#elaborati-course"))) await loadElaborati();
+}
+
+async function toggleElaboratiAccount() {
+  if (portalState.loggedIn) {
+    await portalSignOut();
+    resetPortalCourses($("#elaborati-course"), "Sign in to load your courses");
+    $("#elaborati-refresh").disabled = true;
+    renderElaboratiMessage("Sign in to see your Elaborati.");
+    return;
+  }
+  if ((await portalSignIn()) && (await loadPortalCourses($("#elaborati-course")))) await loadElaborati();
 }
 
 async function submitAssignment() {
@@ -851,7 +1044,7 @@ async function submitAssignment() {
     $("#portal-upload").checked = portalUpload;
     $("#portal-upload-options").hidden = !portalUpload;
     await refreshPortalStatus();
-    if (!portalState.loggedIn) resetPortalCourses("Sign in to load your courses");
+    if (!portalState.loggedIn) resetPortalCourses($("#portal-course"), "Sign in to load your courses");
     $("#submission-dialog").showModal();
     $("#submission-assignment").focus();
     if (portalUpload && portalState.loggedIn && !portalCoursesLoaded) loadPortalCourses();
@@ -860,8 +1053,9 @@ async function submitAssignment() {
   }
 }
 
-async function prepareSubmission() {
+async function prepareSubmission(mode = "submit") {
   if (!current) return;
+  const manualUpload = mode === "manual";
   const assignment = $("#submission-assignment").value.trim();
   if (!/^[A-Za-z][A-Za-z0-9_-]{0,63}$/.test(assignment)) {
     await showActionMessage("Invalid assignment name",
@@ -889,7 +1083,7 @@ async function prepareSubmission() {
     await showActionMessage("Prepare submission", "Additional files exceed the combined 100 MiB limit.");
     return;
   }
-  const portalUpload = $("#portal-upload").checked;
+  const portalUpload = !manualUpload && $("#portal-upload").checked;
   let portalCourseId = null;
   let portalCourseName = "";
   if (portalUpload) {
@@ -961,7 +1155,10 @@ async function prepareSubmission() {
     lastAdvancedLog = result.advancedOutput || result.output;
     updateLog();
     let uploaded = false;
-    if (result.ok && result.archive && portalUpload) {
+    if (result.ok && result.archive && manualUpload) {
+      await offerManualUpload(result.archive);
+      uploaded = true;
+    } else if (result.ok && result.archive && portalUpload) {
       uploaded = await uploadSubmissionToPortal(result.archive, portalCourseId, portalCourseName);
     }
     if (result.ok && result.archive && !uploaded) {
@@ -2265,6 +2462,38 @@ $("#submission-form").onsubmit = event => {
   event.preventDefault();
   prepareSubmission();
 };
+$("#submission-manual").onclick = () => {
+  if ($("#submission-form").reportValidity()) prepareSubmission("manual");
+};
+$("#portal-review-form").onsubmit = event => {
+  event.preventDefault();
+  const description = $("#portal-review-description").value.trim();
+  if (!description) {
+    $("#portal-review-description").focus();
+    return;
+  }
+  finishPortalReview({
+    action: "upload",
+    description,
+    replace: document.querySelector('[name="portal-review-replace"]:checked').value === "replace"
+  });
+};
+$("#portal-review-manual").onclick = () => finishPortalReview({action: "manual"});
+$("#portal-review-cancel").onclick = () => finishPortalReview({action: "cancel"});
+$("#portal-review-dialog").addEventListener("cancel", event => {
+  event.preventDefault();
+  finishPortalReview({action: "cancel"});
+});
+$("#elaborati").onclick = openElaborati;
+$("#elaborati-close").onclick = () => $("#elaborati-dialog").close();
+$("#elaborati-form").onsubmit = event => event.preventDefault();
+$("#elaborati-course").onchange = loadElaborati;
+$("#elaborati-refresh").onclick = loadElaborati;
+$("#elaborati-account-button").onclick = toggleElaboratiAccount;
+$("#elaborati-list").addEventListener("click", event => {
+  const button = event.target.closest("button[data-elaborato]");
+  if (button) changeElaborato(button);
+});
 $("#cancel-config").onclick = () => $("#cpu-dialog").close();
 $("#cancel-environment").onclick = () => $("#environment-dialog").close();
 $("#import-environment").onclick = () => $("#environment-import-file").click();

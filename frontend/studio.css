@@ -331,6 +331,33 @@ dialog::backdrop { background: #0f172a73; }
 .portal-account span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .portal-course { display: grid; gap: 6px; font-weight: 600; }
 #portal-course { width: 100%; min-width: 0; border: 1px solid #b8c5d6; border-radius: 5px; padding: 8px; color: var(--ink); background: #fff; }
+#portal-review-dialog { width: min(620px, calc(100vw - 30px)); }
+#portal-review-form, #elaborati-form { padding: 20px; display: grid; gap: 14px; max-height: calc(100vh - 30px); overflow: auto; }
+#portal-review-form h2, #elaborati-form h2 { margin: 0; color: var(--ink); font-size: 18px; text-transform: none; letter-spacing: normal; }
+#portal-review-form > p, #elaborati-form > small { margin: 0; color: var(--muted); line-height: 1.4; }
+#portal-review-form fieldset { display: grid; gap: 8px; min-width: 0; border: 1px solid var(--line); border-radius: 6px; }
+.portal-review-summary { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 8px 14px; align-items: center; margin: 0; }
+.portal-review-summary dt { color: var(--muted); font-weight: 600; }
+.portal-review-summary dd { margin: 0; min-width: 0; overflow-wrap: anywhere; color: var(--ink); }
+#portal-review-file { font: 12px/1.4 ui-monospace, monospace; }
+#portal-review-description { width: 100%; min-width: 0; border: 1px solid #b8c5d6; border-radius: 5px; padding: 6px 8px; color: var(--ink); background: #fff; }
+.portal-review-entries, .portal-review-existing-list { display: grid; gap: 4px; max-height: 200px; overflow: auto; color: var(--muted); font: 11px/1.4 ui-monospace, monospace; }
+#elaborati-dialog { width: min(760px, calc(100vw - 30px)); }
+.elaborati-course { display: flex; align-items: end; gap: 8px; }
+.elaborati-course label { display: grid; flex: 1; gap: 6px; min-width: 0; font-weight: 600; }
+#elaborati-course { width: 100%; min-width: 0; border: 1px solid #b8c5d6; border-radius: 5px; padding: 8px; color: var(--ink); background: #fff; }
+.elaborati-list { display: grid; gap: 6px; max-height: min(420px, 55vh); overflow: auto; }
+.elaborati-empty { margin: 0; padding: 14px; color: var(--muted); text-align: center; border: 1px dashed var(--line); border-radius: 6px; }
+.elaborato { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; align-items: center; gap: 12px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 6px; }
+.elaborato-main { display: grid; gap: 2px; min-width: 0; }
+.elaborato-main strong, .elaborato-main small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.elaborato-main small, .elaborato-meta { color: var(--muted); }
+.elaborato-main a { color: var(--blue); }
+.elaborato-meta { display: grid; justify-items: end; gap: 1px; font-size: 11px; }
+.elaborato-status { font-weight: 600; color: #2b8a3e; }
+.elaborato.withdrawn .elaborato-main strong, .elaborato.withdrawn .elaborato-main a { color: var(--muted); text-decoration: line-through; }
+.elaborato.withdrawn .elaborato-status { color: #c92a2a; }
+@media (max-width: 560px) { .elaborato { grid-template-columns: minmax(0, 1fr) auto; } .elaborato-meta { grid-column: 1; justify-items: start; } }
 #portal-login-dialog { width: min(440px, calc(100vw - 30px)); }
 #portal-login-form { padding: 20px; display: grid; gap: 14px; }
 #portal-login-form h2 { margin: 0; color: var(--ink); font-size: 18px; text-transform: none; letter-spacing: normal; }
@@ -415,7 +442,9 @@ html[data-theme="dark"] .editor-wrap,
 html[data-theme="dark"] dialog,
 html[data-theme="dark"] #cpu-form,
 html[data-theme="dark"] #submission-form,
-html[data-theme="dark"] #portal-login-form { background: #111827; color: var(--ink); }
+html[data-theme="dark"] #portal-login-form,
+html[data-theme="dark"] #portal-review-form,
+html[data-theme="dark"] #elaborati-form { background: #111827; color: var(--ink); }
 html[data-theme="dark"] button,
 html[data-theme="dark"] #search,
 html[data-theme="dark"] #integer-register-format,
@@ -427,11 +456,15 @@ html[data-theme="dark"] #cpu-form input[type="text"],
 html[data-theme="dark"] #submission-assignment,
 html[data-theme="dark"] #submission-files,
 html[data-theme="dark"] #portal-course,
+html[data-theme="dark"] #portal-review-description,
+html[data-theme="dark"] #elaborati-course,
 html[data-theme="dark"] #portal-username,
 html[data-theme="dark"] #portal-password,
 html[data-theme="dark"] .memory-watch-controls select { background: #1f2937; border-color: #4b5d73; color: #e5edf7; }
 html[data-theme="dark"] .submission-projects { background: #182233; }
 html[data-theme="dark"] #portal-login-form > .portal-login-message.error { color: #fca5a5; }
+html[data-theme="dark"] .elaborato-status { color: #86efac; }
+html[data-theme="dark"] .elaborato.withdrawn .elaborato-status { color: #fca5a5; }
 html[data-theme="dark"] .submission-project:hover { background: #243249; }
 html[data-theme="dark"] .theme { background: #334155; color: #f8fafc; }
 html[data-theme="dark"] .gear { background: #334155; color: #f8fafc; }

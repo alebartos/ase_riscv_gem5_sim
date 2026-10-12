@@ -83,6 +83,8 @@ PORTAL_SSO_CALLBACK = "polito://students/login"
 PORTAL_SSO_TIMEOUT = 15 * 60
 PORTAL_REQUEST_TIMEOUT = 30
 PORTAL_UPLOAD_TIMEOUT = 300
+PORTAL_KEYRING_SERVICE = "ASE Studio Portale"
+PORTAL_KEYRING_ACCOUNT = "portal-session"
 # native.py installs a callable(uid, url) that shows the PoliTO sign-in page.
 PORTAL_SSO_OPENER = None
 
@@ -4607,16 +4609,96 @@ def portal_credentials_path() -> Path:
     return Path(base) / "ase-studio" / "portal.json"
 
 
+def portal_keyring():
+    """Return the operating-system credential store available here, if any."""
+    if sys.platform == "darwin" and os.access("/usr/bin/security", os.X_OK):
+        return "macOS Keychain"
+    if shutil.which("secret-tool") and os.environ.get("DBUS_SESSION_BUS_ADDRESS"):
+        return "system keyring"
+    return None
+
+
+def portal_keyring_run(arguments, stdin=""):
+    try:
+        result = subprocess.run(arguments, input=stdin, capture_output=True,
+                                text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return result.stdout if result.returncode == 0 else None
+
+
+def portal_keyring_store(secret):
+    """Store the remembered session in the OS keyring; return success."""
+    keyring = portal_keyring()
+    # Base64 keeps the secret free of quotes and off the command line.
+    encoded = base64.b64encode(secret.encode("utf-8")).decode("ascii")
+    if keyring == "macOS Keychain":
+        return portal_keyring_run(
+            ["/usr/bin/security", "-i"],
+            f"add-generic-password -U -s \"{PORTAL_KEYRING_SERVICE}\" "
+            f"-a {PORTAL_KEYRING_ACCOUNT} -w {encoded}\n") is not None
+    if keyring == "system keyring":
+        return portal_keyring_run(
+            ["secret-tool", "store", f"--label={PORTAL_KEYRING_SERVICE}",
+             "service", PORTAL_KEYRING_SERVICE, "account", PORTAL_KEYRING_ACCOUNT],
+            encoded) is not None
+    return False
+
+
+def portal_keyring_load():
+    keyring = portal_keyring()
+    if keyring == "macOS Keychain":
+        output = portal_keyring_run(
+            ["/usr/bin/security", "find-generic-password", "-s",
+             PORTAL_KEYRING_SERVICE, "-a", PORTAL_KEYRING_ACCOUNT, "-w"])
+    elif keyring == "system keyring":
+        output = portal_keyring_run(
+            ["secret-tool", "lookup", "service", PORTAL_KEYRING_SERVICE,
+             "account", PORTAL_KEYRING_ACCOUNT])
+    else:
+        output = None
+    if not output:
+        return None
+    try:
+        return base64.b64decode(output.strip(), validate=True).decode("utf-8")
+    except (binascii.Error, UnicodeDecodeError):
+        return None
+
+
+def portal_keyring_delete():
+    keyring = portal_keyring()
+    if keyring == "macOS Keychain":
+        portal_keyring_run(["/usr/bin/security", "delete-generic-password", "-s",
+                            PORTAL_KEYRING_SERVICE, "-a", PORTAL_KEYRING_ACCOUNT])
+    elif keyring == "system keyring":
+        portal_keyring_run(["secret-tool", "clear", "service", PORTAL_KEYRING_SERVICE,
+                            "account", PORTAL_KEYRING_ACCOUNT])
+
+
+def portal_remove_credentials_file():
+    try:
+        portal_credentials_path().unlink()
+    except OSError:
+        pass
+
+
 def portal_session():
     """Return the active portal session, loading remembered credentials once."""
     global _PORTAL_SESSION, _PORTAL_SESSION_LOADED
     with _PORTAL_LOCK:
         if not _PORTAL_SESSION_LOADED:
             _PORTAL_SESSION_LOADED = True
+            storage = "keyring"
+            raw = portal_keyring_load()
+            if raw is None:
+                storage = "file"
+                try:
+                    raw = portal_credentials_path().read_text(encoding="utf-8")
+                except OSError:
+                    raw = None
             try:
-                stored = json.loads(
-                    portal_credentials_path().read_text(encoding="utf-8"))
-            except (OSError, ValueError):
+                stored = json.loads(raw) if raw else None
+            except ValueError:
                 stored = None
             if (isinstance(stored, dict)
                     and isinstance(stored.get("token"), str) and stored["token"]
@@ -4625,7 +4707,7 @@ def portal_session():
                 _PORTAL_SESSION = {
                     "username": stored["username"], "token": stored["token"],
                     "clientId": client_id if isinstance(client_id, str) else None,
-                    "remembered": True,
+                    "remembered": True, "storage": storage,
                 }
         return dict(_PORTAL_SESSION) if _PORTAL_SESSION else None
 
@@ -4638,6 +4720,11 @@ def portal_require_session():
 
 
 def portal_write_credentials(session):
+    """Remember a session in the OS keyring, or else in a private file."""
+    secret = json.dumps({key: session[key] for key in ("username", "token", "clientId")})
+    if portal_keyring_store(secret):
+        portal_remove_credentials_file()
+        return "keyring"
     path = portal_credentials_path()
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     os.chmod(path.parent, 0o700)
@@ -4648,9 +4735,9 @@ def portal_write_credentials(session):
         pass
     descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-        json.dump({key: session[key] for key in ("username", "token", "clientId")},
-                  handle)
+        handle.write(secret)
     os.replace(temporary, path)
+    return "file"
 
 
 def portal_store_session(session, remember):
@@ -4658,20 +4745,17 @@ def portal_store_session(session, remember):
     global _PORTAL_SESSION, _PORTAL_SESSION_LOADED
     with _PORTAL_LOCK:
         _PORTAL_SESSION_LOADED = True
-        remembered = False
+        storage = ""
         if remember:
             try:
-                portal_write_credentials(session)
-                remembered = True
+                storage = portal_write_credentials(session)
             except OSError:
                 pass
-        if not remembered:
-            try:
-                portal_credentials_path().unlink()
-            except OSError:
-                pass
-        _PORTAL_SESSION = {**session, "remembered": remembered}
-        return remembered
+        if not storage:
+            portal_keyring_delete()
+            portal_remove_credentials_file()
+        _PORTAL_SESSION = {**session, "remembered": bool(storage), "storage": storage}
+        return bool(storage)
 
 
 def portal_clear_session(token=None):
@@ -4682,10 +4766,8 @@ def portal_clear_session(token=None):
             return
         _PORTAL_SESSION = None
         _PORTAL_SESSION_LOADED = True
-        try:
-            portal_credentials_path().unlink()
-        except OSError:
-            pass
+        portal_keyring_delete()
+        portal_remove_credentials_file()
 
 
 def portal_error_message(raw):
@@ -4784,6 +4866,8 @@ def portal_status():
     return {"ok": True, "loggedIn": bool(session),
             "username": session["username"] if session else "",
             "remembered": bool(session and session["remembered"]),
+            "storage": session.get("storage", "") if session else "",
+            "keyring": portal_keyring() or "",
             "ssoAvailable": PORTAL_SSO_OPENER is not None}
 
 
@@ -4917,13 +5001,72 @@ def portal_courses():
 
 def portal_assignment_summary(assignment):
     return {key: assignment.get(key) for key in (
-        "id", "description", "filename", "uploadedAt", "sizeInKiloBytes")}
+        "id", "description", "filename", "mimeType", "uploadedAt", "deletedAt",
+        "sizeInKiloBytes", "url")}
+
+
+def portal_course_id(course_id):
+    if not isinstance(course_id, int) or isinstance(course_id, bool) or course_id <= 0:
+        fail("Choose a course on the Portale della Didattica.")
+    return course_id
 
 
 def portal_course_assignments(course_id, token):
     response = portal_request("GET", f"/courses/{course_id}/assignments", token)
     return [entry for entry in response.get("data") or []
             if isinstance(entry, dict)]
+
+
+def portal_assignments(course_id):
+    """List a course's Elaborati, newest first, including withdrawn ones."""
+    course_id = portal_course_id(course_id)
+    token = portal_require_session()["token"]
+    entries = sorted(portal_course_assignments(course_id, token),
+                     key=lambda entry: str(entry.get("uploadedAt") or ""),
+                     reverse=True)
+    return {"ok": True, "courseId": course_id,
+            "assignments": [portal_assignment_summary(entry) for entry in entries]}
+
+
+def portal_set_withdrawn(course_id, assignment_id, withdrawn):
+    """Withdraw an Elaborato or restore a withdrawn one."""
+    course_id = portal_course_id(course_id)
+    if (not isinstance(assignment_id, int) or isinstance(assignment_id, bool)
+            or assignment_id <= 0):
+        fail("Invalid Elaborato.")
+    if not isinstance(withdrawn, bool):
+        fail("Invalid Elaborato action.")
+    token = portal_require_session()["token"]
+    deleted_at = (datetime.now(timezone.utc).isoformat(timespec="seconds")
+                  .replace("+00:00", "Z") if withdrawn else None)
+    portal_request("PATCH", f"/courses/{course_id}/assignments/{assignment_id}",
+                   token, {"deletedAt": deleted_at})
+    return portal_assignments(course_id)
+
+
+def submission_archive_preview(archive_path):
+    """Describe a submission ZIP: its name, size, and the files it contains."""
+    archive = submission_archive_file(archive_path)
+    try:
+        with zipfile.ZipFile(archive) as bundle:
+            entries = [{"path": info.filename, "size": info.file_size}
+                       for info in bundle.infolist() if not info.is_dir()]
+    except zipfile.BadZipFile:
+        fail("The submission ZIP is damaged.")
+    return {"filename": archive.name, "description": archive.stem,
+            "size": archive.stat().st_size, "entries": entries}
+
+
+def portal_upload_preview(archive_path, course_id):
+    """Show how a ZIP will appear in Elaborati and what it would duplicate."""
+    preview = submission_archive_preview(archive_path)
+    course_id = portal_course_id(course_id)
+    token = portal_require_session()["token"]
+    existing = [portal_assignment_summary(entry)
+                for entry in portal_course_assignments(course_id, token)
+                if entry.get("filename") == preview["filename"]
+                and not entry.get("deletedAt")]
+    return {"ok": True, "courseId": course_id, **preview, "existing": existing}
 
 
 def portal_multipart(fields, filename, content, mime_type):
@@ -4949,8 +5092,7 @@ def portal_upload(archive_path, course_id, description=None, replace=None):
     older copies are withdrawn only after the new upload has been confirmed.
     """
     archive = submission_archive_file(archive_path)
-    if not isinstance(course_id, int) or isinstance(course_id, bool) or course_id <= 0:
-        fail("Choose a course on the Portale della Didattica.")
+    course_id = portal_course_id(course_id)
     if description is None:
         description = archive.stem
     if (not isinstance(description, str) or not description.strip()
@@ -5870,6 +6012,15 @@ class Handler(SimpleHTTPRequestHandler):
     def send_json(self, value, status=200):
         data = json.dumps(value).encode()
         self.send_response(status); self.send_header("Content-Type", "application/json"); self.send_header("Content-Length", str(len(data))); self.end_headers(); self.wfile.write(data)
+    def send_file_download(self, path, content_type):
+        data = path.read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Content-Disposition",
+                         f'attachment; filename="{path.name}"')
+        self.end_headers()
+        self.wfile.write(data)
     def read_json(self):
         size = int(self.headers.get("Content-Length", "0"))
         return json.loads(self.rfile.read(size))
@@ -5923,6 +6074,14 @@ class Handler(SimpleHTTPRequestHandler):
                 return self.send_json(portal_status())
             if url.path == "/api/portal/courses":
                 return self.send_json(portal_courses())
+            if url.path == "/api/portal/assignments":
+                course = parse_qs(url.query).get("courseId", [""])[0]
+                return self.send_json(portal_assignments(
+                    int(course) if course.isdigit() else None))
+            if url.path == "/api/submission/download":
+                archive = submission_archive_file(
+                    parse_qs(url.query).get("archive", [""])[0])
+                return self.send_file_download(archive, "application/zip")
             if url.path == "/api/portal/sso":
                 return self.send_json(portal_sso_state(
                     parse_qs(url.query).get("uid", [""])[0]))
@@ -5991,6 +6150,16 @@ class Handler(SimpleHTTPRequestHandler):
                 return self.send_json(portal_sso_start(data.get("remember", False)))
             if self.path == "/api/portal/sso/cancel":
                 return self.send_json(portal_sso_cancel(data.get("uid")))
+            if self.path == "/api/portal/preview":
+                return self.send_json(portal_upload_preview(
+                    data.get("archive"), data.get("courseId")))
+            if self.path == "/api/portal/assignment":
+                return self.send_json(portal_set_withdrawn(
+                    data.get("courseId"), data.get("assignmentId"),
+                    data.get("withdrawn")))
+            if self.path == "/api/submission/preview":
+                return self.send_json({"ok": True, **submission_archive_preview(
+                    data.get("archive"))})
             if self.path == "/api/portal/upload":
                 return self.send_json(portal_upload(
                     data.get("archive"), data.get("courseId"),

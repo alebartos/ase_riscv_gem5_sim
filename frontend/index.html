@@ -3,7 +3,7 @@
 <!-- SPDX-License-Identifier: GPL-2.0-only -->
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>ASE Studio</title><link rel="stylesheet" href="studio.css"></head>
 <body>
-<header><div class="brand"><button id="about-button" title="About ASE Studio"><img class="ase-logo logo-light" src="ase_light.png" alt="ASE Studio logo"><img class="ase-logo logo-dark" src="ase_dark.png" alt="ASE Studio logo"></button></div><div class="header-tools"><div class="project-actions"><button id="environment-settings" class="gear" title="Settings" aria-label="Settings">⚙</button><span id="developer-mode-badge" class="developer-mode-badge" title="Experimental configuration is enabled and startup repository alignment is disabled." hidden>Developer mode</span><button id="theme-toggle" class="theme">Dark mode</button><button id="submit" class="submit" disabled>Submit</button><button id="update" class="update" hidden>Update</button></div><div class="run-actions"><button id="configure" disabled>CPU Configuration</button><button id="reset" class="reset" disabled>Reset</button><button id="step" class="step" disabled>Run Step</button><button id="run" class="primary" disabled>Run ▶</button></div></div></header>
+<header><div class="brand"><button id="about-button" title="About ASE Studio"><img class="ase-logo logo-light" src="ase_light.png" alt="ASE Studio logo"><img class="ase-logo logo-dark" src="ase_dark.png" alt="ASE Studio logo"></button></div><div class="header-tools"><div class="project-actions"><button id="environment-settings" class="gear" title="Settings" aria-label="Settings">⚙</button><span id="developer-mode-badge" class="developer-mode-badge" title="Experimental configuration is enabled and startup repository alignment is disabled." hidden>Developer mode</span><button id="theme-toggle" class="theme">Dark mode</button><button id="elaborati" title="View and manage your Elaborati on the Portale della Didattica">Elaborati</button><button id="submit" class="submit" disabled>Submit</button><button id="update" class="update" hidden>Update</button></div><div class="run-actions"><button id="configure" disabled>CPU Configuration</button><button id="reset" class="reset" disabled>Reset</button><button id="step" class="step" disabled>Run Step</button><button id="run" class="primary" disabled>Run ▶</button></div></div></header>
 <main><aside id="project-panel"><div class="project-panel-header"><div class="sidebar-actions"><button id="new">New</button><button id="duplicate" disabled>Duplicate</button><button id="delete" class="danger" disabled>Delete</button></div><h2>Projects</h2></div><div id="projects"></div></aside><section id="work"><div id="editor-toolbar"><div class="editor-identity"><button id="open-with" disabled>Open with…</button><button id="rename" disabled>Rename</button><button id="save" disabled>Save</button><span id="project-title">Open a project</span><span id="source-name">Assembly Editor</span></div><div class="editor-tools"><label class="editor-font-control">Font <input id="editor-font-size" type="range" min="11" max="22" value="14"><output id="editor-font-value">14 px</output></label><input id="search" placeholder="Search (Ctrl+F)"></div></div><div class="editor-area"><div class="editor-wrap"><pre id="highlight" aria-hidden="true"></pre><textarea id="body" spellcheck="false" aria-label="Assembly source"></textarea></div></div></section><div id="register-resizer" title="Drag to resize register panel"></div><aside id="register-panel"><div class="register-header"><h2>Register file</h2></div><div id="registers"><div class="register-column"><h3>Integer (x)</h3><select id="integer-register-format" aria-label="Integer register number format"><option value="hex" selected>Hexadecimal</option><option value="binary">Binary</option><option value="signed">Signed integer</option><option value="unsigned">Unsigned integer</option><option value="float">Floating-point</option></select><div id="integer-registers"></div></div><div class="register-column"><h3>Floating-point (f)</h3><select id="float-register-format" aria-label="Floating-point register number format"><option value="hex">Hexadecimal</option><option value="binary">Binary</option><option value="signed">Signed integer</option><option value="unsigned">Unsigned integer</option><option value="float" selected>Floating-point</option></select><div id="float-registers"></div></div></div></aside></main>
 <div id="splitter" title="Drag to resize the editor and output panels"></div>
 <section id="bottom">
@@ -47,7 +47,7 @@
 <dialog id="submission-dialog"><form id="submission-form">
   <h2>Prepare submission</h2>
   <p>Choose the ASE projects and optional supporting files to include in one ZIP archive.</p>
-  <label class="submission-assignment">Assignment name<input id="submission-assignment" type="text" placeholder="lab_1" pattern="[A-Za-z][A-Za-z0-9_-]{0,63}" required></label>
+  <label class="submission-assignment">Assignment name<input id="submission-assignment" type="text" placeholder="lab_1" pattern="[A-Za-z][A-Za-z0-9_\-]{0,63}" required></label>
   <fieldset><legend>Projects</legend>
     <div class="submission-project-tools"><small>Each selected project is built and simulated with its saved CPU configuration.</small><span><button id="submission-select-all" type="button">Select all</button><button id="submission-select-none" type="button">Clear</button></span></div>
     <div id="submission-projects" class="submission-projects"></div>
@@ -66,14 +66,41 @@
     </div>
   </fieldset>
   <label class="check"><input id="submission-expand-loops" type="checkbox" checked> Export repeated loop iterations as separate pipeline rows</label>
-  <div class="dialog-actions"><button type="button" id="cancel-submission">Cancel</button><button type="submit" id="submission-confirm" class="primary">Create submission</button></div>
+  <div class="dialog-actions"><button type="button" id="cancel-submission">Cancel</button><button type="button" id="submission-manual" title="Create the ZIP and save a copy to upload yourself on the Portale della Didattica">Save ZIP for manual upload</button><button type="submit" id="submission-confirm" class="primary">Create submission</button></div>
+</form></dialog>
+<dialog id="portal-review-dialog"><form id="portal-review-form">
+  <h2>Review upload</h2>
+  <p>This is how the ZIP will appear in the course's Elaborati.</p>
+  <dl class="portal-review-summary">
+    <dt>Course</dt><dd id="portal-review-course"></dd>
+    <dt>File</dt><dd id="portal-review-file"></dd>
+    <dt>Size</dt><dd id="portal-review-size"></dd>
+    <dt>Description</dt><dd><input id="portal-review-description" type="text" maxlength="200" spellcheck="false"></dd>
+  </dl>
+  <fieldset><legend id="portal-review-contents-title">Contents</legend>
+    <div id="portal-review-entries" class="portal-review-entries"></div>
+  </fieldset>
+  <fieldset id="portal-review-existing" hidden><legend>Already uploaded</legend>
+    <div id="portal-review-existing-list" class="portal-review-existing-list"></div>
+    <label class="check"><input type="radio" name="portal-review-replace" value="replace" checked> Replace: withdraw the previous copy after the new upload is confirmed</label>
+    <label class="check"><input type="radio" name="portal-review-replace" value="keep"> Keep both</label>
+  </fieldset>
+  <div class="dialog-actions"><button type="button" id="portal-review-cancel">Don't upload</button><button type="button" id="portal-review-manual">Save ZIP for manual upload</button><button type="submit" id="portal-review-confirm" class="primary">Upload</button></div>
+</form></dialog>
+<dialog id="elaborati-dialog"><form id="elaborati-form">
+  <h2>Elaborati</h2>
+  <div class="portal-account"><span id="elaborati-account">Not signed in.</span><button type="button" id="elaborati-account-button">Sign in</button></div>
+  <div class="elaborati-course"><label>Course<select id="elaborati-course" disabled><option value="">Sign in to load your courses</option></select></label><button type="button" id="elaborati-refresh" disabled>Refresh</button></div>
+  <div id="elaborati-list" class="elaborati-list"></div>
+  <small>Withdrawn Elaborati stay listed and can be restored. The Portale does not allow deleting them permanently.</small>
+  <div class="dialog-actions"><button type="button" id="elaborati-close" class="primary">Close</button></div>
 </form></dialog>
 <dialog id="portal-login-dialog"><form id="portal-login-form">
   <h2>Sign in to the Portale della Didattica</h2>
   <p>Use your PoliTO credentials. ASE Studio never stores your password.</p>
   <label>Username<input id="portal-username" type="text" placeholder="s123456" autocomplete="username" spellcheck="false" autocapitalize="off"></label>
   <label>Password<input id="portal-password" type="password" autocomplete="current-password"></label>
-  <label class="check"><input id="portal-remember" type="checkbox"> Keep me signed in on this computer</label>
+  <label class="check"><input id="portal-remember" type="checkbox"> Keep me signed in on this computer <small id="portal-remember-note"></small></label>
   <p id="portal-login-message" class="portal-login-message" role="status" hidden></p>
   <div class="dialog-actions"><button type="button" id="portal-login-cancel">Cancel</button><button type="button" id="portal-login-sso" hidden>Sign in with PoliTO SSO</button><button type="submit" id="portal-login-confirm" class="primary">Sign in</button></div>
 </form></dialog>
