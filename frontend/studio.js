@@ -2634,8 +2634,9 @@ $("#search").oninput = event => {
 async function checkForUpdate() {
   try {
     const status = await api("/api/update-status");
-    $("#update").hidden = !status.available;
-    $("#update").disabled = !status.available;
+    const offered = status.available || Boolean(status.appRelease);
+    $("#update").hidden = !offered;
+    $("#update").disabled = !offered;
     $("#update").title = status.message;
   } catch (_error) {
     $("#update").hidden = true;
@@ -2646,6 +2647,22 @@ $("#update").onclick = async () => {
   $("#update").disabled = true;
   try {
     const status = await api("/api/update-status");
+    if (status.appRelease) {
+      const choice = await actionDialog({
+        title: "New ASE Studio app",
+        message: "ASE Studio " + status.appRelease.version + " is available. Besides the interface, it can update "
+          + "Python, the RISC-V compiler and the app window.\n\nDownload the new disk image, quit ASE Studio and "
+          + "replace the app in Applications. Your projects are kept.",
+        confirmLabel: "Download", confirmValue: "download",
+        alternateLabel: status.available ? "Update components only" : null, alternateValue: "components",
+        cancelLabel: "Cancel"
+      });
+      if (choice === "download") window.open(status.appRelease.url, "_blank", "noopener");
+      if (choice !== "components") {
+        await checkForUpdate();
+        return;
+      }
+    }
     let discardLocalChanges = false;
     const blocked = (status.repositories || []).filter(repository => repository.dirty);
     if (blocked.length) {
