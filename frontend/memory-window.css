@@ -1,0 +1,42 @@
+/*
+ * SPDX-FileCopyrightText: 2026 Behnam Farnaghinejad <behnam.farnaghinejad@polito.it>
+ * SPDX-License-Identifier: GPL-2.0-only
+ */
+
+body.memory-window-body {
+  display: block;
+  grid-template-rows: none;
+  min-width: 0;
+  min-height: 0;
+}
+
+.memory-window-shell {
+  display: grid;
+  grid-template-rows: 44px minmax(0, 1fr);
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+}
+
+.memory-window-heading {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+  padding: 0 12px;
+  border-bottom: 1px solid var(--line);
+  background: #fff;
+}
+
+.memory-window-heading strong { font-size: 15px; }
+.memory-window-heading span { min-width: 0; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.memory-window-shell .memory-workspace { min-height: 0; }
+.memory-window-shell #memory-watch-clear { margin-left: auto; }
+
+html[data-theme="dark"] .memory-window-heading { background: #111827; }
+
+@media (max-width: 720px) {
+  .memory-window-shell .memory-workspace { grid-template-columns: minmax(0, 1fr) 145px; }
+  .memory-window-shell .memory-watch-controls select { min-width: 190px; }
+}

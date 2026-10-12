@@ -1,0 +1,23 @@
+<!doctype html>
+<!-- SPDX-FileCopyrightText: 2026 Behnam Farnaghinejad <behnam.farnaghinejad@polito.it> -->
+<!-- SPDX-License-Identifier: GPL-2.0-only -->
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>ASE Studio — Memory</title><link rel="stylesheet" href="studio.css"><link rel="stylesheet" href="memory-window.css"></head>
+<body class="memory-window-body">
+  <div class="memory-window-shell">
+    <div class="memory-window-heading"><strong>Memory</strong><span id="memory-window-project">Waiting for ASE Studio…</span></div>
+    <div class="memory-workspace">
+      <div class="memory-content">
+        <div class="memory-watch-controls">
+          <form id="memory-symbol-form"><label>Variable or vector<select id="memory-symbol" required disabled><option value="">No symbols available</option></select></label><button type="submit" disabled>Add</button></form>
+          <label>Number format<select id="memory-format"><option value="hex">Hexadecimal</option><option value="binary">Binary</option><option value="signed">Signed integer</option><option value="unsigned">Unsigned integer</option><option value="float">Floating-point</option></select></label>
+          <button id="memory-watch-clear" type="button" disabled>Clear watch list</button>
+        </div>
+        <div id="memory-watch-list" class="memory-watch-list"></div>
+        <div id="memory-summary">Waiting for the main ASE Studio window.</div>
+        <div id="memory-table"><div class="memory-empty">Memory values will appear here.</div></div>
+      </div>
+      <aside id="memory-map"><div class="memory-map-title">Program memory map</div><div id="memory-map-sections"><div class="memory-map-empty">Build a project to see its allocated ELF sections.</div></div></aside>
+    </div>
+  </div>
+  <script src="memory-window.js"></script>
+</body></html>

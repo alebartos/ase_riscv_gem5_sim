@@ -65,11 +65,17 @@ def main() -> int:
     server_thread = None
     window = None
     view = None
+    memory_window = None
+    memory_view = None
+    memory_policy_handler = None
+    create_handler = None
     closing = False
     ui_destroyed = False
 
     def activate(app):
-        nonlocal server, server_thread, window, view, closing, ui_destroyed
+        nonlocal server, server_thread, window, view, memory_window
+        nonlocal memory_view, memory_policy_handler, create_handler
+        nonlocal closing, ui_destroyed
         if window is not None:
             window.present()
             return
@@ -163,6 +169,57 @@ def main() -> int:
         backend.PORTAL_SSO_OPENER = (
             lambda uid, url: GLib.idle_add(show_portal_sign_in, uid, url))
 
+        def destroy_memory_window():
+            nonlocal memory_window, memory_view, memory_policy_handler
+            doomed_view = memory_view
+            doomed_window = memory_window
+            memory_view = None
+            memory_window = None
+            if doomed_view is not None:
+                if memory_policy_handler is not None:
+                    doomed_view.disconnect(memory_policy_handler)
+                memory_policy_handler = None
+                doomed_view.stop_loading()
+                parent = doomed_view.get_parent()
+                if parent is not None:
+                    parent.remove(doomed_view)
+                doomed_view.destroy()
+            if doomed_window is not None:
+                doomed_window.destroy()
+
+        def close_memory_window(*_args):
+            destroy_memory_window()
+            return True
+
+        def create_memory_window(source_view, _navigation_action):
+            nonlocal memory_window, memory_view, memory_policy_handler
+            if memory_window is not None and memory_view is not None:
+                memory_window.present()
+                return memory_view
+
+            memory_window = Gtk.ApplicationWindow(
+                application=app, title="ASE Studio — Memory")
+            memory_window.set_default_size(1050, 720)
+            memory_window.set_size_request(650, 400)
+            if ICON_PATH.exists():
+                memory_window.set_icon_from_file(str(ICON_PATH))
+
+            # A related WebView shares the existing WebKit context and web
+            # process. The pop-out is therefore a view of the same running
+            # studio, not a second frontend or simulator instance.
+            memory_view = WebKit2.WebView.new_with_related_view(source_view)
+            memory_view.get_settings().set_property(
+                "enable-developer-extras", False)
+            memory_policy_handler = memory_view.connect(
+                "decide-policy", open_external_links)
+            memory_view.connect("close", close_memory_window)
+            memory_window.connect("delete-event", close_memory_window)
+            memory_window.add(memory_view)
+            memory_window.show_all()
+            return memory_view
+
+        create_handler = view.connect("create", create_memory_window)
+
         def choose_download_destination(download, suggested_filename):
             dialog = Gtk.FileChooserDialog(
                 title="Export pipeline",
@@ -231,13 +288,17 @@ def main() -> int:
         window.show_all()
 
         def close_after_server_stops():
-            nonlocal window, view, ui_destroyed
+            nonlocal window, view, create_handler, ui_destroyed
             if server_thread is not None and server_thread.is_alive():
                 return GLib.SOURCE_CONTINUE
             if ui_destroyed:
                 return GLib.SOURCE_REMOVE
             ui_destroyed = True
+            destroy_memory_window()
             if view is not None:
+                if create_handler is not None:
+                    view.disconnect(create_handler)
+                    create_handler = None
                 view.disconnect(policy_handler)
                 web_context.disconnect(download_handler)
                 view.stop_loading()
