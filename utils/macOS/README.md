@@ -27,6 +27,36 @@ utils/macOS/build_gem5.sh                                                       
 (`1.5 * 2.0` dà NaN). `build_app.py` rifiuta un `gem5.opt` che non supera
 `gem5_selftest.py`.
 
+## Da dove arriva ASE Studio
+
+L'ASE Studio incluso nell'app non è il submodule `ase_studio`: è il branch
+`ase-studio-macos` di questo repository (`alebartos/ase_riscv_gem5_sim`), cioè
+`cad-polito-it/ase-studio` più le funzioni per il Portale della Didattica
+(upload degli elaborati, elenco con ritiro/ripristino, riepilogo prima
+dell'upload, "Save ZIP for manual upload"). `build_app.py` lo scarica da lì
+(`--studio-dir PATH` per compilare un checkout locale) e l'"Update" dell'app
+segue lo stesso branch. Il workflow `sync-upstream.yml` fonde ogni giorno
+`cad-polito-it/ase-studio` in quel branch; se c'è un conflitto il run fallisce
+e va risolto a mano.
+
+Pubblicare una modifica ad ASE Studio (le app installate la ricevono con
+"Update", senza un nuovo DMG):
+
+```sh
+git -C /percorso/ase-studio push git@github.com:alebartos/ase_riscv_gem5_sim.git HEAD:ase-studio-macos
+```
+
+## Nuova versione dell'app
+
+Python, compilatore e finestra nativa cambiano solo con un nuovo DMG. Le app
+annunciano una release più recente con tag `v<versione>-macos` (la versione è
+quella di `VERSION` di ASE Studio):
+
+```sh
+gh release create v1.2.5-macos dist/ASE-Studio-1.2.5.dmg \
+    --title "ASE Studio 1.2.5 per macOS (Apple Silicon)" --notes "..."
+```
+
 ## Aggiornare gem5 nelle app già installate
 
 `build_app.py` produce anche `dist/gem5-macos-arm64.tar.gz` e `dist/gem5.json`.

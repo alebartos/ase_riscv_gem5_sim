@@ -11,6 +11,9 @@ downloads the latest sources from GitHub:
   * gem5.opt (from the GitHub release named in versions.json, checked with
     gem5_selftest.py before use) -> ~/Library/Application Support/ASE Studio/gem5
 
+A newer full app (a v<version>-macos release of the repo in versions.json)
+is announced with a link to its download page.
+
 Python and the compiler are binaries: they only change with a new app.
 
 Usage: ase_studio_app.py PORT | --check-startup
@@ -20,6 +23,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -188,12 +192,37 @@ def remote_commit(repo: str, branch: str) -> str:
                 f"https://api.github.com/repos/{repo}/commits/{branch}").decode().strip()
 
 
+def release_version(tag: str) -> tuple[int, ...] | None:
+    match = re.fullmatch(r"v(\d+(?:\.\d+)*)-macos", tag or "")
+    return tuple(int(part) for part in match[1].split(".")) if match else None
+
+
+def app_release(item: dict) -> dict | None:
+    """The newest published app release, if it is newer than this app."""
+    current = release_version(item.get("tag", ""))
+    releases = json.loads(curl(f"https://api.github.com/repos/{item['repo']}/releases?per_page=30"))
+    published = [(release_version(release.get("tag_name", "")), release)
+                 for release in releases
+                 if not release.get("draft") and not release.get("prerelease")]
+    published = [(version, release) for version, release in published if version]
+    if not current or not published:
+        return None
+    version, release = max(published, key=lambda pair: pair[0])
+    if version <= current:
+        return None
+    return {"version": ".".join(map(str, version)), "tag": release["tag_name"],
+            "name": release.get("name") or release["tag_name"], "url": release["html_url"]}
+
+
 def update_status(refresh=False):
     if not refresh or time.time() - _cache.get("at", 0) < CHECK_INTERVAL:
         if "status" in _cache:
             return _cache["status"]
     repositories = []
-    for key, item in load_versions().items():
+    versions = load_versions()
+    for key, item in versions.items():
+        if key == "app":
+            continue
         entry = {"label": item["label"], "path": item["repo"], "dirty": False,
                  "available": False, "key": key}
         try:
@@ -209,9 +238,18 @@ def update_status(refresh=False):
             entry["message"] = f"{item['label']}: update check failed ({error})."
         repositories.append(entry)
     available = any(item["available"] for item in repositories)
+    release = None
+    if "app" in versions:
+        try:
+            release = app_release(versions["app"])
+        except (OSError, ValueError, KeyError):
+            release = None
+    message = " ".join(item["message"] for item in repositories)
+    if release:
+        message += f" ASE Studio app {release['version']} is available."
     status = {"warning": any(item.get("warning") for item in repositories),
               "available": available, "canUpdate": available, "repositories": repositories,
-              "message": " ".join(item["message"] for item in repositories),
+              "appRelease": release, "message": message,
               "checkedAt": int(time.time())}
     _cache.update(status=status, at=time.time())
     return status

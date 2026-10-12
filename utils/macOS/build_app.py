@@ -13,6 +13,8 @@ Build requirements (on the build machine only):
 
 Usage:  utils/macOS/build_app.py [--no-dmg] [--simulator-repo OWNER/REPO]
                                  [--gem5-repo OWNER/REPO]
+                                 [--studio-repo OWNER/REPO] [--studio-branch BRANCH]
+                                 [--studio-dir PATH]
 Output: dist/ASE Studio.app, dist/ASE-Studio-<version>.dmg and the gem5
         update for the app (dist/gem5-macos-arm64.tar.gz + dist/gem5.json,
         to attach to the GitHub release named GEM5_RELEASE)
@@ -29,6 +31,7 @@ import shutil
 import subprocess
 import sys
 import tarfile
+from io import BytesIO
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -56,6 +59,15 @@ GEM5_ASSET = DIST / f"{GEM5_RELEASE}.tar.gz"
 # repository whatever clone the app is built from; the gem5 update comes from
 # the release of the repository that publishes the macOS builds.
 SIMULATOR_REPO = "cad-polito-it/ase_riscv_gem5_sim"
+# ASE Studio for macOS (the course's ase-studio plus the Portale della
+# Didattica features) lives on a branch of this fork; the in-app update
+# follows the same branch. New full apps are GitHub releases tagged
+# v<version>-macos, which the app announces.
+STUDIO_REPO = "alebartos/ase_riscv_gem5_sim"
+STUDIO_BRANCH = "ase-studio-macos"
+STUDIO_SRC = DIST / "ase_studio-src"
+APP_RELEASE_TAG = "v{version}-macos"
+_studio: dict = {}
 GEM5_MANIFEST = DIST / "gem5.json"
 
 sys.path.insert(0, str(HERE))
@@ -109,7 +121,44 @@ def check_inputs() -> None:
 
 
 def studio_version() -> str:
-    return (REPO / "ase_studio/VERSION").read_text().strip()
+    return (STUDIO_SRC / "VERSION").read_text().strip()
+
+
+def prepare_studio(repo: str, branch: str, local_dir: str | None) -> None:
+    """Export the ASE Studio sources the app is built from into STUDIO_SRC.
+
+    By default the branch is fetched from the GitHub repo the app updates
+    from, so the bundled commit is one the updater can find. --studio-dir
+    builds a local checkout instead (its committed HEAD, never local edits)."""
+    if local_dir:
+        source = Path(local_dir).resolve()
+        commit = output("git", "-C", source, "rev-parse", "HEAD").strip()
+        if output("git", "-C", source, "status", "--porcelain", "--untracked-files=no").strip():
+            log(f"Attenzione: {source} ha modifiche non committate, uso solo HEAD")
+    else:
+        source = REPO
+        for remote in output("git", "-C", REPO, "remote").split():
+            url = output("git", "-C", REPO, "remote", "get-url", remote).strip()
+            if re.sub(r"^.*github\.com[:/]|\.git$", "", url) == repo:
+                run("git", "-C", REPO, "fetch", "--quiet", remote, branch)
+                break
+        else:
+            sys.exit(f"Nessun remote di questo clone punta a {repo}: aggiungilo o usa --studio-dir")
+        commit = output("git", "-C", REPO, "rev-parse", "FETCH_HEAD").strip()
+    log(f"ASE Studio da {repo}@{branch} ({commit[:7]})")
+    archive = subprocess.run(["git", "-C", str(source), "archive", "--format=tar", commit],
+                             check=True, capture_output=True).stdout
+    if STUDIO_SRC.exists():
+        shutil.rmtree(STUDIO_SRC)
+    STUDIO_SRC.mkdir(parents=True)
+    with tarfile.open(fileobj=BytesIO(archive)) as tar:
+        if hasattr(tarfile, "data_filter"):
+            tar.extractall(STUDIO_SRC, filter="data")
+        else:
+            tar.extractall(STUDIO_SRC)
+    if not (STUDIO_SRC / "backend.py").is_file():
+        sys.exit(f"{repo}@{branch} non contiene ASE Studio (manca backend.py)")
+    _studio.update(repo=repo, branch=branch, commit=commit)
 
 
 def make_skeleton() -> None:
@@ -135,7 +184,7 @@ def copy_project(simulator_repo: str, gem5_repo: str) -> None:
             dst = RES / "project" / rel
             dst.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(src, dst)
-    copytree(REPO / "ase_studio", RES / "ase_studio", skip={".git"})
+    copytree(STUDIO_SRC, RES / "ase_studio", skip={".git", ".gitignore"})
     write_versions(simulator_repo, gem5_repo)
 
 
@@ -148,16 +197,16 @@ def write_versions(simulator_repo: str, gem5_repo: str) -> None:
     """Sources the app was built from; the in-app updater compares against them."""
     branches = json.loads((REPO / "ase_studio_branches.json").read_text())
     versions = {
-        "studio": {"label": "ASE Studio", "repo": github_repo(REPO / "ase_studio"),
-                   "branch": branches["studio"], "commit": ""},
+        "studio": {"label": "ASE Studio", "repo": _studio["repo"],
+                   "branch": _studio["branch"], "commit": _studio["commit"]},
         "simulator": {"label": "Simulator", "repo": simulator_repo,
                       "branch": branches["simulator"], "commit": ""},
     }
-    versions["studio"]["commit"] = output("git", "-C", REPO / "ase_studio",
-                                          "rev-parse", "HEAD").strip()
     versions["simulator"]["commit"] = simulator_commit(simulator_repo, branches["simulator"])
     versions["gem5"] = {"label": "gem5", "repo": gem5_repo,
                         "release": GEM5_RELEASE, "commit": gem5_build_id()}
+    versions["app"] = {"label": "ASE Studio app", "repo": gem5_repo,
+                       "tag": APP_RELEASE_TAG.format(version=studio_version())}
     (RES / "versions.json").write_text(json.dumps(versions, indent=2) + "\n")
 
 
@@ -385,9 +434,16 @@ def main() -> int:
     parser.add_argument("--gem5-repo", default=None,
                         help="GitHub repo whose release carries the gem5 update "
                              "(default: this clone's origin)")
+    parser.add_argument("--studio-repo", default=STUDIO_REPO,
+                        help=f"GitHub repo of ASE Studio and its updates (default {STUDIO_REPO})")
+    parser.add_argument("--studio-branch", default=STUDIO_BRANCH,
+                        help=f"branch of ASE Studio (default {STUDIO_BRANCH})")
+    parser.add_argument("--studio-dir", default=None,
+                        help="build ASE Studio from this local checkout instead of the branch")
     args = parser.parse_args()
 
     check_inputs()
+    prepare_studio(args.studio_repo, args.studio_branch, args.studio_dir)
     make_skeleton()
     copy_project(args.simulator_repo, args.gem5_repo or github_repo(REPO))
     copy_gem5()

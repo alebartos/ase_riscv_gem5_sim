@@ -1,5 +1,7 @@
-# Keeps main aligned with cad-polito-it/ase_riscv_gem5_sim.
-# Uses the same API as GitHub's "Sync fork" button: a fast-forward when
+# Keeps main aligned with cad-polito-it/ase_riscv_gem5_sim, and the
+# ase-studio-macos branch (ASE Studio for the macOS app, with the Portale
+# della Didattica features) aligned with cad-polito-it/ase-studio.
+# main uses the same API as GitHub's "Sync fork" button: a fast-forward when
 # possible, otherwise a merge commit on top of the macOS changes of this fork.
 # A conflict makes the run fail; resolve it locally and push.
 name: Sync upstream
@@ -28,3 +30,24 @@ jobs:
           echo "$result"
           echo "### Sync upstream" >> "$GITHUB_STEP_SUMMARY"
           echo "$result" | jq -r '"- \(.message) (\(.merge_type))"' >> "$GITHUB_STEP_SUMMARY"
+
+  sync-studio:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ase-studio-macos
+          fetch-depth: 0
+      - name: Merge cad-polito-it/ase-studio main
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch https://github.com/cad-polito-it/ase-studio.git main
+          before=$(git rev-parse HEAD)
+          git merge --no-edit -m "Merge cad-polito-it/ase-studio main" FETCH_HEAD
+          if [ "$(git rev-parse HEAD)" = "$before" ]; then
+            echo "- ase-studio-macos is up to date" >> "$GITHUB_STEP_SUMMARY"
+          else
+            git push origin HEAD:ase-studio-macos
+            echo "- ase-studio-macos merged $(git rev-parse --short FETCH_HEAD)" >> "$GITHUB_STEP_SUMMARY"
+          fi
