@@ -38,6 +38,8 @@ let studioFeatures = {
 };
 let configuredProgramsDirectory = "";
 let memoryPopoutWindow = null;
+let pipelinePaintFrame = null;
+let pipelineResizeObserver = null;
 const memoryWindowChannel = "BroadcastChannel" in window
   ? new BroadcastChannel("ase-studio-memory-window") : null;
 
@@ -436,6 +438,7 @@ async function openProject(name, {skipUnsavedCheck = false} = {}) {
   $("#cycle-position").textContent = "Cycle —/—";
   $("#step").disabled = false;
   $("#step").textContent = "Run Step";
+  updateCycleNavigation();
   syncEditor();
   renderRegisters();
   renderMemory();
@@ -807,6 +810,8 @@ async function run(stepAfterRun = false) {
   $("#export-pipeline").disabled = true;
   $("#expand-loops").disabled = true;
   $("#step").disabled = true;
+  $("#cycle-jump").disabled = true;
+  $("#cycle-jump-form button").disabled = true;
   $("#run").textContent = "Running…";
   lastNormalLog = "Building and simulating…";
   lastAdvancedLog = lastNormalLog;
@@ -868,6 +873,7 @@ async function run(stepAfterRun = false) {
     $("#expand-loops").disabled = false;
     $("#step").disabled = false;
     $("#run").textContent = "Run ▶";
+    updateCycleNavigation();
   }
 }
 
@@ -885,6 +891,7 @@ function resetSimulation() {
   $("#cycle-prev").disabled = true;
   $("#cycle-next").disabled = true;
   $("#cycle-position").textContent = "Cycle —/—";
+  updateCycleNavigation();
   $("#pipeline-grid").innerHTML = "";
   $("#pipeline-diagram").innerHTML = "";
   $("#pipeline-summary").textContent = "No pipeline trace loaded. Press Run or Run Step.";
@@ -990,12 +997,84 @@ function movePlaybackCycle(delta) {
   showTab("pipeline");
 }
 
+function positionPipelineCycle(cycle) {
+  const scroll = $("#pipeline-scroll");
+  const grid = $("#pipeline-grid");
+  if (!pipelineData) return;
+  const frozenWidth = Number.parseFloat(
+    getComputedStyle(document.documentElement).getPropertyValue("--address-width"))
+    + Number.parseFloat(
+      getComputedStyle(document.documentElement).getPropertyValue("--instruction-width"))
+    + Number.parseFloat(
+      getComputedStyle(document.documentElement).getPropertyValue("--flow-width"));
+  const cellWidth = Number($("#cell-width").value);
+  // The three frozen columns occupy positions 1–3. Leave one preceding
+  // cycle visible so the requested cycle appears at table column 5.
+  const pipelineWidth = frozenWidth + pipelineData.cycles * cellWidth;
+  const horizontalTail = Math.max(
+    0, scroll.clientWidth - frozenWidth - 2 * cellWidth);
+  grid.style.width = `${pipelineWidth + horizontalTail}px`;
+  scroll.scrollLeft = Math.max(
+    0, (cycle - 2) * cellWidth);
+
+  const eventRow = displayedPipelineRows().findIndex(row =>
+    row.cycles?.[String(cycle)] !== undefined);
+  if (eventRow < 0) return;
+  const rowHeight = Number.parseFloat(
+    getComputedStyle(document.documentElement).getPropertyValue("--row-height"));
+  // The sticky header is row 1. Preserve one preceding instruction when
+  // possible so the first event for this cycle appears at table row 3.
+  const rows = grid.querySelector(".pipeline-rows");
+  const verticalTail = Math.max(0, scroll.clientHeight - 3 * rowHeight);
+  rows.style.height = `${displayedPipelineRows().length * rowHeight + verticalTail}px`;
+  scroll.scrollTop = Math.max(0, (eventRow - 1) * rowHeight);
+}
+
+async function jumpToCycle() {
+  if (!stepMode || !pipelineData || playbackCycle === null) {
+    await showActionMessage(
+      "Jump to cycle", "Jump to cycle is available after starting Run Step.");
+    return;
+  }
+  const rawCycle = $("#cycle-jump").value.trim();
+  if (!/^\d+$/.test(rawCycle)) {
+    await showActionMessage("Jump to cycle", "Enter a whole cycle number.");
+    return;
+  }
+  const targetCycle = Number(rawCycle);
+  if (targetCycle < 1 || targetCycle > pipelineData.cycles) {
+    await showActionMessage(
+      "Jump to cycle",
+      `Cycle ${targetCycle} is outside this trace. Enter a cycle from 1 to ${pipelineData.cycles}.`);
+    return;
+  }
+  playbackCycle = targetCycle;
+  selectedColumn = targetCycle;
+  $("#step").textContent = playbackCycle >= pipelineData.cycles
+    ? "Restart Step" : "Next Cycle";
+  renderPipeline();
+  showTab("pipeline");
+  positionPipelineCycle(targetCycle);
+}
+
 function updateCycleNavigation() {
   const hasTrace = Boolean(pipelineData && playbackCycle !== null);
   $("#cycle-position").textContent = hasTrace
     ? `Cycle ${playbackCycle}/${pipelineData.cycles}` : "Cycle —/—";
   $("#cycle-prev").disabled = !hasTrace || !stepMode || playbackCycle <= 1;
   $("#cycle-next").disabled = !hasTrace || !stepMode || playbackCycle >= pipelineData.cycles;
+  const canJump = hasTrace && stepMode;
+  const jumpInput = $("#cycle-jump");
+  jumpInput.disabled = !canJump;
+  $("#cycle-jump-form button").disabled = !canJump;
+  if (hasTrace) {
+    jumpInput.max = pipelineData.cycles;
+    jumpInput.placeholder = `1–${pipelineData.cycles}`;
+  } else {
+    jumpInput.removeAttribute("max");
+    jumpInput.placeholder = "Cycle";
+    jumpInput.value = "";
+  }
 }
 
 function renderPipelineDiagram() {
@@ -1364,6 +1443,14 @@ function jumpTargetRow(rows, address, afterCycle = 0) {
 }
 
 function renderPipeline() {
+  if (pipelinePaintFrame !== null) {
+    cancelAnimationFrame(pipelinePaintFrame);
+    pipelinePaintFrame = null;
+  }
+  if (pipelineResizeObserver) {
+    pipelineResizeObserver.disconnect();
+    pipelineResizeObserver = null;
+  }
   const data = pipelineData;
   if (!data) {
     $("#pipeline-grid").innerHTML = "";
@@ -1383,7 +1470,7 @@ function renderPipeline() {
   const addressWidth = 88;
   const instructionWidth = window.innerWidth <= 700 ? 150 : 182;
   const flowWidth = window.innerWidth <= 700 ? 132 : 140;
-  const columns = `${addressWidth}px ${instructionWidth}px ${flowWidth}px repeat(${data.cycles}, ${cellWidth}px)`;
+  const frozenWidth = addressWidth + instructionWidth + flowWidth;
   const totalWidth = addressWidth + instructionWidth + flowWidth + data.cycles * cellWidth;
   const grid = $("#pipeline-grid");
   const scroll = $("#pipeline-scroll");
@@ -1405,23 +1492,51 @@ function renderPipeline() {
   $("#pipeline-summary").textContent = `${instructionCount} instructions · ${codeBytes} bytes pipeline code${predictionSummary} · CPI ${cpi}`;
   updateCycleNavigation();
   grid.style.width = totalWidth + "px";
-
-  let header = `<div class="pipeline-header" style="grid-template-columns:${columns};width:${totalWidth}px">`;
-  header += '<div class="cell address-cell head corner">PC Address</div>';
-  header += '<div class="cell inst head corner">Instruction</div>';
-  header += '<div class="cell flow-cell head corner" title="Control-flow transfers, prediction misses, and cache misses">Control / cache</div>';
-  for (let cycle = 1; cycle <= data.cycles; cycle++) {
-    header += `<div class="cell head ${selectedColumn === cycle ? "column-selected" : ""}${cycle > visibleCycle ? " future" : ""}" data-col="${cycle}">${cycle}</div>`;
-  }
-  header += `</div><div class="pipeline-rows" style="height:${displayRows.length * rowHeight}px;width:${totalWidth}px"></div>`;
-  grid.innerHTML = header;
+  grid.innerHTML = `<div class="pipeline-header" style="width:${totalWidth}px"></div><div class="pipeline-rows" style="height:${displayRows.length * rowHeight}px;width:${totalWidth}px"></div>`;
+  const header = grid.querySelector(".pipeline-header");
   const rows = grid.querySelector(".pipeline-rows");
+  const cycleOverscan = 8;
+  let paintedFirstRow = -1;
+  let paintedLastRow = -1;
+  let paintedFirstCycle = -1;
+  let paintedLastCycle = -1;
+  let forceNextPaint = false;
 
-  function paintRows() {
-    const visibleTop = Math.max(0, scroll.scrollTop - rowHeight);
-    const first = Math.max(0, Math.floor(visibleTop / rowHeight) - 6);
-    const visibleCount = Math.ceil(scroll.clientHeight / rowHeight) + 14;
-    const last = Math.min(displayRows.length, first + visibleCount);
+  function visibleCycleWindow() {
+    const cycleViewportWidth = Math.max(
+      cellWidth, scroll.clientWidth - frozenWidth);
+    const firstVisible = Math.max(
+      1, Math.floor(scroll.scrollLeft / cellWidth) + 1);
+    const lastVisible = Math.min(
+      data.cycles,
+      Math.ceil((scroll.scrollLeft + cycleViewportWidth) / cellWidth));
+    return {
+      first: Math.max(1, firstVisible - cycleOverscan),
+      last: Math.min(data.cycles, lastVisible + cycleOverscan)
+    };
+  }
+
+  function virtualColumns(firstCycle, lastCycle) {
+    const beforeWidth = (firstCycle - 1) * cellWidth;
+    const cycleCount = Math.max(0, lastCycle - firstCycle + 1);
+    const afterWidth = Math.max(0, data.cycles - lastCycle) * cellWidth;
+    return `${addressWidth}px ${instructionWidth}px ${flowWidth}px ${beforeWidth}px repeat(${cycleCount}, ${cellWidth}px) ${afterWidth}px`;
+  }
+
+  function paintHeader(firstCycle, lastCycle, columns) {
+    let html = '<div class="cell address-cell head corner">PC Address</div>';
+    html += '<div class="cell inst head corner">Instruction</div>';
+    html += '<div class="cell flow-cell head corner" title="Control-flow transfers, prediction misses, and cache misses">Control / cache</div>';
+    html += '<div class="pipeline-cycle-spacer" aria-hidden="true"></div>';
+    for (let cycle = firstCycle; cycle <= lastCycle; cycle++) {
+      html += `<div class="cell head ${selectedColumn === cycle ? "column-selected" : ""}${cycle > visibleCycle ? " future" : ""}" data-col="${cycle}">${cycle}</div>`;
+    }
+    html += '<div class="pipeline-cycle-spacer" aria-hidden="true"></div>';
+    header.style.gridTemplateColumns = columns;
+    header.innerHTML = html;
+  }
+
+  function paintRows(first, last, firstCycle, lastCycle, columns) {
     let html = "";
 
     for (let rowIndex = first; rowIndex < last; rowIndex++) {
@@ -1451,16 +1566,52 @@ function renderPipeline() {
         ? `<span class="branch-miss">BP miss${predictionMisses > 1 ? ` ×${predictionMisses}` : ""}</span>`
         : "";
       html += `<div class="cell flow-cell" data-row="${rowIndex}">${jumpLinks}${predictionEvent}${cacheEvents}</div>`;
-      for (let cycle = 1; cycle <= data.cycles; cycle++) {
+      html += '<div class="pipeline-cycle-spacer" aria-hidden="true"></div>';
+      for (let cycle = firstCycle; cycle <= lastCycle; cycle++) {
         const stage = row.cycles[cycle] || "";
         const label = stage.length > 1 && stage !== "S" ? stage.split("").join("/") : stage;
         const stageClass = stage ? "stage-" + stage.slice(-1) : "";
         const columnClass = selectedColumn === cycle ? " column-selected" : "";
         html += `<div class="cell ${stageClass}${columnClass}${cycle > visibleCycle ? " future" : ""}" data-row="${rowIndex}" data-col="${cycle}" data-stage="${stage}">${label}</div>`;
       }
+      html += '<div class="pipeline-cycle-spacer" aria-hidden="true"></div>';
       html += "</div>";
     }
     rows.innerHTML = html;
+  }
+
+  function paintViewport(force = false) {
+    const visibleTop = Math.max(0, scroll.scrollTop - rowHeight);
+    const firstRow = Math.max(0, Math.floor(visibleTop / rowHeight) - 6);
+    const visibleRowCount = Math.ceil(scroll.clientHeight / rowHeight) + 14;
+    const lastRow = Math.min(displayRows.length, firstRow + visibleRowCount);
+    const cycleWindow = visibleCycleWindow();
+    const rowsChanged = firstRow !== paintedFirstRow || lastRow !== paintedLastRow;
+    const cyclesChanged = cycleWindow.first !== paintedFirstCycle
+      || cycleWindow.last !== paintedLastCycle;
+    if (!force && !rowsChanged && !cyclesChanged) return;
+    const columns = virtualColumns(cycleWindow.first, cycleWindow.last);
+    if (force || cyclesChanged) {
+      paintHeader(cycleWindow.first, cycleWindow.last, columns);
+    }
+    if (force || rowsChanged || cyclesChanged) {
+      paintRows(firstRow, lastRow, cycleWindow.first, cycleWindow.last, columns);
+    }
+    paintedFirstRow = firstRow;
+    paintedLastRow = lastRow;
+    paintedFirstCycle = cycleWindow.first;
+    paintedLastCycle = cycleWindow.last;
+  }
+
+  function schedulePaint(force = false) {
+    forceNextPaint ||= force;
+    if (pipelinePaintFrame !== null) return;
+    pipelinePaintFrame = requestAnimationFrame(() => {
+      pipelinePaintFrame = null;
+      const repaintAll = forceNextPaint;
+      forceNextPaint = false;
+      paintViewport(repaintAll);
+    });
   }
 
   grid.onmousemove = event => {
@@ -1498,7 +1649,7 @@ function renderPipeline() {
         selectedRow = targetRow;
         scroll.scrollTop = Math.max(0, targetRow * rowHeight - rowHeight * 2);
         highlightSourceLine(displayRows[targetRow].sourceLine);
-        paintRows();
+        paintViewport(true);
       }
       return;
     }
@@ -1509,10 +1660,7 @@ function renderPipeline() {
       highlightSourceLine(displayRows[selectedRow].sourceLine);
     }
     if (cell.dataset.col !== undefined) selectedColumn = Number(cell.dataset.col);
-    grid.querySelectorAll(".pipeline-header [data-col]").forEach(headerCell => {
-      headerCell.classList.toggle("column-selected", Number(headerCell.dataset.col) === selectedColumn);
-    });
-    paintRows();
+    paintViewport(true);
   };
   grid.onclick = null;
   grid.oncontextmenu = event => {
@@ -1521,10 +1669,17 @@ function renderPipeline() {
     pipelineSelectTarget(event.target);
   };
 
-  scroll.onscroll = paintRows;
+  scroll.onscroll = () => schedulePaint();
   scroll.scrollLeft = savedLeft;
   scroll.scrollTop = savedTop;
-  paintRows();
+  paintViewport(true);
+  if ("ResizeObserver" in window) {
+    pipelineResizeObserver = new ResizeObserver(() => schedulePaint(true));
+    pipelineResizeObserver.observe(scroll);
+  }
+  // renderPipeline can run while its tab is hidden. Recalculate once the
+  // browser has laid out the newly visible pipeline viewport.
+  schedulePaint(true);
   renderRegisters();
   renderPipelineDiagram();
   renderMemory();
@@ -1793,6 +1948,7 @@ function clearCurrentProject() {
   $("#cycle-next").disabled = true;
   $("#cycle-position").textContent = "Cycle —/—";
   $("#step").disabled = true;
+  updateCycleNavigation();
 }
 
 
@@ -2023,6 +2179,10 @@ $("#cell-smaller").onclick = () => adjustCellWidth(-6);
 $("#cell-larger").onclick = () => adjustCellWidth(6);
 $("#cycle-prev").onclick = () => movePlaybackCycle(-1);
 $("#cycle-next").onclick = () => movePlaybackCycle(1);
+$("#cycle-jump-form").onsubmit = event => {
+  event.preventDefault();
+  jumpToCycle();
+};
 $("#expand-loops").onchange = () => {
   selectedRow = null;
   if (pipelineData) renderPipeline();
