@@ -23,6 +23,7 @@ ICON_PATH = STUDIO_ROOT / "frontend" / "icon.png"
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+import ase_studio.backend as backend  # noqa: E402
 from ase_studio.backend import (  # noqa: E402
     Handler, require_startup_repositories, terminate_active_commands,
 )
@@ -107,6 +108,60 @@ def main() -> int:
             return False
 
         policy_handler = view.connect("decide-policy", open_external_links)
+
+        def show_portal_sign_in(uid, url):
+            # A private, ephemeral WebKit context keeps PoliTO cookies out of
+            # the Studio view and discards them when the window closes.
+            sign_in = Gtk.Window(title="PoliTO sign-in", transient_for=window,
+                                 modal=True, destroy_with_parent=True)
+            sign_in.set_default_size(560, 760)
+            sign_in_view = WebKit2.WebView.new_with_context(
+                WebKit2.WebContext.new_ephemeral())
+            completed = False
+
+            def finish(uri):
+                nonlocal completed
+                if completed:
+                    return
+                completed = True
+                # Exchanging the SSO key is a network call; keep GTK responsive.
+                threading.Thread(target=backend.portal_sso_callback,
+                                 args=(uri,), daemon=True).start()
+                sign_in.destroy()
+
+            def intercept_callback(_view, decision, decision_type):
+                if decision_type not in {
+                        WebKit2.PolicyDecisionType.NAVIGATION_ACTION,
+                        WebKit2.PolicyDecisionType.NEW_WINDOW_ACTION}:
+                    return False
+                uri = decision.get_navigation_action().get_request().get_uri()
+                if not uri.startswith(backend.PORTAL_SSO_CALLBACK):
+                    return False
+                decision.ignore()
+                finish(uri)
+                return True
+
+            def intercept_failed_callback(_view, _event, failing_uri, _error):
+                # Redirects to the unknown polito:// scheme may surface here.
+                if not failing_uri.startswith(backend.PORTAL_SSO_CALLBACK):
+                    return False
+                finish(failing_uri)
+                return True
+
+            def sign_in_closed(_widget):
+                if not completed:
+                    backend.portal_sso_cancel(uid)
+
+            sign_in_view.connect("decide-policy", intercept_callback)
+            sign_in_view.connect("load-failed", intercept_failed_callback)
+            sign_in.connect("destroy", sign_in_closed)
+            sign_in.add(sign_in_view)
+            sign_in.show_all()
+            sign_in_view.load_uri(url)
+            return GLib.SOURCE_REMOVE
+
+        backend.PORTAL_SSO_OPENER = (
+            lambda uid, url: GLib.idle_add(show_portal_sign_in, uid, url))
 
         def choose_download_destination(download, suggested_filename):
             dialog = Gtk.FileChooserDialog(

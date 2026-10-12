@@ -162,7 +162,11 @@ async function api(url, options = {}) {
   } catch (_error) {
     throw Error(`ASE Studio received an incompatible server response (${response.status}). Stop the old server and restart ./ase-studio.sh.`);
   }
-  if (!response.ok) throw Error(data.error || "Request failed");
+  if (!response.ok) {
+    const error = Error(data.error || "Request failed");
+    error.status = response.status;
+    throw error;
+  }
   return data;
 }
 
@@ -597,6 +601,241 @@ function submissionAttachment(file) {
   });
 }
 
+const PORTAL_ASE_SHORTCODE = "02GOLYG";
+let portalState = {loggedIn: false, username: "", remembered: false, ssoAvailable: false};
+let portalCoursesLoaded = false;
+let portalLoginResolver = null;
+let portalSsoUid = null;
+
+function jsonRequest(body) {
+  return {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)};
+}
+
+function updatePortalAccount() {
+  $("#portal-account-status").textContent = portalState.loggedIn
+    ? "Signed in as " + (portalState.username || "student") + "."
+    : "Not signed in.";
+  $("#portal-account-button").textContent = portalState.loggedIn ? "Sign out" : "Sign in";
+}
+
+async function refreshPortalStatus() {
+  try {
+    portalState = await api("/api/portal/status");
+  } catch (_error) {
+    portalState = {loggedIn: false, username: "", remembered: false, ssoAvailable: false};
+  }
+  updatePortalAccount();
+}
+
+function resetPortalCourses(label) {
+  const select = $("#portal-course");
+  select.innerHTML = '<option value="">' + escapeHtml(label) + "</option>";
+  select.disabled = true;
+  portalCoursesLoaded = false;
+}
+
+async function loadPortalCourses() {
+  if (!portalState.loggedIn) {
+    resetPortalCourses("Sign in to load your courses");
+    return;
+  }
+  const select = $("#portal-course");
+  resetPortalCourses("Loading courses…");
+  try {
+    const data = await api("/api/portal/courses");
+    const saved = localStorage.getItem("ase-studio-portal-course");
+    select.innerHTML = '<option value="">Choose a course</option>' + data.courses.map(course =>
+      '<option value="' + course.id + '">' + escapeHtml(course.name)
+      + (course.shortcode ? " · " + escapeHtml(course.shortcode) : "") + "</option>"
+    ).join("");
+    const preferred = data.courses.find(course => String(course.id) === saved)
+      || data.courses.find(course => course.shortcode === PORTAL_ASE_SHORTCODE);
+    select.value = preferred ? String(preferred.id) : "";
+    select.disabled = false;
+    portalCoursesLoaded = true;
+  } catch (error) {
+    if (error.status === 401) await refreshPortalStatus();
+    resetPortalCourses(portalState.loggedIn ? "Courses unavailable" : "Sign in to load your courses");
+    await showActionMessage("Portale della Didattica", error.message);
+  }
+}
+
+function setPortalLoginBusy(busy) {
+  ["#portal-username", "#portal-password", "#portal-remember", "#portal-login-sso", "#portal-login-confirm"]
+    .forEach(selector => { $(selector).disabled = busy; });
+  $("#portal-login-confirm").textContent = busy && !portalSsoUid ? "Signing in…" : "Sign in";
+}
+
+function showPortalLoginMessage(message, isError = false) {
+  const element = $("#portal-login-message");
+  element.textContent = message || "";
+  element.hidden = !message;
+  element.classList.toggle("error", isError);
+}
+
+function portalSignIn() {
+  if (portalLoginResolver) return Promise.resolve(false);
+  $("#portal-username").value = portalState.username || "";
+  $("#portal-password").value = "";
+  $("#portal-remember").checked = localStorage.getItem("ase-studio-portal-remember") === "1";
+  $("#portal-login-sso").hidden = !portalState.ssoAvailable;
+  showPortalLoginMessage("");
+  setPortalLoginBusy(false);
+  $("#portal-login-dialog").showModal();
+  setTimeout(() => ($("#portal-username").value ? $("#portal-password") : $("#portal-username")).focus(), 0);
+  return new Promise(resolve => { portalLoginResolver = resolve; });
+}
+
+function finishPortalLogin(signedIn) {
+  if (portalSsoUid) {
+    api("/api/portal/sso/cancel", jsonRequest({uid: portalSsoUid})).catch(() => {});
+    portalSsoUid = null;
+  }
+  $("#portal-password").value = "";
+  const dialog = $("#portal-login-dialog");
+  if (dialog.open) dialog.close();
+  const resolver = portalLoginResolver;
+  portalLoginResolver = null;
+  if (signedIn) portalCoursesLoaded = false;
+  updatePortalAccount();
+  if (resolver) resolver(signedIn);
+}
+
+async function submitPortalLogin() {
+  const username = $("#portal-username").value.trim();
+  const password = $("#portal-password").value;
+  if (!username || !password) {
+    showPortalLoginMessage("Enter your username and password.", true);
+    return;
+  }
+  const remember = $("#portal-remember").checked;
+  localStorage.setItem("ase-studio-portal-remember", remember ? "1" : "0");
+  setPortalLoginBusy(true);
+  showPortalLoginMessage("");
+  try {
+    portalState = await api("/api/portal/login", jsonRequest({username, password, remember}));
+    finishPortalLogin(true);
+  } catch (error) {
+    setPortalLoginBusy(false);
+    showPortalLoginMessage(error.message, true);
+    $("#portal-password").select();
+  }
+}
+
+async function startPortalSso() {
+  const remember = $("#portal-remember").checked;
+  localStorage.setItem("ase-studio-portal-remember", remember ? "1" : "0");
+  let uid = null;
+  try {
+    uid = (await api("/api/portal/sso/start", jsonRequest({remember}))).uid;
+    portalSsoUid = uid;
+    setPortalLoginBusy(true);
+    showPortalLoginMessage("Complete the sign-in in the PoliTO window.");
+    while (portalSsoUid === uid) {
+      await new Promise(resolve => setTimeout(resolve, 1000));
+      if (portalSsoUid !== uid) return;
+      const state = await api("/api/portal/sso?uid=" + encodeURIComponent(uid));
+      if (state.state === "pending" || state.state === "completing") continue;
+      portalSsoUid = null;
+      if (state.state === "done") {
+        portalState = state;
+        finishPortalLogin(true);
+        return;
+      }
+      if (state.state === "error") throw Error(state.error || "The PoliTO sign-in failed.");
+      setPortalLoginBusy(false);
+      showPortalLoginMessage("The PoliTO sign-in was cancelled.");
+    }
+  } catch (error) {
+    if (portalSsoUid && portalSsoUid !== uid) return;
+    portalSsoUid = null;
+    setPortalLoginBusy(false);
+    showPortalLoginMessage(error.message, true);
+  }
+}
+
+async function togglePortalAccount() {
+  if (portalState.loggedIn) {
+    try {
+      portalState = await api("/api/portal/logout", jsonRequest({}));
+    } catch (error) {
+      await showActionMessage("Portale della Didattica", error.message);
+    }
+    updatePortalAccount();
+    resetPortalCourses("Sign in to load your courses");
+    return;
+  }
+  if (await portalSignIn()) await loadPortalCourses();
+}
+
+async function togglePortalUpload() {
+  const enabled = $("#portal-upload").checked;
+  $("#portal-upload-options").hidden = !enabled;
+  localStorage.setItem("ase-studio-portal-upload", enabled ? "1" : "0");
+  if (!enabled) return;
+  if (!portalState.loggedIn && !(await portalSignIn())) {
+    updatePortalAccount();
+    return;
+  }
+  if (!portalCoursesLoaded) await loadPortalCourses();
+}
+
+function appendSubmissionLog(text) {
+  lastNormalLog += "\n\n" + text;
+  lastAdvancedLog += "\n\n" + text;
+  updateLog();
+}
+
+async function uploadSubmissionToPortal(archive, courseId, courseName) {
+  appendSubmissionLog("Uploading to the Elaborati of " + courseName + "…");
+  $("#submit").textContent = "Uploading…";
+  let replace = null;
+  let signedInAgain = false;
+  while (true) {
+    try {
+      const upload = await api("/api/portal/upload", jsonRequest({archive, courseId, replace}));
+      if (upload.conflict) {
+        const previous = upload.existing.map(entry =>
+          "• " + entry.filename + " (" + entry.sizeInKiloBytes + " KiB, " + entry.uploadedAt + ")").join("\n");
+        const choice = await actionDialog({
+          title: "Elaborato already uploaded",
+          message: "The course's Elaborati already contain:\n" + previous
+            + "\n\nReplace withdraws the previous copy after the new upload is confirmed.",
+          confirmLabel: "Replace", confirmValue: "replace",
+          alternateLabel: "Keep both", alternateValue: "keep",
+          cancelLabel: "Don't upload"
+        });
+        if (choice !== "replace" && choice !== "keep") {
+          appendSubmissionLog("Upload skipped. The ZIP is saved locally only.");
+          return false;
+        }
+        replace = choice === "replace";
+        continue;
+      }
+      const lines = [];
+      if (upload.assignment) {
+        lines.push("Uploaded to Elaborati: " + upload.assignment.filename + " ("
+          + upload.assignment.sizeInKiloBytes + " KiB, " + upload.assignment.uploadedAt + ").");
+      } else {
+        lines.push("Uploaded " + upload.filename + " to Elaborati.");
+      }
+      if (upload.withdrawn.length) lines.push("Withdrew " + upload.withdrawn.length + " previous copy(ies).");
+      upload.warnings.forEach(warning => lines.push("Warning: " + warning));
+      appendSubmissionLog(lines.join("\n"));
+      return true;
+    } catch (error) {
+      if (error.status === 401 && !signedInAgain) {
+        signedInAgain = true;
+        portalState.loggedIn = false;
+        updatePortalAccount();
+        if (await portalSignIn()) continue;
+      }
+      appendSubmissionLog("Upload failed: " + error.message + "\nThe ZIP is saved locally only.");
+      return false;
+    }
+  }
+}
+
 async function submitAssignment() {
   if (!current) return;
   try {
@@ -608,8 +847,14 @@ async function submitAssignment() {
     $("#submission-files").value = "";
     $("#submission-expand-loops").checked = $("#expand-loops").checked;
     renderSubmissionFiles();
+    const portalUpload = localStorage.getItem("ase-studio-portal-upload") === "1";
+    $("#portal-upload").checked = portalUpload;
+    $("#portal-upload-options").hidden = !portalUpload;
+    await refreshPortalStatus();
+    if (!portalState.loggedIn) resetPortalCourses("Sign in to load your courses");
     $("#submission-dialog").showModal();
     $("#submission-assignment").focus();
+    if (portalUpload && portalState.loggedIn && !portalCoursesLoaded) loadPortalCourses();
   } catch (error) {
     await showActionMessage("Prepare submission", error.message);
   }
@@ -643,6 +888,22 @@ async function prepareSubmission() {
   if (totalSize > 100 * 1024 * 1024) {
     await showActionMessage("Prepare submission", "Additional files exceed the combined 100 MiB limit.");
     return;
+  }
+  const portalUpload = $("#portal-upload").checked;
+  let portalCourseId = null;
+  let portalCourseName = "";
+  if (portalUpload) {
+    if (!portalState.loggedIn) {
+      if (!(await portalSignIn())) return;
+      await loadPortalCourses();
+    }
+    portalCourseId = Number($("#portal-course").value) || null;
+    if (!portalCourseId) {
+      await showActionMessage("Prepare submission", "Choose the course whose Elaborati should receive the ZIP.");
+      return;
+    }
+    portalCourseName = $("#portal-course").selectedOptions[0].textContent;
+    localStorage.setItem("ase-studio-portal-course", String(portalCourseId));
   }
 
   const confirmButton = $("#submission-confirm");
@@ -699,7 +960,11 @@ async function prepareSubmission() {
     lastNormalLog = result.output;
     lastAdvancedLog = result.advancedOutput || result.output;
     updateLog();
-    if (result.ok && result.archive) {
+    let uploaded = false;
+    if (result.ok && result.archive && portalUpload) {
+      uploaded = await uploadSubmissionToPortal(result.archive, portalCourseId, portalCourseName);
+    }
+    if (result.ok && result.archive && !uploaded) {
       try {
         await api("/api/submission/reveal", {
           method: "POST",
@@ -1978,6 +2243,18 @@ $("#submission-dialog").addEventListener("cancel", event => {
   if ($("#submission-confirm").disabled) event.preventDefault();
 });
 $("#submission-files").onchange = renderSubmissionFiles;
+$("#portal-upload").onchange = togglePortalUpload;
+$("#portal-account-button").onclick = togglePortalAccount;
+$("#portal-login-form").onsubmit = event => {
+  event.preventDefault();
+  submitPortalLogin();
+};
+$("#portal-login-sso").onclick = startPortalSso;
+$("#portal-login-cancel").onclick = () => finishPortalLogin(false);
+$("#portal-login-dialog").addEventListener("cancel", event => {
+  event.preventDefault();
+  finishPortalLogin(false);
+});
 $("#submission-select-all").onclick = () => {
   document.querySelectorAll("[data-submission-project]").forEach(input => { input.checked = true; });
 };

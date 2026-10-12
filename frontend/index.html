@@ -57,8 +57,25 @@
     <small>Up to 20 files, 25 MiB each and 100 MiB in total.</small>
     <div id="submission-file-list" class="submission-file-list">No additional files selected.</div>
   </fieldset>
+  <fieldset id="submission-portal"><legend>Portale della Didattica</legend>
+    <label class="check"><input id="portal-upload" type="checkbox"> Upload the ZIP to the course's Elaborati</label>
+    <div id="portal-upload-options" class="portal-upload-options" hidden>
+      <div class="portal-account"><span id="portal-account-status">Not signed in.</span><button type="button" id="portal-account-button">Sign in</button></div>
+      <label class="portal-course">Course<select id="portal-course" disabled><option value="">Sign in to load your courses</option></select></label>
+      <small>The ZIP is always kept in the submission folder as well.</small>
+    </div>
+  </fieldset>
   <label class="check"><input id="submission-expand-loops" type="checkbox" checked> Export repeated loop iterations as separate pipeline rows</label>
   <div class="dialog-actions"><button type="button" id="cancel-submission">Cancel</button><button type="submit" id="submission-confirm" class="primary">Create submission</button></div>
+</form></dialog>
+<dialog id="portal-login-dialog"><form id="portal-login-form">
+  <h2>Sign in to the Portale della Didattica</h2>
+  <p>Use your PoliTO credentials. ASE Studio never stores your password.</p>
+  <label>Username<input id="portal-username" type="text" placeholder="s123456" autocomplete="username" spellcheck="false" autocapitalize="off"></label>
+  <label>Password<input id="portal-password" type="password" autocomplete="current-password"></label>
+  <label class="check"><input id="portal-remember" type="checkbox"> Keep me signed in on this computer</label>
+  <p id="portal-login-message" class="portal-login-message" role="status" hidden></p>
+  <div class="dialog-actions"><button type="button" id="portal-login-cancel">Cancel</button><button type="button" id="portal-login-sso" hidden>Sign in with PoliTO SSO</button><button type="submit" id="portal-login-confirm" class="primary">Sign in</button></div>
 </form></dialog>
 <dialog id="environment-dialog"><form id="environment-form" novalidate>
   <h2>Settings</h2>

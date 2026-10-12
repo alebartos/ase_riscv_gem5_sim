@@ -324,6 +324,21 @@ dialog::backdrop { background: #0f172a73; }
 .submission-file-list { display: grid; gap: 4px; max-height: 110px; overflow: auto; color: var(--muted); font: 11px/1.4 ui-monospace, monospace; }
 .submission-file-entry { display: flex; justify-content: space-between; gap: 12px; }
 .submission-file-entry strong { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ink); }
+.portal-upload-options { display: grid; gap: 10px; }
+.portal-upload-options[hidden] { display: none; }
+.portal-upload-options small { color: var(--muted); line-height: 1.4; }
+.portal-account { display: flex; align-items: center; justify-content: space-between; gap: 12px; color: var(--ink); }
+.portal-account span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.portal-course { display: grid; gap: 6px; font-weight: 600; }
+#portal-course { width: 100%; min-width: 0; border: 1px solid #b8c5d6; border-radius: 5px; padding: 8px; color: var(--ink); background: #fff; }
+#portal-login-dialog { width: min(440px, calc(100vw - 30px)); }
+#portal-login-form { padding: 20px; display: grid; gap: 14px; }
+#portal-login-form h2 { margin: 0; color: var(--ink); font-size: 18px; text-transform: none; letter-spacing: normal; }
+#portal-login-form > p { margin: 0; color: var(--muted); line-height: 1.4; }
+#portal-login-form > label:not(.check) { display: grid; gap: 6px; font-weight: 600; }
+#portal-username, #portal-password { width: 100%; min-width: 0; border: 1px solid #b8c5d6; border-radius: 5px; padding: 8px; color: var(--ink); background: #fff; }
+#portal-login-form > .portal-login-message { color: var(--ink); white-space: pre-wrap; }
+#portal-login-form > .portal-login-message.error { color: #c92a2a; }
 #environment-dialog { width: min(650px, calc(100vw - 30px)); }
 #environment-form { padding: 20px; display: grid; gap: 14px; max-height: calc(100vh - 30px); overflow: auto; }
 #environment-form h2 { margin: 0; color: var(--ink); font-size: 18px; text-transform: none; letter-spacing: normal; }
@@ -399,7 +414,8 @@ html[data-theme="dark"] #bottom,
 html[data-theme="dark"] .editor-wrap,
 html[data-theme="dark"] dialog,
 html[data-theme="dark"] #cpu-form,
-html[data-theme="dark"] #submission-form { background: #111827; color: var(--ink); }
+html[data-theme="dark"] #submission-form,
+html[data-theme="dark"] #portal-login-form { background: #111827; color: var(--ink); }
 html[data-theme="dark"] button,
 html[data-theme="dark"] #search,
 html[data-theme="dark"] #integer-register-format,
@@ -410,8 +426,12 @@ html[data-theme="dark"] #cpu-form input[type="number"],
 html[data-theme="dark"] #cpu-form input[type="text"],
 html[data-theme="dark"] #submission-assignment,
 html[data-theme="dark"] #submission-files,
+html[data-theme="dark"] #portal-course,
+html[data-theme="dark"] #portal-username,
+html[data-theme="dark"] #portal-password,
 html[data-theme="dark"] .memory-watch-controls select { background: #1f2937; border-color: #4b5d73; color: #e5edf7; }
 html[data-theme="dark"] .submission-projects { background: #182233; }
+html[data-theme="dark"] #portal-login-form > .portal-login-message.error { color: #fca5a5; }
 html[data-theme="dark"] .submission-project:hover { background: #243249; }
 html[data-theme="dark"] .theme { background: #334155; color: #f8fafc; }
 html[data-theme="dark"] .gear { background: #334155; color: #f8fafc; }
