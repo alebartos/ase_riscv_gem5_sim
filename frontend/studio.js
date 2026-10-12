@@ -601,15 +601,11 @@ function submissionAttachment(file) {
   });
 }
 
-const PORTAL_ASE_SHORTCODE = "02GOLYG";
 const PORTAL_WEBSITE = "https://didattica.polito.it/";
 let portalState = {loggedIn: false, username: "", remembered: false, ssoAvailable: false};
-let portalCourses = null;
-let portalCoursesLoaded = false;
 let portalLoginResolver = null;
 let portalSsoUid = null;
 let portalReviewResolver = null;
-let elaboratiCourseId = null;
 
 function jsonRequest(body) {
   return {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)};
@@ -632,7 +628,6 @@ async function refreshPortalStatus() {
   } catch (_error) {
     portalState = {loggedIn: false, username: "", remembered: false, ssoAvailable: false};
   }
-  if (!portalState.loggedIn) portalCourses = null;
   updatePortalAccount();
 }
 
@@ -644,43 +639,9 @@ async function portalCall(request) {
   } catch (error) {
     if (error.status !== 401) throw error;
     portalState.loggedIn = false;
-    portalCourses = null;
     updatePortalAccount();
     if (!(await portalSignIn())) throw error;
     return await request();
-  }
-}
-
-function resetPortalCourses(select, label) {
-  select.innerHTML = '<option value="">' + escapeHtml(label) + "</option>";
-  select.disabled = true;
-  if (select === $("#portal-course")) portalCoursesLoaded = false;
-}
-
-async function loadPortalCourses(select = $("#portal-course")) {
-  if (!portalState.loggedIn) {
-    resetPortalCourses(select, "Sign in to load your courses");
-    return false;
-  }
-  resetPortalCourses(select, "Loading courses…");
-  try {
-    if (!portalCourses) portalCourses = (await portalCall(() => api("/api/portal/courses"))).courses;
-    const saved = localStorage.getItem("ase-studio-portal-course");
-    select.innerHTML = '<option value="">Choose a course</option>' + portalCourses.map(course =>
-      '<option value="' + course.id + '">' + escapeHtml(course.name)
-      + (course.shortcode ? " · " + escapeHtml(course.shortcode) : "") + "</option>"
-    ).join("");
-    const preferred = portalCourses.find(course => String(course.id) === saved)
-      || portalCourses.find(course => course.shortcode === PORTAL_ASE_SHORTCODE);
-    select.value = preferred ? String(preferred.id) : "";
-    select.disabled = false;
-    if (select === $("#portal-course")) portalCoursesLoaded = true;
-    return true;
-  } catch (error) {
-    if (error.status === 401) await refreshPortalStatus();
-    resetPortalCourses(select, portalState.loggedIn ? "Courses unavailable" : "Sign in to load your courses");
-    await showActionMessage("Portale della Didattica", error.message);
-    return false;
   }
 }
 
@@ -723,10 +684,6 @@ function finishPortalLogin(signedIn) {
   if (dialog.open) dialog.close();
   const resolver = portalLoginResolver;
   portalLoginResolver = null;
-  if (signedIn) {
-    portalCourses = null;
-    portalCoursesLoaded = false;
-  }
   updatePortalAccount();
   if (resolver) resolver(signedIn);
 }
@@ -790,9 +747,7 @@ async function portalSignOut() {
   } catch (error) {
     await showActionMessage("Portale della Didattica", error.message);
   }
-  portalCourses = null;
   updatePortalAccount();
-  resetPortalCourses($("#portal-course"), "Sign in to load your courses");
 }
 
 async function togglePortalAccount() {
@@ -800,7 +755,7 @@ async function togglePortalAccount() {
     await portalSignOut();
     return;
   }
-  if (await portalSignIn()) await loadPortalCourses();
+  await portalSignIn();
 }
 
 async function togglePortalUpload() {
@@ -808,11 +763,7 @@ async function togglePortalUpload() {
   $("#portal-upload-options").hidden = !enabled;
   localStorage.setItem("ase-studio-portal-upload", enabled ? "1" : "0");
   if (!enabled) return;
-  if (!portalState.loggedIn && !(await portalSignIn())) {
-    updatePortalAccount();
-    return;
-  }
-  if (!portalCoursesLoaded) await loadPortalCourses();
+  if (!portalState.loggedIn) await portalSignIn();
 }
 
 function appendSubmissionLog(text) {
@@ -849,8 +800,12 @@ async function offerManualUpload(archive, reason) {
   if (choice === "portal") window.open(PORTAL_WEBSITE, "_blank", "noopener");
 }
 
-function reviewPortalUpload(preview, courseName) {
-  $("#portal-review-course").textContent = courseName;
+function portalCourseLabel(course) {
+  return course.name + (course.shortcode ? " · " + course.shortcode : "");
+}
+
+function reviewPortalUpload(preview) {
+  $("#portal-review-course").textContent = portalCourseLabel(preview.course);
   $("#portal-review-file").textContent = preview.filename;
   $("#portal-review-size").textContent = formatSubmissionFileSize(preview.size);
   $("#portal-review-description").value = preview.description;
@@ -880,16 +835,16 @@ function finishPortalReview(decision) {
 
 // Returns true when the ZIP was handed off (uploaded or saved for manual
 // upload), false when it stays only in the submission folder.
-async function uploadSubmissionToPortal(archive, courseId, courseName) {
+async function uploadSubmissionToPortal(archive) {
   let preview;
   try {
-    preview = await portalCall(() => api("/api/portal/preview", jsonRequest({archive, courseId})));
+    preview = await portalCall(() => api("/api/portal/preview", jsonRequest({archive})));
   } catch (error) {
     appendSubmissionLog("Upload failed: " + error.message);
     await offerManualUpload(archive, "The upload could not be prepared: " + error.message);
     return true;
   }
-  const decision = await reviewPortalUpload(preview, courseName);
+  const decision = await reviewPortalUpload(preview);
   if (decision.action === "manual") {
     await offerManualUpload(archive);
     return true;
@@ -898,13 +853,13 @@ async function uploadSubmissionToPortal(archive, courseId, courseName) {
     appendSubmissionLog("Upload cancelled. The ZIP is saved in the submission folder only.");
     return false;
   }
-  appendSubmissionLog("Uploading " + preview.filename + " to the Elaborati of " + courseName + "…");
+  appendSubmissionLog("Uploading " + preview.filename + " to the Elaborati of " + portalCourseLabel(preview.course) + "…");
   $("#submit").textContent = "Uploading…";
   let replace = preview.existing.length ? decision.replace : null;
   while (true) {
     try {
       const upload = await portalCall(() => api("/api/portal/upload", jsonRequest({
-        archive, courseId, description: decision.description, replace
+        archive, description: decision.description, replace
       })));
       if (upload.conflict) {
         // Someone uploaded the same file since the review; ask again.
@@ -967,20 +922,19 @@ function renderElaborati(assignments) {
 }
 
 async function loadElaborati() {
-  const courseId = Number($("#elaborati-course").value) || null;
-  elaboratiCourseId = courseId;
-  $("#elaborati-refresh").disabled = !courseId;
-  if (!courseId) {
-    renderElaboratiMessage(portalState.loggedIn ? "Choose a course." : "Sign in to see your Elaborati.");
+  $("#elaborati-refresh").disabled = !portalState.loggedIn;
+  if (!portalState.loggedIn) {
+    renderElaboratiMessage("Sign in to see your Elaborati.");
     return;
   }
-  localStorage.setItem("ase-studio-portal-course", String(courseId));
   renderElaboratiMessage("Loading Elaborati…");
   try {
-    const data = await portalCall(() => api("/api/portal/assignments?courseId=" + courseId));
-    if (elaboratiCourseId === courseId) renderElaborati(data.assignments);
+    const data = await portalCall(() => api("/api/portal/assignments"));
+    $("#elaborati-course").textContent = portalCourseLabel(data.course);
+    renderElaborati(data.assignments);
   } catch (error) {
     await refreshPortalStatus();
+    $("#elaborati-refresh").disabled = !portalState.loggedIn;
     renderElaboratiMessage(error.message);
   }
 }
@@ -988,7 +942,6 @@ async function loadElaborati() {
 async function changeElaborato(button) {
   const assignmentId = Number(button.dataset.elaborato);
   const withdrawn = button.dataset.withdraw === "true";
-  const courseId = elaboratiCourseId;
   if (withdrawn) {
     const confirmed = await actionDialog({
       title: "Withdraw Elaborato",
@@ -1000,8 +953,8 @@ async function changeElaborato(button) {
   button.disabled = true;
   try {
     const data = await portalCall(() => api("/api/portal/assignment",
-      jsonRequest({courseId, assignmentId, withdrawn})));
-    if (elaboratiCourseId === courseId) renderElaborati(data.assignments);
+      jsonRequest({assignmentId, withdrawn})));
+    renderElaborati(data.assignments);
   } catch (error) {
     button.disabled = false;
     await showActionMessage("Elaborati", error.message);
@@ -1010,23 +963,21 @@ async function changeElaborato(button) {
 
 async function openElaborati() {
   await refreshPortalStatus();
-  renderElaboratiMessage(portalState.loggedIn ? "Loading courses…" : "Sign in to see your Elaborati.");
-  resetPortalCourses($("#elaborati-course"), "Sign in to load your courses");
+  renderElaboratiMessage(portalState.loggedIn ? "Loading Elaborati…" : "Sign in to see your Elaborati.");
   $("#elaborati-refresh").disabled = true;
   $("#elaborati-dialog").showModal();
   if (!portalState.loggedIn && !(await portalSignIn())) return;
-  if (await loadPortalCourses($("#elaborati-course"))) await loadElaborati();
+  await loadElaborati();
 }
 
 async function toggleElaboratiAccount() {
   if (portalState.loggedIn) {
     await portalSignOut();
-    resetPortalCourses($("#elaborati-course"), "Sign in to load your courses");
     $("#elaborati-refresh").disabled = true;
     renderElaboratiMessage("Sign in to see your Elaborati.");
     return;
   }
-  if ((await portalSignIn()) && (await loadPortalCourses($("#elaborati-course")))) await loadElaborati();
+  if (await portalSignIn()) await loadElaborati();
 }
 
 async function submitAssignment() {
@@ -1044,10 +995,8 @@ async function submitAssignment() {
     $("#portal-upload").checked = portalUpload;
     $("#portal-upload-options").hidden = !portalUpload;
     await refreshPortalStatus();
-    if (!portalState.loggedIn) resetPortalCourses($("#portal-course"), "Sign in to load your courses");
     $("#submission-dialog").showModal();
     $("#submission-assignment").focus();
-    if (portalUpload && portalState.loggedIn && !portalCoursesLoaded) loadPortalCourses();
   } catch (error) {
     await showActionMessage("Prepare submission", error.message);
   }
@@ -1084,21 +1033,7 @@ async function prepareSubmission(mode = "submit") {
     return;
   }
   const portalUpload = !manualUpload && $("#portal-upload").checked;
-  let portalCourseId = null;
-  let portalCourseName = "";
-  if (portalUpload) {
-    if (!portalState.loggedIn) {
-      if (!(await portalSignIn())) return;
-      await loadPortalCourses();
-    }
-    portalCourseId = Number($("#portal-course").value) || null;
-    if (!portalCourseId) {
-      await showActionMessage("Prepare submission", "Choose the course whose Elaborati should receive the ZIP.");
-      return;
-    }
-    portalCourseName = $("#portal-course").selectedOptions[0].textContent;
-    localStorage.setItem("ase-studio-portal-course", String(portalCourseId));
-  }
+  if (portalUpload && !portalState.loggedIn && !(await portalSignIn())) return;
 
   const confirmButton = $("#submission-confirm");
   const cancelButton = $("#cancel-submission");
@@ -1159,7 +1094,7 @@ async function prepareSubmission(mode = "submit") {
       await offerManualUpload(result.archive);
       uploaded = true;
     } else if (result.ok && result.archive && portalUpload) {
-      uploaded = await uploadSubmissionToPortal(result.archive, portalCourseId, portalCourseName);
+      uploaded = await uploadSubmissionToPortal(result.archive);
     }
     if (result.ok && result.archive && !uploaded) {
       try {
@@ -2487,7 +2422,6 @@ $("#portal-review-dialog").addEventListener("cancel", event => {
 $("#elaborati").onclick = openElaborati;
 $("#elaborati-close").onclick = () => $("#elaborati-dialog").close();
 $("#elaborati-form").onsubmit = event => event.preventDefault();
-$("#elaborati-course").onchange = loadElaborati;
 $("#elaborati-refresh").onclick = loadElaborati;
 $("#elaborati-account-button").onclick = toggleElaboratiAccount;
 $("#elaborati-list").addEventListener("click", event => {

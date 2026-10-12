@@ -84,6 +84,9 @@ PORTAL_SSO_TIMEOUT = 15 * 60
 PORTAL_REQUEST_TIMEOUT = 30
 PORTAL_UPLOAD_TIMEOUT = 300
 PORTAL_KEYRING_SERVICE = "ASE Studio Portale"
+# Uploads always go to Architetture dei sistemi di elaborazione. Its course
+# id changes every academic year, so it is found by its shortcode.
+PORTAL_COURSE_SHORTCODE = os.environ.get("ASE_STUDIO_PORTAL_COURSE", "02GOLYG")
 PORTAL_KEYRING_ACCOUNT = "portal-session"
 # native.py installs a callable(uid, url) that shows the PoliTO sign-in page.
 PORTAL_SSO_OPENER = None
@@ -4602,6 +4605,7 @@ _PORTAL_LOCK = threading.Lock()
 _PORTAL_SESSION = None
 _PORTAL_SESSION_LOADED = False
 _PORTAL_SSO = {}
+_PORTAL_COURSE = {}
 
 
 def portal_credentials_path() -> Path:
@@ -5005,10 +5009,21 @@ def portal_assignment_summary(assignment):
         "sizeInKiloBytes", "url")}
 
 
-def portal_course_id(course_id):
-    if not isinstance(course_id, int) or isinstance(course_id, bool) or course_id <= 0:
-        fail("Choose a course on the Portale della Didattica.")
-    return course_id
+def portal_course():
+    """Return the ASE course of the signed-in student, newest year first."""
+    token = portal_require_session()["token"]
+    with _PORTAL_LOCK:
+        if _PORTAL_COURSE.get("token") == token:
+            return dict(_PORTAL_COURSE["course"])
+    matches = [course for course in portal_courses()["courses"]
+               if course["shortcode"].upper() == PORTAL_COURSE_SHORTCODE.upper()]
+    if not matches:
+        fail("Your PoliTO account has no Architetture dei sistemi di elaborazione "
+             f"course ({PORTAL_COURSE_SHORTCODE}) on the Portale della Didattica.")
+    course = max(matches, key=lambda entry: (entry["year"] or 0, entry["id"]))
+    with _PORTAL_LOCK:
+        _PORTAL_COURSE.update(token=token, course=course)
+    return dict(course)
 
 
 def portal_course_assignments(course_id, token):
@@ -5017,20 +5032,20 @@ def portal_course_assignments(course_id, token):
             if isinstance(entry, dict)]
 
 
-def portal_assignments(course_id):
-    """List a course's Elaborati, newest first, including withdrawn ones."""
-    course_id = portal_course_id(course_id)
+def portal_assignments():
+    """List the ASE course's Elaborati, newest first, including withdrawn ones."""
+    course = portal_course()
     token = portal_require_session()["token"]
-    entries = sorted(portal_course_assignments(course_id, token),
+    entries = sorted(portal_course_assignments(course["id"], token),
                      key=lambda entry: str(entry.get("uploadedAt") or ""),
                      reverse=True)
-    return {"ok": True, "courseId": course_id,
+    return {"ok": True, "course": course,
             "assignments": [portal_assignment_summary(entry) for entry in entries]}
 
 
-def portal_set_withdrawn(course_id, assignment_id, withdrawn):
-    """Withdraw an Elaborato or restore a withdrawn one."""
-    course_id = portal_course_id(course_id)
+def portal_set_withdrawn(assignment_id, withdrawn):
+    """Withdraw an Elaborato of the ASE course or restore a withdrawn one."""
+    course_id = portal_course()["id"]
     if (not isinstance(assignment_id, int) or isinstance(assignment_id, bool)
             or assignment_id <= 0):
         fail("Invalid Elaborato.")
@@ -5041,7 +5056,7 @@ def portal_set_withdrawn(course_id, assignment_id, withdrawn):
                   .replace("+00:00", "Z") if withdrawn else None)
     portal_request("PATCH", f"/courses/{course_id}/assignments/{assignment_id}",
                    token, {"deletedAt": deleted_at})
-    return portal_assignments(course_id)
+    return portal_assignments()
 
 
 def submission_archive_preview(archive_path):
@@ -5057,16 +5072,16 @@ def submission_archive_preview(archive_path):
             "size": archive.stat().st_size, "entries": entries}
 
 
-def portal_upload_preview(archive_path, course_id):
+def portal_upload_preview(archive_path):
     """Show how a ZIP will appear in Elaborati and what it would duplicate."""
     preview = submission_archive_preview(archive_path)
-    course_id = portal_course_id(course_id)
+    course = portal_course()
     token = portal_require_session()["token"]
     existing = [portal_assignment_summary(entry)
-                for entry in portal_course_assignments(course_id, token)
+                for entry in portal_course_assignments(course["id"], token)
                 if entry.get("filename") == preview["filename"]
                 and not entry.get("deletedAt")]
-    return {"ok": True, "courseId": course_id, **preview, "existing": existing}
+    return {"ok": True, "course": course, **preview, "existing": existing}
 
 
 def portal_multipart(fields, filename, content, mime_type):
@@ -5084,15 +5099,15 @@ def portal_multipart(fields, filename, content, mime_type):
     return b"".join(parts), f"multipart/form-data; boundary={boundary}"
 
 
-def portal_upload(archive_path, course_id, description=None, replace=None):
-    """Upload a submission ZIP to a course's Elaborati and confirm it arrived.
+def portal_upload(archive_path, description=None, replace=None):
+    """Upload a submission ZIP to the ASE course's Elaborati and confirm it.
 
     With replace=None, an existing active upload with the same filename is
     reported as a conflict instead of being duplicated. With replace=True the
     older copies are withdrawn only after the new upload has been confirmed.
     """
     archive = submission_archive_file(archive_path)
-    course_id = portal_course_id(course_id)
+    course_id = portal_course()["id"]
     if description is None:
         description = archive.stem
     if (not isinstance(description, str) or not description.strip()
@@ -5155,7 +5170,7 @@ def portal_upload(archive_path, course_id, description=None, replace=None):
     return {"ok": True, "verified": uploaded is not None,
             "assignment": portal_assignment_summary(uploaded) if uploaded else None,
             "withdrawn": withdrawn, "warnings": warnings_list,
-            "filename": archive.name}
+            "filename": archive.name, "course": portal_course()}
 
 
 def git_run(args, timeout=20, cwd=ROOT):
@@ -6072,12 +6087,10 @@ class Handler(SimpleHTTPRequestHandler):
                 return self.send_json(project_config(folder))
             if url.path == "/api/portal/status":
                 return self.send_json(portal_status())
-            if url.path == "/api/portal/courses":
-                return self.send_json(portal_courses())
+            if url.path == "/api/portal/course":
+                return self.send_json({"ok": True, "course": portal_course()})
             if url.path == "/api/portal/assignments":
-                course = parse_qs(url.query).get("courseId", [""])[0]
-                return self.send_json(portal_assignments(
-                    int(course) if course.isdigit() else None))
+                return self.send_json(portal_assignments())
             if url.path == "/api/submission/download":
                 archive = submission_archive_file(
                     parse_qs(url.query).get("archive", [""])[0])
@@ -6151,19 +6164,17 @@ class Handler(SimpleHTTPRequestHandler):
             if self.path == "/api/portal/sso/cancel":
                 return self.send_json(portal_sso_cancel(data.get("uid")))
             if self.path == "/api/portal/preview":
-                return self.send_json(portal_upload_preview(
-                    data.get("archive"), data.get("courseId")))
+                return self.send_json(portal_upload_preview(data.get("archive")))
             if self.path == "/api/portal/assignment":
                 return self.send_json(portal_set_withdrawn(
-                    data.get("courseId"), data.get("assignmentId"),
-                    data.get("withdrawn")))
+                    data.get("assignmentId"), data.get("withdrawn")))
             if self.path == "/api/submission/preview":
                 return self.send_json({"ok": True, **submission_archive_preview(
                     data.get("archive"))})
             if self.path == "/api/portal/upload":
                 return self.send_json(portal_upload(
-                    data.get("archive"), data.get("courseId"),
-                    data.get("description"), data.get("replace")))
+                    data.get("archive"), data.get("description"),
+                    data.get("replace")))
             if self.path == "/api/submission/reveal":
                 return self.send_json(reveal_submission_folder(data.get("archive")))
             if self.path == "/api/submit":
