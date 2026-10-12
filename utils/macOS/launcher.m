@@ -11,6 +11,7 @@ static NSString *const kTitle = @"ASE Studio";
                                    WKNavigationDelegate, WKDownloadDelegate>
 @property(strong) NSWindow *window;
 @property(strong) WKWebView *web;
+@property(strong) NSMutableArray<NSWindow *> *popups;   // e.g. the memory pop-out
 @property(strong) NSTask *backend;
 @property(strong) NSMutableString *backendOutput;
 @property(copy) NSString *serverURL;
@@ -95,6 +96,7 @@ static NSString *const kTitle = @"ASE Studio";
 // ------------------------------------------------------------------ startup
 - (void)applicationDidFinishLaunching:(NSNotification *)note {
     [self buildMenu];
+    self.popups = [NSMutableArray array];
 
     WKWebViewConfiguration *config = [WKWebViewConfiguration new];
     config.websiteDataStore = WKWebsiteDataStore.defaultDataStore;   // keeps localStorage
@@ -216,6 +218,12 @@ static NSString *const kTitle = @"ASE Studio";
     return NO;
 }
 
+// Pop-outs belong to the main window: they close with it.
+- (void)windowWillClose:(NSNotification *)note {
+    if (note.object != self.window) return;
+    for (NSWindow *popup in self.popups.copy) [popup close];
+}
+
 - (NSApplicationTerminateReply)applicationShouldTerminate:(NSApplication *)app {
     if (self.closeConfirmed) return NSTerminateNow;
     [self confirmClose:^(BOOL ok) {
@@ -277,11 +285,52 @@ static NSString *const kTitle = @"ASE Studio";
     }];
 }
 
-// target=_blank / window.open: open in the default browser.
+// window.open / target=_blank: pages of the Studio itself (the memory
+// pop-out) open in a window of the app, everything else in the default browser.
 - (WKWebView *)webView:(WKWebView *)webView createWebViewWithConfiguration:(WKWebViewConfiguration *)c
     forNavigationAction:(WKNavigationAction *)action windowFeatures:(WKWindowFeatures *)f {
-    if (action.request.URL) [NSWorkspace.sharedWorkspace openURL:action.request.URL];
-    return nil;
+    NSURL *url = action.request.URL;
+    if (![url.host isEqualToString:@"127.0.0.1"]) {
+        if (url) [NSWorkspace.sharedWorkspace openURL:url];
+        return nil;
+    }
+    // WebKit's configuration shares the main view's web process and storage,
+    // so BroadcastChannel keeps the pop-out in sync with the Studio.
+    WKWebView *view = [[WKWebView alloc] initWithFrame:NSZeroRect configuration:c];
+    view.UIDelegate = self;
+    view.navigationDelegate = self;
+    NSRect frame = NSMakeRect(0, 0, f.width ? f.width.doubleValue : 1050,
+                              f.height ? f.height.doubleValue : 720);
+    NSWindow *popup = [[NSWindow alloc]
+        initWithContentRect:frame
+                  styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
+                            NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskResizable
+                    backing:NSBackingStoreBuffered
+                      defer:NO];
+    popup.releasedWhenClosed = NO;
+    popup.title = kTitle;
+    popup.contentView = view;
+    popup.minSize = NSMakeSize(650, 400);
+    [popup center];
+    [self.popups addObject:popup];
+    __weak AppDelegate *weakSelf = self;
+    __block id observer = [NSNotificationCenter.defaultCenter
+        addObserverForName:NSWindowWillCloseNotification object:popup queue:nil
+                usingBlock:^(NSNotification *note) {
+        [NSNotificationCenter.defaultCenter removeObserver:observer];
+        [weakSelf.popups removeObject:note.object];
+    }];
+    [popup makeKeyAndOrderFront:nil];
+    return view;
+}
+
+// window.close() from a pop-out.
+- (void)webViewDidClose:(WKWebView *)webView {
+    if (webView != self.web) [webView.window close];
+}
+
+- (void)webView:(WKWebView *)webView didFinishNavigation:(WKNavigation *)navigation {
+    if (webView != self.web && webView.title.length) webView.window.title = webView.title;
 }
 
 - (void)webView:(WKWebView *)webView decidePolicyForNavigationAction:(WKNavigationAction *)action
