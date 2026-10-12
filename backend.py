@@ -84,9 +84,13 @@ PORTAL_SSO_TIMEOUT = 15 * 60
 PORTAL_REQUEST_TIMEOUT = 30
 PORTAL_UPLOAD_TIMEOUT = 300
 PORTAL_KEYRING_SERVICE = "ASE Studio Portale"
-# Uploads always go to Architetture dei sistemi di elaborazione. Its course
-# id changes every academic year, so it is found by its shortcode.
-PORTAL_COURSE_SHORTCODE = os.environ.get("ASE_STUDIO_PORTAL_COURSE", "02GOLYG")
+# Uploads always go to Architetture dei sistemi di elaborazione (02GOL..) or
+# its English edition, Computer architectures (02LSE..). The course id changes
+# every academic year and the last two letters of the shortcode depend on the
+# degree programme, so the course is found by the first five characters.
+PORTAL_COURSE_CODES = tuple(
+    code.strip().upper()[:5] for code in
+    os.environ.get("ASE_STUDIO_PORTAL_COURSE", "02GOL,02LSE").split(",") if code.strip())
 PORTAL_KEYRING_ACCOUNT = "portal-session"
 # native.py installs a callable(uid, url) that shows the PoliTO sign-in page.
 PORTAL_SSO_OPENER = None
@@ -5016,10 +5020,10 @@ def portal_course():
         if _PORTAL_COURSE.get("token") == token:
             return dict(_PORTAL_COURSE["course"])
     matches = [course for course in portal_courses()["courses"]
-               if course["shortcode"].upper() == PORTAL_COURSE_SHORTCODE.upper()]
+               if course["shortcode"].upper()[:5] in PORTAL_COURSE_CODES]
     if not matches:
-        fail("Your PoliTO account has no Architetture dei sistemi di elaborazione "
-             f"course ({PORTAL_COURSE_SHORTCODE}) on the Portale della Didattica.")
+        fail("Your PoliTO account is not enrolled in Architetture dei sistemi di "
+             "elaborazione or Computer architectures on the Portale della Didattica.")
     course = max(matches, key=lambda entry: (entry["year"] or 0, entry["id"]))
     with _PORTAL_LOCK:
         _PORTAL_COURSE.update(token=token, course=course)
