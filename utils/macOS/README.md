@@ -36,8 +36,18 @@ L'ASE Studio incluso nell'app non è il submodule `ase_studio`: è il branch
 dell'upload, "Save ZIP for manual upload"). `build_app.py` lo scarica da lì
 (`--studio-dir PATH` per compilare un checkout locale) e l'"Update" dell'app
 segue lo stesso branch. Il workflow `sync-upstream.yml` fonde ogni giorno
-`cad-polito-it/ase-studio` in quel branch; se c'è un conflitto il run fallisce
-e va risolto a mano.
+`cad-polito-it/ase-studio` in quel branch e, prima del push, esegue
+`tests/run_checks.sh`: sintassi di Python e JavaScript, elementi della pagina
+usati da `studio.js`, funzioni del Portale contro un portale finto
+(`tests/fake_portal.py`) e avvio del backend. Se c'è un conflitto o un
+controllo fallisce, il branch non viene aggiornato (le app restano all'ultima
+versione buona) e GitHub manda un'email: il merge va fatto a mano.
+
+Per eseguire gli stessi controlli in locale:
+
+```sh
+utils/macOS/tests/run_checks.sh /percorso/ase-studio
+```
 
 Pubblicare una modifica ad ASE Studio (le app installate la ricevono con
 "Update", senza un nuovo DMG):
@@ -90,6 +100,7 @@ di build).
 | `ase_studio_app.py` | avvia `ase_studio/backend.py` senza controlli git; update da GitHub senza git (anche di gem5); "Open with" e "mostra consegna" con `open` di macOS |
 | `build_gem5.sh`, `gem5_patches/` | compila `tools/gem5` per macOS con le patch necessarie |
 | `gem5_selftest.py` | verifica che gem5 calcoli correttamente in virgola mobile (build, update e avvio) |
+| `tests/` | controlli eseguiti prima di aggiornare `ase-studio-macos` (`run_checks.sh`) |
 | `Info.plist`, `AppIcon.icns`, `LEGGIMI.txt` | bundle e contenuto del DMG |
 
 ## Dove stanno i dati

@@ -34,11 +34,19 @@ jobs:
   sync-studio:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Check out ase-studio-macos
+        uses: actions/checkout@v4
         with:
           ref: ase-studio-macos
           fetch-depth: 0
+          path: studio
+      - name: Check out the checks (main)
+        uses: actions/checkout@v4
+        with:
+          path: fork
       - name: Merge cad-polito-it/ase-studio main
+        id: merge
+        working-directory: studio
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -46,8 +54,19 @@ jobs:
           before=$(git rev-parse HEAD)
           git merge --no-edit -m "Merge cad-polito-it/ase-studio main" FETCH_HEAD
           if [ "$(git rev-parse HEAD)" = "$before" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
             echo "- ase-studio-macos is up to date" >> "$GITHUB_STEP_SUMMARY"
           else
-            git push origin HEAD:ase-studio-macos
-            echo "- ase-studio-macos merged $(git rev-parse --short FETCH_HEAD)" >> "$GITHUB_STEP_SUMMARY"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
           fi
+      # The installed apps download ase-studio-macos with "Update": a merge
+      # that fails the checks is not pushed. A manual run always checks.
+      - name: Check the merged ASE Studio
+        if: steps.merge.outputs.changed == 'true' || github.event_name == 'workflow_dispatch'
+        run: bash fork/utils/macOS/tests/run_checks.sh studio
+      - name: Push ase-studio-macos
+        if: steps.merge.outputs.changed == 'true'
+        working-directory: studio
+        run: |
+          git push origin HEAD:ase-studio-macos
+          echo "- ase-studio-macos merged $(git rev-parse --short FETCH_HEAD) (checks passed)" >> "$GITHUB_STEP_SUMMARY"
