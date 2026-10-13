@@ -1772,9 +1772,16 @@ function jumpTargetRow(rows, address, afterCycle = 0) {
   return fallback;
 }
 
+// Rows and cycle columns painted beyond the visible area, so that small
+// scrolls do not reveal empty space before the next frame.
+const PIPELINE_ROW_MARGIN = 10;
+const PIPELINE_CYCLE_MARGIN = 16;
+let pipelinePaint = null;
+
 function renderPipeline() {
   const data = pipelineData;
   if (!data) {
+    pipelinePaint = null;
     $("#pipeline-grid").innerHTML = "";
     $("#pipeline-diagram").innerHTML = "";
     $("#pipeline-pc").textContent = "PC —";
@@ -1792,8 +1799,8 @@ function renderPipeline() {
   const addressWidth = 88;
   const instructionWidth = window.innerWidth <= 700 ? 150 : 182;
   const flowWidth = window.innerWidth <= 700 ? 132 : 140;
-  const columns = `${addressWidth}px ${instructionWidth}px ${flowWidth}px repeat(${data.cycles}, ${cellWidth}px)`;
-  const totalWidth = addressWidth + instructionWidth + flowWidth + data.cycles * cellWidth;
+  const fixedWidth = addressWidth + instructionWidth + flowWidth;
+  const totalWidth = fixedWidth + data.cycles * cellWidth;
   const grid = $("#pipeline-grid");
   const scroll = $("#pipeline-scroll");
   const savedLeft = scroll.scrollLeft;
@@ -1815,24 +1822,45 @@ function renderPipeline() {
   updateCycleNavigation();
   grid.style.width = totalWidth + "px";
 
-  let header = `<div class="pipeline-header" style="grid-template-columns:${columns};width:${totalWidth}px">`;
-  header += '<div class="cell address-cell head corner">PC Address</div>';
-  header += '<div class="cell inst head corner">Instruction</div>';
-  header += '<div class="cell flow-cell head corner" title="Control-flow transfers, prediction misses, and cache misses">Control / cache</div>';
-  for (let cycle = 1; cycle <= data.cycles; cycle++) {
-    header += `<div class="cell head ${selectedColumn === cycle ? "column-selected" : ""}${cycle > visibleCycle ? " future" : ""}" data-col="${cycle}">${cycle}</div>`;
-  }
-  header += `</div><div class="pipeline-rows" style="height:${displayRows.length * rowHeight}px;width:${totalWidth}px"></div>`;
-  grid.innerHTML = header;
+  grid.innerHTML = `<div class="pipeline-header" style="width:${totalWidth}px"></div>`
+    + `<div class="pipeline-rows" style="height:${displayRows.length * rowHeight}px;width:${totalWidth}px"></div>`;
+  const headerRow = grid.querySelector(".pipeline-header");
   const rows = grid.querySelector(".pipeline-rows");
+  let paintedRange = "";
+  let paintFrame = 0;
 
-  function paintRows() {
+  // Only the rows and cycle columns in the viewport (plus a margin) are in
+  // the DOM. A long trace has thousands of both, and painting every cycle
+  // of every row froze the interface on each scroll and step.
+  function paintRows(force = false) {
+    const viewportWidth = scroll.clientWidth || window.innerWidth;
+    const viewportHeight = scroll.clientHeight || window.innerHeight;
     const visibleTop = Math.max(0, scroll.scrollTop - rowHeight);
-    const first = Math.max(0, Math.floor(visibleTop / rowHeight) - 6);
-    const visibleCount = Math.ceil(scroll.clientHeight / rowHeight) + 14;
-    const last = Math.min(displayRows.length, first + visibleCount);
-    let html = "";
+    const first = Math.max(0, Math.floor(visibleTop / rowHeight) - PIPELINE_ROW_MARGIN);
+    const last = Math.min(displayRows.length,
+      first + Math.ceil(viewportHeight / rowHeight) + 2 * PIPELINE_ROW_MARGIN + 2);
+    // Cycle c starts at fixedWidth + (c - 1) * cellWidth; the sticky columns
+    // cover the first fixedWidth pixels of the viewport.
+    const firstCycle = Math.max(1, Math.floor(scroll.scrollLeft / cellWidth) + 1 - PIPELINE_CYCLE_MARGIN);
+    const lastCycle = Math.min(data.cycles, Math.ceil(
+      (scroll.scrollLeft + viewportWidth - fixedWidth) / cellWidth) + PIPELINE_CYCLE_MARGIN);
+    const range = `${first}:${last}:${firstCycle}:${lastCycle}`;
+    if (!force && range === paintedRange) return;
+    paintedRange = range;
+    const columns = `${addressWidth}px ${instructionWidth}px ${flowWidth}px `
+      + `${(firstCycle - 1) * cellWidth}px repeat(${Math.max(0, lastCycle - firstCycle + 1)}, ${cellWidth}px)`;
 
+    let header = '<div class="cell address-cell head corner">PC Address</div>';
+    header += '<div class="cell inst head corner">Instruction</div>';
+    header += '<div class="cell flow-cell head corner" title="Control-flow transfers, prediction misses, and cache misses">Control / cache</div>';
+    header += '<div class="cycle-spacer"></div>';
+    for (let cycle = firstCycle; cycle <= lastCycle; cycle++) {
+      header += `<div class="cell head ${selectedColumn === cycle ? "column-selected" : ""}${cycle > visibleCycle ? " future" : ""}" data-col="${cycle}">${cycle}</div>`;
+    }
+    headerRow.style.gridTemplateColumns = columns;
+    headerRow.innerHTML = header;
+
+    let html = "";
     for (let rowIndex = first; rowIndex < last; rowIndex++) {
       const row = displayRows[rowIndex];
       html += `<div class="pipeline-row ${selectedRow === rowIndex ? "row-selected" : ""}" style="top:${rowIndex * rowHeight}px;grid-template-columns:${columns};width:${totalWidth}px">`;
@@ -1860,7 +1888,8 @@ function renderPipeline() {
         ? `<span class="branch-miss">BP miss${predictionMisses > 1 ? ` ×${predictionMisses}` : ""}</span>`
         : "";
       html += `<div class="cell flow-cell" data-row="${rowIndex}">${jumpLinks}${predictionEvent}${cacheEvents}</div>`;
-      for (let cycle = 1; cycle <= data.cycles; cycle++) {
+      html += '<div class="cycle-spacer"></div>';
+      for (let cycle = firstCycle; cycle <= lastCycle; cycle++) {
         const stage = row.cycles[cycle] || "";
         const label = stage.length > 1 && stage !== "S" ? stage.split("").join("/") : stage;
         const stageClass = stage ? "stage-" + stage.slice(-1) : "";
@@ -1870,6 +1899,14 @@ function renderPipeline() {
       html += "</div>";
     }
     rows.innerHTML = html;
+  }
+
+  function schedulePaint() {
+    if (paintFrame) return;
+    paintFrame = requestAnimationFrame(() => {
+      paintFrame = 0;
+      if (pipelinePaint === schedulePaint) paintRows();
+    });
   }
 
   grid.onmousemove = event => {
@@ -1907,7 +1944,7 @@ function renderPipeline() {
         selectedRow = targetRow;
         scroll.scrollTop = Math.max(0, targetRow * rowHeight - rowHeight * 2);
         highlightSourceLine(displayRows[targetRow].sourceLine);
-        paintRows();
+        paintRows(true);
       }
       return;
     }
@@ -1918,10 +1955,7 @@ function renderPipeline() {
       highlightSourceLine(displayRows[selectedRow].sourceLine);
     }
     if (cell.dataset.col !== undefined) selectedColumn = Number(cell.dataset.col);
-    grid.querySelectorAll(".pipeline-header [data-col]").forEach(headerCell => {
-      headerCell.classList.toggle("column-selected", Number(headerCell.dataset.col) === selectedColumn);
-    });
-    paintRows();
+    paintRows(true);
   };
   grid.onclick = null;
   grid.oncontextmenu = event => {
@@ -1930,10 +1964,11 @@ function renderPipeline() {
     pipelineSelectTarget(event.target);
   };
 
-  scroll.onscroll = paintRows;
+  pipelinePaint = schedulePaint;
+  scroll.onscroll = schedulePaint;
   scroll.scrollLeft = savedLeft;
   scroll.scrollTop = savedTop;
-  paintRows();
+  paintRows(true);
   renderRegisters();
   renderPipelineDiagram();
   renderMemory();
@@ -2813,6 +2848,10 @@ registerResizer.addEventListener("pointerup", event => {
 });
 
 const pipelineScroll = $("#pipeline-scroll");
+// Repaint the visible window when the pipeline area is shown or resized.
+if ("ResizeObserver" in window) {
+  new ResizeObserver(() => pipelinePaint?.()).observe(pipelineScroll);
+}
 let pipelinePan = null;
 pipelineScroll.addEventListener("pointerdown", event => {
   if (event.button !== 0 && event.button !== 1) return;
