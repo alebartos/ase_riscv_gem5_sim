@@ -1542,19 +1542,26 @@ def parse_minor(path: Path, source_body="", include_fetch_stalls=True):
     # MinorGUI emits a complete register snapshot at the first writeback.
     # Compare it with the architectural reset state so unchanged zero-valued
     # registers are not all presented as writes by the first instruction.
+    # Values are compared as numbers: gem5 prints integer registers with 8
+    # hex digits and, since cad-polito-it/gem5 fc0ef46, floating-point
+    # registers with 16 (the whole NaN-boxed register).
+    def register_number(value):
+        try:
+            return int(value, 16)
+        except (TypeError, ValueError):
+            return value
+
     register_deltas = {}
-    previous_registers = {
-        **{f"x{index}": "0x00000000" for index in range(32)},
-        **{f"f{index}": "0x00000000" for index in range(32)},
-    }
+    previous_registers = {f"{kind}{index}": 0 for kind in "xf" for index in range(32)}
     for tick in sorted(register_events):
         if tick not in cycle_for_tick:
             continue
         snapshot = register_events[tick]
         changed = {register: value for register, value in snapshot.items()
                    if register != "x0"
-                   and previous_registers.get(register) != value}
-        previous_registers.update(snapshot)
+                   and previous_registers.get(register) != register_number(value)}
+        previous_registers.update({register: register_number(value)
+                                   for register, value in snapshot.items()})
         if changed:
             register_deltas[str(cycle_for_tick[tick])] = changed
     exec_registers, memory_deltas = parse_exec_playback(lines, ticks)
