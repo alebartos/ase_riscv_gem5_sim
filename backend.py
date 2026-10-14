@@ -2363,16 +2363,20 @@ def source_data_layouts(folder):
             continue
         element, byte_count = data_directive_layout(directive,
                                                     statement.group(2))
+        untyped_storage = directive in {".space", ".skip", ".zero"}
         if pending:
             for name in pending:
                 layouts[name] = {"elementSize": element,
-                                 "byteCount": byte_count}
+                                 "byteCount": byte_count,
+                                 "untypedStorage": untyped_storage}
             open_labels, pending = pending, []
             continue
         for name in open_labels:
             layout = layouts[name]
             if layout["elementSize"] != element:
                 layout["elementSize"] = 1
+            layout["untypedStorage"] = (
+                layout.get("untypedStorage", False) and untyped_storage)
             layout["byteCount"] = (
                 None if layout["byteCount"] is None or byte_count is None
                 else layout["byteCount"] + byte_count)
@@ -2513,6 +2517,10 @@ def data_symbols(folder):
             "kind": symbol["kind"],
             "elementSize": element,
             "elementCount": size // element,
+            # .space/.skip/.zero reserve bytes without declaring a data type.
+            # The memory tab may therefore group this storage according to
+            # the selected numeric view (for example four bytes per float).
+            "untypedStorage": bool(layout.get("untypedStorage")),
         })
     return symbols
 
@@ -3914,8 +3922,17 @@ def schedule_direct_in_order_pipeline(data, configuration):
     return True
 
 
-def normalize_in_order_taken_branches(data, configuration):
-    """Show one wrong-path fetch at Decode, then apply the branch redirect."""
+def normalize_in_order_taken_branches(data, configuration, dump_text="",
+                                      source_body=""):
+    """Show one sequential wrong-path fetch for every taken branch.
+
+    Minor sometimes resolves a conditional branch before its sequential fetch
+    is emitted by MinorGUI. Unconditional jumps normally do emit that row,
+    which previously made otherwise equivalent redirects look inconsistent.
+    Reuse gem5's squashed row when one exists; otherwise recover the static
+    instruction from the disassembly and synthesize the single Fetch marker
+    used by the teaching pipeline.
+    """
     if configuration["cpu"] != "in-order":
         return
     dynamic = data.get("dynamicInstructions", [])
@@ -3931,33 +3948,111 @@ def normalize_in_order_taken_branches(data, configuration):
             r"^(?:b(?:eq|ne|lt|ge|ltu|geu)|j|jr|jal|jalr|ret)\b",
             display_instruction(instruction), re.I))
 
-    # Keep one speculative Fetch event to make the redirect visible, but
-    # align it with the branch's Decode cycle. The fetched instruction never
-    # executes; it is the wrong-path instruction present at branch decode.
+    def numeric_registers(instruction):
+        return re.sub(
+            r"\b(" + "|".join(map(re.escape, REGISTER_ALIASES)) + r")\b",
+            lambda match: REGISTER_ALIASES[match.group(1).lower()],
+            display_instruction(instruction), flags=re.I,
+        )
+
+    static_instructions = {}
+    end_match = re.search(r"^\s*([0-9a-fA-F]+)\s+<End>:\s*$",
+                          dump_text, re.M | re.I)
+    end_address = int(end_match.group(1), 16) if end_match else None
+    for line in dump_text.splitlines():
+        match = re.match(
+            r"^\s*([0-9a-fA-F]+):\s+[0-9a-fA-F]+\s+(.+?)\s*$", line)
+        if not match:
+            continue
+        address, instruction = match.groups()
+        if end_address is not None and int(address, 16) >= end_address:
+            continue
+        instruction = instruction.split("#", 1)[0].strip()
+        instruction = re.sub(r"\s+<[^>]+>\s*$", "", instruction)
+        static_instructions[address.lower()] = numeric_registers(instruction)
+
+    # A trace can provide the same static instruction from another loop
+    # iteration even when objdump is unavailable, as in frozen fixtures.
     for row in dynamic:
-        if not row.get("squashed") or not row.get("address"):
-            continue
-        fetch = first_stage(row, "F")
-        if fetch is None:
-            continue
-        branch_address = f"{int(row['address'], 16) - 4:x}"
-        candidates = [candidate for candidate in dynamic
-                      if not candidate.get("squashed")
-                      and candidate.get("address") == branch_address
-                      and is_control(candidate.get("instruction", ""))]
+        if row.get("address") and not row.get("squashed"):
+            static_instructions.setdefault(row["address"].lower(),
+                                           row["instruction"])
+    static_addresses = sorted(int(address, 16)
+                              for address in static_instructions)
+
+    executed_controls = [
+        row for row in dynamic
+        if not row.get("squashed") and row.get("address")
+        and is_control(row.get("instruction", ""))
+    ]
+    unused_controls = set(map(id, executed_controls))
+    unused_squashed = {
+        id(row) for row in dynamic
+        if row.get("squashed") and row.get("address")
+    }
+    additions = defaultdict(list)
+
+    # Keep one speculative Fetch event to make each redirect visible. It is
+    # aligned with the branch Decode cycle and never advances to Decode.
+    for jump in sorted(data.get("jumps", []), key=lambda item: item["cycle"]):
+        candidates = [
+            row for row in executed_controls
+            if id(row) in unused_controls
+            and row["address"].lower() == jump.get("fromAddress", "").lower()
+        ]
         branch = min(
-            (candidate for candidate in candidates
-             if (first_stage(candidate, "D") or 0) >= fetch),
-            key=lambda candidate: first_stage(candidate, "D") or 10**12,
+            candidates,
+            key=lambda row: abs((first_stage(row, "E") or 10**12)
+                                - jump["cycle"]),
             default=None,
         )
-        decode = first_stage(branch, "D") if branch is not None else None
-        if decode is not None:
-            row["cycles"] = {str(decode): "F"}
+        if branch is None:
+            continue
+        unused_controls.discard(id(branch))
+        decode = first_stage(branch, "D")
+        branch_address = int(branch["address"], 16)
+        sequential_address = next(
+            (address for address in static_addresses
+             if address > branch_address), None)
+        if decode is None or sequential_address is None:
+            continue
+        expected_address = f"{sequential_address:x}"
+        candidates = [
+            row for row in dynamic
+            if id(row) in unused_squashed
+            and row.get("address", "").lower() == expected_address
+        ]
+        squashed = min(
+            candidates,
+            key=lambda row: abs((first_stage(row, "F") or 10**12) - decode),
+            default=None,
+        )
+        if squashed is None:
+            squashed = {
+                "instruction": static_instructions[expected_address],
+                "address": expected_address,
+                "cycles": {},
+                "squashed": True,
+                "iterations": 0,
+            }
+            additions[id(branch)].append(squashed)
+        else:
+            unused_squashed.discard(id(squashed))
+        squashed["cycles"] = {str(decode): "F"}
+
+    if additions:
+        expanded = []
+        for row in dynamic:
+            expanded.append(row)
+            expanded.extend(additions.get(id(row), []))
+        dynamic[:] = expanded
 
     # The fetch map is used by the PC monitor, so keep it consistent with the
     # adjusted row rather than leaving the old speculative cycle.
     data["instructions"] = compact_iterations(dynamic)
+    if source_body:
+        add_source_lines(data["instructions"], source_body)
+        attach_dynamic_source_lines(dynamic, data["instructions"])
     data["pcDeltas"] = {
         cycle: "0x" + row["address"]
         for row in sorted(dynamic,
@@ -4197,7 +4292,7 @@ def pipeline(name):
     if not schedule_direct_in_order_pipeline(data, configuration):
         normalize_direct_in_order_control(data, configuration)
         normalize_forwarded_dependencies(data, configuration)
-    normalize_in_order_taken_branches(data, configuration)
+    normalize_in_order_taken_branches(data, configuration, dump_text, source)
     fill_in_order_stall_gaps(data, configuration)
     enforce_five_stage_in_order_completion(data, configuration)
     configure_o3_stage_display(data, configuration)
