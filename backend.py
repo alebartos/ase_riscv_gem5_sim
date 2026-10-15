@@ -519,7 +519,7 @@ def settings_env():
     env["OBJDUMP"] = str(objdump)
     env["CC_INSTALLATION_PATH"] = str(compiler.parent) + os.sep
     env["GEM5_INSTALLATION_PATH"] = str(
-        resolve_environment_path(env["GEM5_INSTALLATION_PATH"]))
+        gem5_executable_path(env["GEM5_INSTALLATION_PATH"]))
     env["ASE_STUDIO_DEMO_MK"] = str((PROGRAMS / "demo.mk").resolve())
     # ASE Studio supports the RISC-V optimized gem5 build. Keeping these
     # fixed avoids asking users for path components that are not choices in
@@ -541,6 +541,8 @@ def environment_settings():
             item = str(PROGRAMS)
         elif not item and key == "SUBMISSION_DIRECTORY":
             item = str(SUBMISSIONS)
+        if key == "GEM5_INSTALLATION_PATH" and item:
+            item = str(gem5_executable_path(item))
         values[key] = (portable_environment_value(item)
                        if key in ENVIRONMENT_PATH_FIELDS else item)
     return {
@@ -623,6 +625,8 @@ def import_environment_settings(filename, content):
                 if value == temporary_root or value.startswith(temporary_root + os.sep):
                     values[key] = str(ROOT) + value[len(temporary_root):]
         for key in ENVIRONMENT_PATH_FIELDS:
+            if key == "GEM5_INSTALLATION_PATH" and values.get(key):
+                values[key] = str(gem5_executable_path(values[key]))
             values[key] = portable_environment_value(values.get(key, ""))
         return {"values": values, "source": display_name}
     except subprocess.TimeoutExpired:
@@ -671,6 +675,15 @@ def portable_environment_value(value):
 def resolve_environment_path(value):
     path = Path(expand_portable_environment_variables(value)).expanduser()
     return (ROOT / path).resolve() if not path.is_absolute() else path.resolve()
+
+
+def gem5_executable_path(value):
+    """Resolve the configured gem5 executable, migrating legacy build paths."""
+    requested = resolve_environment_path(value)
+    legacy_executable = requested / GEM5_ISA / f"gem5.{GEM5_VARIANT}"
+    if requested.is_dir() and legacy_executable.is_file():
+        return legacy_executable.resolve()
+    return requested
 
 
 def toolchain_executables(value):
@@ -817,8 +830,7 @@ def validate_environment_field(key, values):
         return (f"Submission name part: {part}" if part
                 else "No text will be added in this position.")
 
-    gem5 = (resolve_environment_path(cleaned["GEM5_INSTALLATION_PATH"])
-            / GEM5_ISA / f"gem5.{GEM5_VARIANT}")
+    gem5 = gem5_executable_path(cleaned["GEM5_INSTALLATION_PATH"])
     if not gem5.is_file() or not os.access(gem5, os.X_OK):
         fail(f"The gem5 executable does not exist or is not executable: {gem5}")
     return gem5_version(gem5)
@@ -845,6 +857,11 @@ def save_environment_settings(value):
     # Saving is intentionally strict: every field must be usable.
     for key in ENVIRONMENT_FIELDS:
         validate_environment_field(key, cleaned)
+
+    # ASE Studio 1.4 and earlier stored the gem5 build directory. Saving the
+    # dialog once upgrades that value to the executable/wrapper path.
+    cleaned["GEM5_INSTALLATION_PATH"] = str(
+        gem5_executable_path(cleaned["GEM5_INSTALLATION_PATH"]))
 
     stored = {
         key: portable_environment_value(item) if key in ENVIRONMENT_PATH_FIELDS else item
@@ -1029,8 +1046,7 @@ def simulate(name):
         if old_trace.exists():
             old_trace.unlink()
     in_order = cpu_config["cpu"] == "in-order"
-    gem5 = (Path(configured_path(env["GEM5_INSTALLATION_PATH"]))
-            / GEM5_ISA / f"gem5.{GEM5_VARIANT}")
+    gem5 = Path(configured_path(env["GEM5_INSTALLATION_PATH"]))
     config = (configured_path(env["GEM5_SIMULATION_SCRIPT"]) if in_order
               else str(ROOT / "gem5" / "riscv_o3_custom.py"))
     latency_options = [
@@ -4943,17 +4959,29 @@ def gem5_checkout_is_writable(repository, build_dir):
 
 
 def configured_gem5_location(values=None):
-    """Locate the configured build and checkout without running Git."""
+    """Locate the configured executable and its managed checkout, if any."""
     if values is None:
         values = setup_environment()
         values.update(environment_overrides())
     try:
-        build_dir = resolve_environment_path(values["GEM5_INSTALLATION_PATH"])
-        executable = build_dir / GEM5_ISA / f"gem5.{GEM5_VARIANT}"
+        executable = gem5_executable_path(values["GEM5_INSTALLATION_PATH"])
     except (KeyError, ValueError) as error:
         return {"error": f"gem5 update checking is unavailable: {error}"}
-    repository = filesystem_git_checkout(build_dir)
-    source_dir = repository if repository is not None else build_dir.parent
+
+    standard_build = (
+        executable.name == f"gem5.{GEM5_VARIANT}"
+        and executable.parent.name == GEM5_ISA
+        and executable.parent.parent.name == "build"
+    )
+    build_dir = executable.parent.parent if standard_build else executable.parent
+    candidate = filesystem_git_checkout(executable)
+    # A wrapper can live in the parent simulator repository. It must not make
+    # that repository look like a gem5 checkout to branch/update management.
+    expected = (candidate / "build" / GEM5_ISA / f"gem5.{GEM5_VARIANT}"
+                if candidate is not None else None)
+    repository = (candidate if standard_build and expected is not None
+                  and executable == expected.resolve() else None)
+    source_dir = repository if repository is not None else executable.parent
     return {
         "buildDir": str(build_dir),
         "executable": str(executable),
@@ -4961,9 +4989,9 @@ def configured_gem5_location(values=None):
         "repository": str(repository) if repository is not None else "",
         "filesystemWritable": bool(
             source_dir.is_dir()
-            and build_dir.is_dir()
             and os.access(source_dir, os.W_OK)
-            and os.access(build_dir, os.W_OK)
+            and executable.parent.is_dir()
+            and os.access(executable.parent, os.W_OK)
         ),
         "writable": (gem5_checkout_is_writable(repository, build_dir)
                      if repository is not None else False),
@@ -4973,10 +5001,8 @@ def configured_gem5_location(values=None):
 def ensure_configured_gem5_branch(location, required_branch):
     """Select writable gem5, or request action for a shared checkout."""
     if not location.get("repository"):
-        if location.get("filesystemWritable"):
-            return ("The configured gem5 build is not inside a Git checkout: "
-                    f"{location['buildDir']}"), False
-        # A shared binary-only installation has no branch metadata to inspect.
+        # A wrapper or binary-only installation has no reliable branch
+        # metadata. It remains runnable, but update management is unavailable.
         return None, False
 
     # A shared checkout may be owned by root or an administrator. Running Git
@@ -5042,9 +5068,11 @@ def require_startup_repositories():
     if location.get("error"):
         configuration_warnings.append(
             f"The configured gem5 path is invalid: {location['error']}")
-    elif not Path(location["buildDir"]).is_dir():
+    elif (not Path(location["executable"]).is_file()
+          or not os.access(location["executable"], os.X_OK)):
         configuration_warnings.append(
-            f"The configured gem5 build directory does not exist: {location['buildDir']}")
+            "The configured gem5 executable or wrapper does not exist or is "
+            f"not executable: {location['executable']}")
     elif location.get("repository") and not location.get("writable"):
         configuration_warnings.append(
             "The configured gem5 checkout is owned or managed by another "
@@ -5089,23 +5117,25 @@ def normalized_git_remote(value):
 
 
 def configured_gem5_checkout(values=None):
-    """Describe the Git checkout owning the configured gem5 build."""
+    """Describe the Git checkout owning the configured gem5 executable."""
     location = configured_gem5_location(values)
     if location.get("error"):
         return {"managed": False,
                 "message": location["error"]}
     build_dir = Path(location["buildDir"])
     executable = Path(location["executable"])
-    if not executable.is_file():
+    if not executable.is_file() or not os.access(executable, os.X_OK):
         return {"managed": False, "buildDir": str(build_dir),
                 "executable": str(executable),
-                "message": ("The configured gem5 build does not exist; "
-                            "updates cannot be checked.")}
+                "message": ("The configured gem5 executable or wrapper does "
+                            "not exist or is not executable; updates cannot "
+                            "be checked.")}
     if not location["repository"]:
         return {"managed": False, "buildDir": str(build_dir),
                 "executable": str(executable),
-                "message": ("The build works, but it is not inside a Git "
-                            "checkout; gem5 updates cannot be checked.")}
+                "message": ("The executable or wrapper works, but ASE Studio "
+                            "cannot identify its gem5 Git checkout; gem5 "
+                            "updates and automatic rebuilds are disabled.")}
     repository = Path(location["repository"])
     if not location["writable"]:
         return {"managed": False, "path": str(repository),
@@ -5118,14 +5148,15 @@ def configured_gem5_checkout(values=None):
     if not ok or Path(top).resolve() != repository:
         return {"managed": False, "path": str(repository),
                 "buildDir": str(build_dir), "executable": str(executable),
-                "message": ("The build works, but its source directory is not "
-                            "a valid Git checkout; updates cannot be checked.")}
+                "message": ("The executable works, but its source directory "
+                            "is not a valid Git checkout; updates cannot be "
+                            "checked.")}
     ok, origin = git_run(["remote", "get-url", "origin"], cwd=repository)
     if not ok or normalized_git_remote(origin) != OFFICIAL_GEM5_REPOSITORY:
         shown = origin if ok and origin else "no origin remote"
         return {"managed": False, "path": str(repository),
                 "buildDir": str(build_dir), "executable": str(executable),
-                "message": ("The build is not connected to the official "
+                "message": ("The executable is not connected to the official "
                             f"cad-polito-it/gem5 repository ({shown}); "
                             "updates cannot be checked.")}
     try:
