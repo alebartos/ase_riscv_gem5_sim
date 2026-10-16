@@ -539,8 +539,11 @@ def settings_env():
     env["CC"] = str(compiler)
     env["OBJDUMP"] = str(objdump)
     env["CC_INSTALLATION_PATH"] = str(compiler.parent) + os.sep
+    # Keep a configured build directory as a directory: the macOS app
+    # recognises its bundled build here and swaps in the gem5 installed by
+    # Update. simulate() resolves it to the executable.
     env["GEM5_INSTALLATION_PATH"] = str(
-        gem5_executable_path(env["GEM5_INSTALLATION_PATH"]))
+        resolve_environment_path(env["GEM5_INSTALLATION_PATH"]))
     env["ASE_STUDIO_DEMO_MK"] = str((PROGRAMS / "demo.mk").resolve())
     # ASE Studio supports the RISC-V optimized gem5 build. Keeping these
     # fixed avoids asking users for path components that are not choices in
@@ -1068,6 +1071,8 @@ def simulate(name):
             old_trace.unlink()
     in_order = cpu_config["cpu"] == "in-order"
     gem5 = Path(configured_path(env["GEM5_INSTALLATION_PATH"]))
+    if gem5.is_dir():
+        gem5 = gem5 / GEM5_ISA / f"gem5.{GEM5_VARIANT}"
     config = (configured_path(env["GEM5_SIMULATION_SCRIPT"]) if in_order
               else str(ROOT / "gem5" / "riscv_o3_custom.py"))
     latency_options = [
