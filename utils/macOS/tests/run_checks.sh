@@ -7,7 +7,8 @@
 #  1. Python compiles, JavaScript parses
 #  2. every element studio.js looks up exists in index.html
 #  3. Portale della Didattica functions against a fake portal
-#  4. the backend starts and serves the page and the API
+#  4. the gem5 path contract of the installed macOS apps
+#  5. the backend starts and serves the page and the API
 #
 # Usage: utils/macOS/tests/run_checks.sh PATH_TO_ASE_STUDIO
 set -euo pipefail
@@ -46,6 +47,10 @@ wait_for http://127.0.0.1:18911/api/_state
 ASE_STUDIO_DIR="$studio" ASE_STUDIO_PORTAL_API=http://127.0.0.1:18911/api \
 ASE_STUDIO_HOST_ROOT="$tmp/host" XDG_CONFIG_HOME="$tmp/config" \
   python3 "$here/test_portal.py"
+
+echo "==> gem5 path used by the macOS app"
+ASE_STUDIO_DIR="$studio" ASE_STUDIO_HOST_ROOT="$tmp/host" XDG_CONFIG_HOME="$tmp/config" \
+  python3 "$here/test_gem5_path.py"
 
 echo "==> Backend server"
 ASE_STUDIO_DEVELOPER=1 ASE_STUDIO_HOST_ROOT="$tmp/host" XDG_CONFIG_HOME="$tmp/config" \

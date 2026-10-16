@@ -400,9 +400,14 @@ def main() -> int:
             env = make_env()
             if env.get("ASE_STUDIO_DEMO_MK"):
                 env["ASE_STUDIO_DEMO_MK"] = str(space_free(Path(env["ASE_STUDIO_DEMO_MK"])))
-            # Run the updated gem5 wherever the settings name the bundled one.
-            if Path(env["GEM5_INSTALLATION_PATH"]).resolve() == BUNDLED_GEM5_BUILD.resolve():
+            # Run the updated gem5 wherever the settings name the bundled one,
+            # as a build directory or (ASE Studio 1.4.2+) as the executable.
+            configured = Path(env["GEM5_INSTALLATION_PATH"]).resolve()
+            bundled = BUNDLED_GEM5_BUILD.resolve()
+            if configured == bundled:
                 env["GEM5_INSTALLATION_PATH"] = str(active_gem5_build())
+            elif configured == (bundled / "RISCV/gem5.opt").resolve():
+                env["GEM5_INSTALLATION_PATH"] = str(active_gem5_build() / "RISCV/gem5.opt")
             return env
         backend.settings_env = settings_env
     if hasattr(backend, "toolchain_executables"):
