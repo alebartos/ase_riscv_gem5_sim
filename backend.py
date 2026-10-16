@@ -540,7 +540,7 @@ def settings_env():
     env["OBJDUMP"] = str(objdump)
     env["CC_INSTALLATION_PATH"] = str(compiler.parent) + os.sep
     env["GEM5_INSTALLATION_PATH"] = str(
-        resolve_environment_path(env["GEM5_INSTALLATION_PATH"]))
+        gem5_executable_path(env["GEM5_INSTALLATION_PATH"]))
     env["ASE_STUDIO_DEMO_MK"] = str((PROGRAMS / "demo.mk").resolve())
     # ASE Studio supports the RISC-V optimized gem5 build. Keeping these
     # fixed avoids asking users for path components that are not choices in
@@ -562,6 +562,8 @@ def environment_settings():
             item = str(PROGRAMS)
         elif not item and key == "SUBMISSION_DIRECTORY":
             item = str(SUBMISSIONS)
+        if key == "GEM5_INSTALLATION_PATH" and item:
+            item = str(gem5_executable_path(item))
         values[key] = (portable_environment_value(item)
                        if key in ENVIRONMENT_PATH_FIELDS else item)
     return {
@@ -644,6 +646,8 @@ def import_environment_settings(filename, content):
                 if value == temporary_root or value.startswith(temporary_root + os.sep):
                     values[key] = str(ROOT) + value[len(temporary_root):]
         for key in ENVIRONMENT_PATH_FIELDS:
+            if key == "GEM5_INSTALLATION_PATH" and values.get(key):
+                values[key] = str(gem5_executable_path(values[key]))
             values[key] = portable_environment_value(values.get(key, ""))
         return {"values": values, "source": display_name}
     except subprocess.TimeoutExpired:
@@ -692,6 +696,15 @@ def portable_environment_value(value):
 def resolve_environment_path(value):
     path = Path(expand_portable_environment_variables(value)).expanduser()
     return (ROOT / path).resolve() if not path.is_absolute() else path.resolve()
+
+
+def gem5_executable_path(value):
+    """Resolve the configured gem5 executable, migrating legacy build paths."""
+    requested = resolve_environment_path(value)
+    legacy_executable = requested / GEM5_ISA / f"gem5.{GEM5_VARIANT}"
+    if requested.is_dir() and legacy_executable.is_file():
+        return legacy_executable.resolve()
+    return requested
 
 
 def toolchain_executables(value):
@@ -838,8 +851,7 @@ def validate_environment_field(key, values):
         return (f"Submission name part: {part}" if part
                 else "No text will be added in this position.")
 
-    gem5 = (resolve_environment_path(cleaned["GEM5_INSTALLATION_PATH"])
-            / GEM5_ISA / f"gem5.{GEM5_VARIANT}")
+    gem5 = gem5_executable_path(cleaned["GEM5_INSTALLATION_PATH"])
     if not gem5.is_file() or not os.access(gem5, os.X_OK):
         fail(f"The gem5 executable does not exist or is not executable: {gem5}")
     return gem5_version(gem5)
@@ -866,6 +878,11 @@ def save_environment_settings(value):
     # Saving is intentionally strict: every field must be usable.
     for key in ENVIRONMENT_FIELDS:
         validate_environment_field(key, cleaned)
+
+    # ASE Studio 1.4 and earlier stored the gem5 build directory. Saving the
+    # dialog once upgrades that value to the executable/wrapper path.
+    cleaned["GEM5_INSTALLATION_PATH"] = str(
+        gem5_executable_path(cleaned["GEM5_INSTALLATION_PATH"]))
 
     stored = {
         key: portable_environment_value(item) if key in ENVIRONMENT_PATH_FIELDS else item
@@ -1050,8 +1067,7 @@ def simulate(name):
         if old_trace.exists():
             old_trace.unlink()
     in_order = cpu_config["cpu"] == "in-order"
-    gem5 = (Path(configured_path(env["GEM5_INSTALLATION_PATH"]))
-            / GEM5_ISA / f"gem5.{GEM5_VARIANT}")
+    gem5 = Path(configured_path(env["GEM5_INSTALLATION_PATH"]))
     config = (configured_path(env["GEM5_SIMULATION_SCRIPT"]) if in_order
               else str(ROOT / "gem5" / "riscv_o3_custom.py"))
     latency_options = [
@@ -2391,16 +2407,20 @@ def source_data_layouts(folder):
             continue
         element, byte_count = data_directive_layout(directive,
                                                     statement.group(2))
+        untyped_storage = directive in {".space", ".skip", ".zero"}
         if pending:
             for name in pending:
                 layouts[name] = {"elementSize": element,
-                                 "byteCount": byte_count}
+                                 "byteCount": byte_count,
+                                 "untypedStorage": untyped_storage}
             open_labels, pending = pending, []
             continue
         for name in open_labels:
             layout = layouts[name]
             if layout["elementSize"] != element:
                 layout["elementSize"] = 1
+            layout["untypedStorage"] = (
+                layout.get("untypedStorage", False) and untyped_storage)
             layout["byteCount"] = (
                 None if layout["byteCount"] is None or byte_count is None
                 else layout["byteCount"] + byte_count)
@@ -2541,6 +2561,10 @@ def data_symbols(folder):
             "kind": symbol["kind"],
             "elementSize": element,
             "elementCount": size // element,
+            # .space/.skip/.zero reserve bytes without declaring a data type.
+            # The memory tab may therefore group this storage according to
+            # the selected numeric view (for example four bytes per float).
+            "untypedStorage": bool(layout.get("untypedStorage")),
         })
     return symbols
 
@@ -3942,8 +3966,17 @@ def schedule_direct_in_order_pipeline(data, configuration):
     return True
 
 
-def normalize_in_order_taken_branches(data, configuration):
-    """Show one wrong-path fetch at Decode, then apply the branch redirect."""
+def normalize_in_order_taken_branches(data, configuration, dump_text="",
+                                      source_body=""):
+    """Show one sequential wrong-path fetch for every taken branch.
+
+    Minor sometimes resolves a conditional branch before its sequential fetch
+    is emitted by MinorGUI. Unconditional jumps normally do emit that row,
+    which previously made otherwise equivalent redirects look inconsistent.
+    Reuse gem5's squashed row when one exists; otherwise recover the static
+    instruction from the disassembly and synthesize the single Fetch marker
+    used by the teaching pipeline.
+    """
     if configuration["cpu"] != "in-order":
         return
     dynamic = data.get("dynamicInstructions", [])
@@ -3959,33 +3992,111 @@ def normalize_in_order_taken_branches(data, configuration):
             r"^(?:b(?:eq|ne|lt|ge|ltu|geu)|j|jr|jal|jalr|ret)\b",
             display_instruction(instruction), re.I))
 
-    # Keep one speculative Fetch event to make the redirect visible, but
-    # align it with the branch's Decode cycle. The fetched instruction never
-    # executes; it is the wrong-path instruction present at branch decode.
+    def numeric_registers(instruction):
+        return re.sub(
+            r"\b(" + "|".join(map(re.escape, REGISTER_ALIASES)) + r")\b",
+            lambda match: REGISTER_ALIASES[match.group(1).lower()],
+            display_instruction(instruction), flags=re.I,
+        )
+
+    static_instructions = {}
+    end_match = re.search(r"^\s*([0-9a-fA-F]+)\s+<End>:\s*$",
+                          dump_text, re.M | re.I)
+    end_address = int(end_match.group(1), 16) if end_match else None
+    for line in dump_text.splitlines():
+        match = re.match(
+            r"^\s*([0-9a-fA-F]+):\s+[0-9a-fA-F]+\s+(.+?)\s*$", line)
+        if not match:
+            continue
+        address, instruction = match.groups()
+        if end_address is not None and int(address, 16) >= end_address:
+            continue
+        instruction = instruction.split("#", 1)[0].strip()
+        instruction = re.sub(r"\s+<[^>]+>\s*$", "", instruction)
+        static_instructions[address.lower()] = numeric_registers(instruction)
+
+    # A trace can provide the same static instruction from another loop
+    # iteration even when objdump is unavailable, as in frozen fixtures.
     for row in dynamic:
-        if not row.get("squashed") or not row.get("address"):
-            continue
-        fetch = first_stage(row, "F")
-        if fetch is None:
-            continue
-        branch_address = f"{int(row['address'], 16) - 4:x}"
-        candidates = [candidate for candidate in dynamic
-                      if not candidate.get("squashed")
-                      and candidate.get("address") == branch_address
-                      and is_control(candidate.get("instruction", ""))]
+        if row.get("address") and not row.get("squashed"):
+            static_instructions.setdefault(row["address"].lower(),
+                                           row["instruction"])
+    static_addresses = sorted(int(address, 16)
+                              for address in static_instructions)
+
+    executed_controls = [
+        row for row in dynamic
+        if not row.get("squashed") and row.get("address")
+        and is_control(row.get("instruction", ""))
+    ]
+    unused_controls = set(map(id, executed_controls))
+    unused_squashed = {
+        id(row) for row in dynamic
+        if row.get("squashed") and row.get("address")
+    }
+    additions = defaultdict(list)
+
+    # Keep one speculative Fetch event to make each redirect visible. It is
+    # aligned with the branch Decode cycle and never advances to Decode.
+    for jump in sorted(data.get("jumps", []), key=lambda item: item["cycle"]):
+        candidates = [
+            row for row in executed_controls
+            if id(row) in unused_controls
+            and row["address"].lower() == jump.get("fromAddress", "").lower()
+        ]
         branch = min(
-            (candidate for candidate in candidates
-             if (first_stage(candidate, "D") or 0) >= fetch),
-            key=lambda candidate: first_stage(candidate, "D") or 10**12,
+            candidates,
+            key=lambda row: abs((first_stage(row, "E") or 10**12)
+                                - jump["cycle"]),
             default=None,
         )
-        decode = first_stage(branch, "D") if branch is not None else None
-        if decode is not None:
-            row["cycles"] = {str(decode): "F"}
+        if branch is None:
+            continue
+        unused_controls.discard(id(branch))
+        decode = first_stage(branch, "D")
+        branch_address = int(branch["address"], 16)
+        sequential_address = next(
+            (address for address in static_addresses
+             if address > branch_address), None)
+        if decode is None or sequential_address is None:
+            continue
+        expected_address = f"{sequential_address:x}"
+        candidates = [
+            row for row in dynamic
+            if id(row) in unused_squashed
+            and row.get("address", "").lower() == expected_address
+        ]
+        squashed = min(
+            candidates,
+            key=lambda row: abs((first_stage(row, "F") or 10**12) - decode),
+            default=None,
+        )
+        if squashed is None:
+            squashed = {
+                "instruction": static_instructions[expected_address],
+                "address": expected_address,
+                "cycles": {},
+                "squashed": True,
+                "iterations": 0,
+            }
+            additions[id(branch)].append(squashed)
+        else:
+            unused_squashed.discard(id(squashed))
+        squashed["cycles"] = {str(decode): "F"}
+
+    if additions:
+        expanded = []
+        for row in dynamic:
+            expanded.append(row)
+            expanded.extend(additions.get(id(row), []))
+        dynamic[:] = expanded
 
     # The fetch map is used by the PC monitor, so keep it consistent with the
     # adjusted row rather than leaving the old speculative cycle.
     data["instructions"] = compact_iterations(dynamic)
+    if source_body:
+        add_source_lines(data["instructions"], source_body)
+        attach_dynamic_source_lines(dynamic, data["instructions"])
     data["pcDeltas"] = {
         cycle: "0x" + row["address"]
         for row in sorted(dynamic,
@@ -4225,7 +4336,7 @@ def pipeline(name):
     if not schedule_direct_in_order_pipeline(data, configuration):
         normalize_direct_in_order_control(data, configuration)
         normalize_forwarded_dependencies(data, configuration)
-    normalize_in_order_taken_branches(data, configuration)
+    normalize_in_order_taken_branches(data, configuration, dump_text, source)
     fill_in_order_stall_gaps(data, configuration)
     enforce_five_stage_in_order_completion(data, configuration)
     configure_o3_stage_display(data, configuration)
@@ -5456,17 +5567,29 @@ def gem5_checkout_is_writable(repository, build_dir):
 
 
 def configured_gem5_location(values=None):
-    """Locate the configured build and checkout without running Git."""
+    """Locate the configured executable and its managed checkout, if any."""
     if values is None:
         values = setup_environment()
         values.update(environment_overrides())
     try:
-        build_dir = resolve_environment_path(values["GEM5_INSTALLATION_PATH"])
-        executable = build_dir / GEM5_ISA / f"gem5.{GEM5_VARIANT}"
+        executable = gem5_executable_path(values["GEM5_INSTALLATION_PATH"])
     except (KeyError, ValueError) as error:
         return {"error": f"gem5 update checking is unavailable: {error}"}
-    repository = filesystem_git_checkout(build_dir)
-    source_dir = repository if repository is not None else build_dir.parent
+
+    standard_build = (
+        executable.name == f"gem5.{GEM5_VARIANT}"
+        and executable.parent.name == GEM5_ISA
+        and executable.parent.parent.name == "build"
+    )
+    build_dir = executable.parent.parent if standard_build else executable.parent
+    candidate = filesystem_git_checkout(executable)
+    # A wrapper can live in the parent simulator repository. It must not make
+    # that repository look like a gem5 checkout to branch/update management.
+    expected = (candidate / "build" / GEM5_ISA / f"gem5.{GEM5_VARIANT}"
+                if candidate is not None else None)
+    repository = (candidate if standard_build and expected is not None
+                  and executable == expected.resolve() else None)
+    source_dir = repository if repository is not None else executable.parent
     return {
         "buildDir": str(build_dir),
         "executable": str(executable),
@@ -5474,9 +5597,9 @@ def configured_gem5_location(values=None):
         "repository": str(repository) if repository is not None else "",
         "filesystemWritable": bool(
             source_dir.is_dir()
-            and build_dir.is_dir()
             and os.access(source_dir, os.W_OK)
-            and os.access(build_dir, os.W_OK)
+            and executable.parent.is_dir()
+            and os.access(executable.parent, os.W_OK)
         ),
         "writable": (gem5_checkout_is_writable(repository, build_dir)
                      if repository is not None else False),
@@ -5486,10 +5609,8 @@ def configured_gem5_location(values=None):
 def ensure_configured_gem5_branch(location, required_branch):
     """Select writable gem5, or request action for a shared checkout."""
     if not location.get("repository"):
-        if location.get("filesystemWritable"):
-            return ("The configured gem5 build is not inside a Git checkout: "
-                    f"{location['buildDir']}"), False
-        # A shared binary-only installation has no branch metadata to inspect.
+        # A wrapper or binary-only installation has no reliable branch
+        # metadata. It remains runnable, but update management is unavailable.
         return None, False
 
     # A shared checkout may be owned by root or an administrator. Running Git
@@ -5555,9 +5676,11 @@ def require_startup_repositories():
     if location.get("error"):
         configuration_warnings.append(
             f"The configured gem5 path is invalid: {location['error']}")
-    elif not Path(location["buildDir"]).is_dir():
+    elif (not Path(location["executable"]).is_file()
+          or not os.access(location["executable"], os.X_OK)):
         configuration_warnings.append(
-            f"The configured gem5 build directory does not exist: {location['buildDir']}")
+            "The configured gem5 executable or wrapper does not exist or is "
+            f"not executable: {location['executable']}")
     elif location.get("repository") and not location.get("writable"):
         configuration_warnings.append(
             "The configured gem5 checkout is owned or managed by another "
@@ -5602,23 +5725,25 @@ def normalized_git_remote(value):
 
 
 def configured_gem5_checkout(values=None):
-    """Describe the Git checkout owning the configured gem5 build."""
+    """Describe the Git checkout owning the configured gem5 executable."""
     location = configured_gem5_location(values)
     if location.get("error"):
         return {"managed": False,
                 "message": location["error"]}
     build_dir = Path(location["buildDir"])
     executable = Path(location["executable"])
-    if not executable.is_file():
+    if not executable.is_file() or not os.access(executable, os.X_OK):
         return {"managed": False, "buildDir": str(build_dir),
                 "executable": str(executable),
-                "message": ("The configured gem5 build does not exist; "
-                            "updates cannot be checked.")}
+                "message": ("The configured gem5 executable or wrapper does "
+                            "not exist or is not executable; updates cannot "
+                            "be checked.")}
     if not location["repository"]:
         return {"managed": False, "buildDir": str(build_dir),
                 "executable": str(executable),
-                "message": ("The build works, but it is not inside a Git "
-                            "checkout; gem5 updates cannot be checked.")}
+                "message": ("The executable or wrapper works, but ASE Studio "
+                            "cannot identify its gem5 Git checkout; gem5 "
+                            "updates and automatic rebuilds are disabled.")}
     repository = Path(location["repository"])
     if not location["writable"]:
         return {"managed": False, "path": str(repository),
@@ -5631,14 +5756,15 @@ def configured_gem5_checkout(values=None):
     if not ok or Path(top).resolve() != repository:
         return {"managed": False, "path": str(repository),
                 "buildDir": str(build_dir), "executable": str(executable),
-                "message": ("The build works, but its source directory is not "
-                            "a valid Git checkout; updates cannot be checked.")}
+                "message": ("The executable works, but its source directory "
+                            "is not a valid Git checkout; updates cannot be "
+                            "checked.")}
     ok, origin = git_run(["remote", "get-url", "origin"], cwd=repository)
     if not ok or normalized_git_remote(origin) != OFFICIAL_GEM5_REPOSITORY:
         shown = origin if ok and origin else "no origin remote"
         return {"managed": False, "path": str(repository),
                 "buildDir": str(build_dir), "executable": str(executable),
-                "message": ("The build is not connected to the official "
+                "message": ("The executable is not connected to the official "
                             f"cad-polito-it/gem5 repository ({shown}); "
                             "updates cannot be checked.")}
     try:

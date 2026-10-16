@@ -1578,6 +1578,15 @@ function describeMemorySymbol(symbol) {
   return `${symbol.elementCount} ${unit}${symbol.elementCount === 1 ? "" : "s"}`;
 }
 
+function memoryDisplayLayout(symbol, format) {
+  let elementSize = symbol.elementSize;
+  if (format === "float" && symbol.untypedStorage) {
+    const floatingBytes = pipelineData?.configuration?.floatingPointPrecision === "double" ? 8 : 4;
+    if (symbol.size % floatingBytes === 0) elementSize = floatingBytes;
+  }
+  return {elementSize, elementCount: symbol.size / elementSize};
+}
+
 function memorySymbolHue(symbol, symbols) {
   const index = Math.max(0, symbols.indexOf(symbol));
   return Math.round((index * 137.508) % 360);
@@ -1751,28 +1760,29 @@ function renderMemory() {
     const symbol = symbols.find(candidate => candidate.name === watch.name);
     if (!symbol) return;
     const start = Number(BigInt(symbol.address));
-    const shown = Math.min(symbol.elementCount, MEMORY_ROWS_PER_SYMBOL);
-    truncated ||= shown < symbol.elementCount;
+    const layout = memoryDisplayLayout(symbol, format);
+    const shown = Math.min(layout.elementCount, MEMORY_ROWS_PER_SYMBOL);
+    truncated ||= shown < layout.elementCount;
     for (let index = 0; index < shown; index++) {
-      const address = start + index * symbol.elementSize;
+      const address = start + index * layout.elementSize;
       let value = 0n;
       let known = true;
       let latest = null;
       // RISC-V is little-endian: the highest address holds the most significant byte.
-      for (let offset = symbol.elementSize - 1; offset >= 0; offset--) {
+      for (let offset = layout.elementSize - 1; offset >= 0; offset--) {
         const byte = byteAt(address + offset);
         if (byte === null) known = false;
         else value = (value << 8n) | BigInt(byte);
         const event = accessed.get(address + offset);
         if (event && (!latest || event.cycle > latest.cycle)) latest = event;
       }
-      const width = symbol.elementSize * 8;
+      const width = layout.elementSize * 8;
       // Floating-point views only exist for single and double precision.
       const elementFormat = format === "float" && width < 32 ? "hex" : format;
       rows.push({
         address,
         symbol,
-        label: symbol.elementCount > 1 ? `${symbol.name}[${index}]` : symbol.name,
+        label: layout.elementCount > 1 ? `${symbol.name}[${index}]` : symbol.name,
         access: latest ? latest.access : known ? "initial value" : "not accessed",
         value: known ? formatWordValue(value, elementFormat, width) : "—",
         changed: latest?.cycle === playbackCycle
