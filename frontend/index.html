@@ -80,22 +80,39 @@
 </form></dialog>
 <dialog id="cpu-dialog"><form id="cpu-form">
   <h2>CPU Configuration</h2>
-  <label id="cpu-model-field">CPU model<select id="cpu-model"><option value="in-order">Five-stage pipeline (in-order fetch and issue)</option><option value="out-of-order">Multiple-issue processor with speculation</option></select></label>
+  <label id="cpu-model-field">CPU model<select id="cpu-model"><option value="in-order">Five-Stage Pipeline (F/D/E/M/W)</option><option value="out-of-order">Superscalar</option></select></label>
   <div class="units-grid">
-    <fieldset><legend>Integer unit · clock cycles</legend><div class="unit-fields"><div class="unit-heading"><span>Operation</span><span>Latency</span><span>Pipelined</span></div><div class="unit-row"><span>ALU</span><input id="int-alu" type="number" min="1" max="100" aria-label="Integer ALU latency" required><label class="unit-pipeline-check"><input id="int-alu-pipelined" type="checkbox"><span>Yes</span></label></div><div class="unit-row"><span>Multiply</span><input id="int-mul" type="number" min="1" max="100" aria-label="Integer multiply latency" required><label class="unit-pipeline-check"><input id="int-mul-pipelined" type="checkbox"><span>Yes</span></label></div><div class="unit-row"><span>Divide</span><input id="int-div" type="number" min="1" max="100" aria-label="Integer divide latency" required><label class="unit-pipeline-check"><input id="int-div-pipelined" type="checkbox"><span>Yes</span></label></div></div></fieldset>
-    <fieldset><legend>Floating-point unit · clock cycles</legend><label class="floating-precision">Precision<select id="floating-point-precision"><option value="single">Single (32-bit)</option><option value="double">Double (64-bit)</option></select></label><div class="unit-fields"><div class="unit-heading"><span>Operation</span><span>Latency</span><span>Pipelined</span></div><div class="unit-row"><span>ALU</span><input id="float-alu" type="number" min="1" max="100" aria-label="Floating-point ALU latency" required><label class="unit-pipeline-check"><input id="float-alu-pipelined" type="checkbox"><span>Yes</span></label></div><div class="unit-row"><span>Multiply</span><input id="float-mul" type="number" min="1" max="100" aria-label="Floating-point multiply latency" required><label class="unit-pipeline-check"><input id="float-mul-pipelined" type="checkbox"><span>Yes</span></label></div><div class="unit-row"><span>Divide</span><input id="float-div" type="number" min="1" max="100" aria-label="Floating-point divide latency" required><label class="unit-pipeline-check"><input id="float-div-pipelined" type="checkbox"><span>Yes</span></label></div></div></fieldset>
+    <fieldset id="integer-unit-settings">
+      <legend>Integer unit · clock cycles</legend>
+      <div class="unit-fields">
+        <div class="unit-heading"><span>Operation</span><span>Latency</span><span>Pipelined</span></div>
+        <div class="unit-row"><span>ALU</span><input id="int-alu" type="number" min="1" max="100" aria-label="Integer ALU latency" required><label class="unit-pipeline-check"><input id="int-alu-pipelined" type="checkbox"><span>Yes</span></label></div>
+        <div class="unit-row"><span>Multiply</span><input id="int-mul" type="number" min="1" max="100" aria-label="Integer multiply latency" required><label class="unit-pipeline-check"><input id="int-mul-pipelined" type="checkbox"><span>Yes</span></label></div>
+        <div class="unit-row"><span>Divide</span><input id="int-div" type="number" min="1" max="100" aria-label="Integer divide latency" required><label class="unit-pipeline-check"><input id="int-div-pipelined" type="checkbox"><span>Yes</span></label></div>
+      </div>
+    </fieldset>
+    <fieldset id="floating-unit-settings">
+      <legend>Floating-point unit · clock cycles</legend>
+      <div class="unit-fields">
+        <div class="unit-heading"><span>Operation</span><span>Latency</span><span>Pipelined</span></div>
+        <div class="unit-row"><span>ALU</span><input id="float-alu" type="number" min="1" max="100" aria-label="Floating-point ALU latency" required><label class="unit-pipeline-check"><input id="float-alu-pipelined" type="checkbox"><span>Yes</span></label></div>
+        <div class="unit-row"><span>Multiply</span><input id="float-mul" type="number" min="1" max="100" aria-label="Floating-point multiply latency" required><label class="unit-pipeline-check"><input id="float-mul-pipelined" type="checkbox"><span>Yes</span></label></div>
+        <div class="unit-row"><span>Divide</span><input id="float-div" type="number" min="1" max="100" aria-label="Floating-point divide latency" required><label class="unit-pipeline-check"><input id="float-div-pipelined" type="checkbox"><span>Yes</span></label></div>
+      </div>
+      <label class="floating-precision">Precision<select id="floating-point-precision"><option value="single">Single (32-bit)</option><option value="double">Double (64-bit)</option></select></label>
+    </fieldset>
   </div>
   <small class="unit-pipeline-help">A pipelined unit can accept a new operation every cycle. A non-pipelined unit waits for its configured latency before accepting another operation.</small>
   <label class="check"><input id="forwarding" type="checkbox"> Enable forwarding <small id="forwarding-note"></small></label>
   <label class="check"><input id="compressed-instructions" type="checkbox"> Enable compressed instructions (RVC)</label>
   <label class="check"><input id="out-of-order-execution" type="checkbox"> Enable out-of-order execution</label>
-  <fieldset id="o3-management"><legend>Multiple-issue processor</legend>
+  <fieldset id="o3-management"><legend>Superscalar</legend>
     <div class="o3-policy-grid">
       <label>Branch predictor<select id="branch-predictor"><option value="ideal">Ideal (perfect prediction)</option><option value="local">Local two-bit</option><option value="tournament">Tournament</option><option value="bimode">Bi-mode</option><option value="tage">TAGE</option></select></label>
       <label>Evaluation start label<input id="o3-evaluation-label" type="text" placeholder="Optional, e.g. Loop" spellcheck="false"></label>
-      <label class="check o3-speculation"><input id="speculative-execution" type="checkbox"> Execute past unresolved branches</label>
+      <label class="check o3-speculation" hidden><input id="speculative-execution" type="checkbox" disabled> Execute past unresolved branches</label>
     </div>
-    <div class="o3-stage-heading"><strong>Visible stages</strong><small>Hiding a stage changes the table only; gem5 still executes its required internal stages.</small></div>
+    <div class="o3-stage-heading"><strong>Visible stages</strong></div>
     <div class="o3-stage-visibility">
       <label><input type="checkbox" data-o3-stage="fetch"> Fetch</label>
       <label><input type="checkbox" data-o3-stage="decode"> Decode</label>
@@ -106,7 +123,8 @@
       <label><input type="checkbox" data-o3-stage="cdb"> CDB</label>
       <label><input type="checkbox" data-o3-stage="commit"> Commit</label>
     </div>
-    <div class="o3-grid"><label>Fetch width<input id="fetch-width" type="number" min="1" max="8" required></label><label>Decode width<input id="decode-width" type="number" min="1" max="8" required></label><label>Rename width<input id="rename-width" type="number" min="1" max="8" required></label><label>In-order issue width<input id="dispatch-width" type="number" min="1" max="8" required></label><label>EXE issue width<input id="issue-width" type="number" min="1" max="8" required></label><label>CDB count<input id="writeback-width" type="number" min="1" max="8" required></label><label>Commit width<input id="commit-width" type="number" min="1" max="8" required></label><label>ROB entries<input id="rob-entries" type="number" min="16" max="512" required></label><label>Reservation station / IQ entries<input id="iq-entries" type="number" min="8" max="2048" required></label><label>Load queue entries<input id="lq-entries" type="number" min="4" max="256" required></label><label>Store queue entries<input id="sq-entries" type="number" min="4" max="256" required></label></div>
+    <div class="o3-grid"><label>Issue width<input id="dispatch-width" type="number" min="1" max="8" required></label><label>CDB count<input id="writeback-width" type="number" min="1" max="8" required></label><label>Commit width<input id="commit-width" type="number" min="1" max="8" required></label></div>
+    <div hidden><input id="fetch-width" type="number" disabled><input id="decode-width" type="number" disabled><input id="rename-width" type="number" disabled><input id="issue-width" type="number" disabled><input id="rob-entries" type="number" disabled><input id="iq-entries" type="number" disabled><input id="lq-entries" type="number" disabled><input id="sq-entries" type="number" disabled></div>
   </fieldset>
   <fieldset id="memory-management"><legend>Memory system</legend>
     <label class="memory-mode-label">Mode<select id="memory-mode"><option value="direct">Direct memory (no cache)</option><option value="cache">L1 caches + main memory</option></select></label>

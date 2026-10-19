@@ -274,7 +274,8 @@ dialog::backdrop { background: #0f172a73; }
 #cpu-form select, #cpu-form input[type="number"], #cpu-form input[type="text"] { border: 1px solid #b8c5d6; border-radius: 5px; padding: 7px; background: #fff; }
 #cpu-form fieldset { border: 1px solid var(--line); border-radius: 6px; }
 .units-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
-.floating-precision { display: grid; grid-template-columns: minmax(75px, 1fr) 152px; align-items: center; gap: 8px; margin-bottom: 10px; font-size: 11px; font-weight: 600; }
+.units-grid.superscalar { grid-template-columns: minmax(0, 1fr); }
+.floating-precision { display: grid; grid-template-columns: minmax(75px, 1fr) 152px; align-items: center; gap: 8px; margin-top: 12px; font-size: 11px; font-weight: 600; }
 .floating-precision select { width: 100%; min-width: 0; }
 .unit-fields { display: grid; gap: 9px; }
 .unit-heading, .unit-row { display: grid; grid-template-columns: minmax(75px, 1fr) 68px 72px; align-items: center; gap: 8px; }

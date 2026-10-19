@@ -83,7 +83,7 @@ def developer_mode_enabled(environment=None):
 
 DEVELOPER_MODE = developer_mode_enabled()
 ENABLE_MEMORY_CONFIGURATION = DEVELOPER_MODE
-ENABLE_MULTI_ISSUE_CPU = DEVELOPER_MODE
+ENABLE_MULTI_ISSUE_CPU = True
 
 _ACTIVE_COMMANDS = set()
 _ACTIVE_COMMANDS_LOCK = threading.Lock()
@@ -117,6 +117,24 @@ DEFAULT_CONFIG = {
     "o3VisibleStages": ["issue", "execute", "memory", "cdb", "commit"],
     "branchPredictor": "local", "speculativeExecution": True,
     "outOfOrderExecution": True, "o3EvaluationLabel": "",
+}
+
+# The multiple-issue table models the examination architecture. gem5 still
+# needs finite queues to generate the architectural instruction/value trace;
+# these internal sizes never constrain the table's unlimited ROB and RS.
+O3_FIXED_CONFIG = {
+    "fetchWidth": 2, "decodeWidth": 2, "renameWidth": 2,
+    "issueWidth": 8,
+    "robEntries": 64, "iqEntries": 128, "lqEntries": 32, "sqEntries": 32,
+    "speculativeExecution": True,
+    "outOfOrderExecution": True, "forwarding": True,
+    "intMul": 1, "intDiv": 1,
+    "intMulPipelined": True, "intDivPipelined": True,
+}
+DEFAULT_O3_CONFIG = {
+    **DEFAULT_CONFIG, **O3_FIXED_CONFIG,
+    "cpu": "out-of-order", "floatMul": 6, "floatDiv": 6,
+    "branchPredictor": "ideal",
 }
 
 
@@ -232,9 +250,12 @@ def source_file(folder: Path) -> Path:
 def validate_config(value):
     if not isinstance(value, dict):
         fail("Invalid CPU configuration.")
-    config = DEFAULT_CONFIG.copy()
     if value.get("cpu") not in {"in-order", "out-of-order"}:
-        fail("Select an in-order or out-of-order CPU.")
+        fail("Select Five-Stage Pipeline or Superscalar.")
+    multiple_issue = ENABLE_MULTI_ISSUE_CPU and value["cpu"] == "out-of-order"
+    config = (DEFAULT_O3_CONFIG if multiple_issue else DEFAULT_CONFIG).copy()
+    if multiple_issue:
+        value = {**DEFAULT_O3_CONFIG, **value, **O3_FIXED_CONFIG}
     config["cpu"] = (value["cpu"] if ENABLE_MULTI_ISSUE_CPU
                      else DEFAULT_CONFIG["cpu"])
     for key in ("intAlu", "intMul", "intDiv", "floatAlu", "floatMul", "floatDiv"):
@@ -1246,7 +1267,7 @@ def parse_exec_playback(lines, ordered_ticks):
 
 
 def parse_taken_jumps(lines, ordered_ticks):
-    """Return control-flow transfers that changed the sequential PC."""
+    """Return control-flow transfers supported by the completed instruction trace."""
     executed = []
     for line in lines:
         match = EXEC_EVENT.match(line)
@@ -1262,12 +1283,32 @@ def parse_taken_jumps(lines, ordered_ticks):
         r"^(?:c\.)?(?:b(?:eq|eqz|ne|nez|lt|ge|ltu|geu)|j|jr|jal|jalr|ret)\b",
         re.I,
     )
+    conditional_branch = re.compile(
+        r"^(?:c\.)?b(?:eq|eqz|ne|nez|lt|ge|ltu|geu)\b", re.I,
+    )
+    branch_offset = re.compile(
+        r",\s*([+-]?(?:0x[0-9a-f]+|\d+))\s*$", re.I,
+    )
     for ((tick, source, instruction, instruction_bytes),
          (_next_tick, target, _next_instruction, _next_bytes)) in zip(executed, executed[1:]):
         if not control_instruction.match(instruction.strip()):
             continue
-        if int(target, 16) == int(source, 16) + instruction_bytes:
+        source_pc, target_pc = int(source, 16), int(target, 16)
+        if target_pc == source_pc + instruction_bytes:
             continue
+        if conditional_branch.match(instruction):
+            offset = branch_offset.search(instruction)
+            if offset:
+                value = offset.group(1)
+                displacement = (int(value, 16) if "0x" in value.lower()
+                                else int(value, 10))
+                # Exec records completion order. A long-running instruction
+                # immediately after a not-taken branch can complete after a
+                # younger instruction, making that younger PC look like a
+                # branch target. A real taken branch must land at its encoded
+                # PC-relative destination.
+                if target_pc != source_pc + displacement:
+                    continue
         jumps.append({
             "fromAddress": source,
             "toAddress": target,
@@ -1672,14 +1713,14 @@ def complete_o3_waits(rows):
 def schedule_lecture_o3_pipeline(data, configuration, start_address=None):
     """Build the multiple-issue Tomasulo/ROB table used in the lectures.
 
-    gem5's trace remains the source of the committed dynamic instruction
-    stream and architectural values. This projection intentionally removes
-    gem5 front-end and time-buffer transport delays. With speculation off,
-    issue into the ROB/RS continues along the predicted path, but execution
-    of younger instructions waits until every older branch has resolved.
+    gem5 supplies the committed dynamic instruction stream and architectural
+    values. The exam model uses unlimited queues, configurable prediction and
+    independent functional units, without gem5's internal transport delays.
+    Every control transfer occupies an Issue cycle of its own.
     """
     if data.get("format") != "o3":
         return False
+    configuration = {**DEFAULT_O3_CONFIG, **configuration, **O3_FIXED_CONFIG}
 
     def first_cycle(row):
         return min((int(cycle) for cycle in row.get("cycles", {})),
@@ -1734,14 +1775,16 @@ def schedule_lecture_o3_pipeline(data, configuration, start_address=None):
         load = bool(re.fullmatch(r"(?:l(?:b|bu|h|hu|w|wu|d)|fl[wdq])", opcode))
         store = bool(re.fullmatch(r"(?:s[bhwdq]|fs[wdq])", opcode))
         control = bool(re.fullmatch(
-            r"(?:b(?:eq|ne|lt|ge|ltu|geu)|j|jr|jal|jalr|ret)", opcode))
+            r"(?:b(?:eq|ne|lt|ge|ltu|geu|eqz|nez|ltz|gez|lez|gtz)|j|jr|jal|jalr|ret)", opcode))
         no_destination = store or opcode.startswith("b") or opcode in {"j", "jr", "ret"}
         destination = registers[0] if registers and not no_destination else None
         sources = registers if no_destination else registers[1:]
         store_data = registers[0] if store and registers else None
         execute_sources = registers[1:] if store else sources
 
-        if load or store:
+        if control:
+            unit, latency, pipelined = "jump", 1, True
+        elif load or store:
             unit, latency, pipelined = "address", 1, True
         elif re.match(r"^fmul", opcode):
             unit, latency, pipelined = (
@@ -1788,9 +1831,9 @@ def schedule_lecture_o3_pipeline(data, configuration, start_address=None):
         stage_uses = {stage: defaultdict(int)
                       for stage in ("F", "D", "R", "I")}
 
-        def reserve_front_stage(stage, earliest, width):
+        def reserve_front_stage(stage, earliest, width, exclusive=False):
             cycle = earliest
-            while stage_uses[stage][cycle] >= width:
+            while stage_uses[stage][cycle] >= (1 if exclusive else width):
                 cycle += 1
             stage_uses[stage][cycle] += 1
             return cycle
@@ -1810,7 +1853,7 @@ def schedule_lecture_o3_pipeline(data, configuration, start_address=None):
                 max(1, int(configuration["renameWidth"])))
             issue = reserve_front_stage(
                 "I", max(rename + 1, issue_floor, previous_stage["I"]),
-                issue_width)
+                issue_width, exclusive=info["control"])
             front_end_cycles[id(row)] = {
                 "F": fetch, "D": decode, "R": rename,
             }
@@ -1827,17 +1870,19 @@ def schedule_lecture_o3_pipeline(data, configuration, start_address=None):
         issue_cycle, issue_slots = 1, 0
         for row in committed:
             info = information[id(row)]
+            # Every control transfer occupies an Issue cycle of its own,
+            # including when a preceding instruction used only one slot.
+            if info["control"] and issue_slots:
+                issue_cycle += 1
+                issue_slots = 0
             issue_cycles[id(row)] = issue_cycle
             issue_slots += 1
-            # A predicted control transfer supplies its successor for the next
-            # cycle; it cannot share the remaining issue slot in this cycle.
+            # The predicted successor issues no earlier than the next cycle.
             if info["control"] or issue_slots >= issue_width:
                 issue_cycle += 1
                 issue_slots = 0
 
-    execution_width = max(1, int(configuration["issueWidth"]))
     cdb_width = max(1, int(configuration["writebackWidth"]))
-    execution_starts = defaultdict(int)
     cdb_uses = defaultdict(int)
     unit_busy = defaultdict(set)
     memory_busy = set()
@@ -1850,9 +1895,9 @@ def schedule_lecture_o3_pipeline(data, configuration, start_address=None):
         while True:
             occupied = ({cycle} if info["pipelined"]
                         else set(range(cycle, cycle + info["latency"])))
-            if (execution_starts[cycle] < execution_width
-                    and not (occupied & unit_busy[info["unit"]])):
-                execution_starts[cycle] += 1
+            # No global EXE-queue/width limit: independent functional units
+            # may start together. Each unit still enforces its own capacity.
+            if not (occupied & unit_busy[info["unit"]]):
                 unit_busy[info["unit"]].update(occupied)
                 return cycle
             cycle += 1
@@ -5573,6 +5618,7 @@ class Handler(SimpleHTTPRequestHandler):
             if url.path == "/api/health":
                 return self.send_json({"ok": True, "apiVersion": STUDIO_API_VERSION,
                                        "version": STUDIO_VERSION,
+                                       "o3Defaults": DEFAULT_O3_CONFIG,
                                        "features": {
                                            "developerMode": DEVELOPER_MODE,
                                            "memoryConfiguration":

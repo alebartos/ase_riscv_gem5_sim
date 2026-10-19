@@ -31,6 +31,7 @@ let pipelineSelectTarget = null;
 let externalSyncBusy = false;
 let memoryWatches = [];
 let cpuConfigurationOpenedAs = null;
+let o3Defaults = {};
 let studioFeatures = {
   developerMode: false,
   memoryConfiguration: false,
@@ -189,6 +190,7 @@ async function api(url, options = {}) {
 async function loadStudioVersion() {
   try {
     const health = await api("/api/health");
+    o3Defaults = health.o3Defaults || {};
     $("#about-version").textContent = `Version ${health.version}`;
     applyDeveloperFeatures(health.features || {});
   } catch (_error) {
@@ -1097,13 +1099,17 @@ function renderPipelineDiagram() {
   const memoryDetails = memoryMode === "cache"
     ? `L1 I ${config.iCacheSize} · D ${config.dCacheSize}<br>Hit ${config.cacheLatency} cycles · RAM ${config.memoryLatency} cycles`
     : `Direct memory · I ${config.instructionMemoryLatency} · Read ${config.dataReadLatency} · Write ${config.dataWriteLatency} cycles`;
+  const predictorName = {
+    ideal: "Ideal (perfect prediction)", local: "Local two-bit",
+    tournament: "Tournament", bimode: "Bi-mode", tage: "TAGE"
+  }[config.branchPredictor] || "Ideal (perfect prediction)";
   const details = (o3
-    ? `${config.speculativeExecution ? "speculation on" : "speculation off"} · ${config.outOfOrderExecution !== false ? "out-of-order execution" : "in-order execution"}<br>Predictor: ${{ideal: "Ideal (perfect prediction)", local: "Local two-bit", tournament: "Tournament", bimode: "Bi-mode", tage: "TAGE"}[config.branchPredictor] || "Local two-bit"}<br>In-order issue ${config.dispatchWidth} · EXE issue ${config.issueWidth}<br>CDB ${config.writebackWidth} · Commit ${config.commitWidth}<br>ROB ${config.robEntries} · RS/IQ ${config.iqEntries}<br>LQ ${config.lqEntries} · SQ ${config.sqEntries}`
+    ? `Out-of-order execution · speculation on<br>Predictor: ${predictorName}<br>Issue ${config.dispatchWidth} · branches/jumps issue alone<br>CDB ${config.writebackWidth} · Commit ${config.commitWidth}<br>Address unit: 1 cycle · Jump unit: 1 cycle<br>ROB · RS/IQ · LQ · SQ: unlimited`
     : `Forwarding: ${config.forwarding ? "on" : "off"}<br>Out-of-order execution: ${config.outOfOrderExecution !== false ? "on" : "off"}`)
     + `<br>Floating point: ${config.floatingPointPrecision === "double" ? "double (64-bit)" : "single (32-bit)"}`
     + `<br>Compressed instructions: ${config.compressedInstructions ? "on" : "off"}`
     + `<br>${memoryDetails}`;
-  $("#pipeline-diagram").innerHTML = `<div class="diagram-title">${o3 ? "Multiple-issue processor with speculation" : "Five-stage pipeline (in-order fetch and issue)"}</div>${blocks}<div class="diagram-detail">${details}</div>`;
+  $("#pipeline-diagram").innerHTML = `<div class="diagram-title">${o3 ? "Superscalar" : "Five-Stage Pipeline (F/D/E/M/W)"}</div>${blocks}<div class="diagram-detail">${details}</div>`;
 }
 
 function memoryWatchStorageKey(projectName = current?.name) {
@@ -1753,22 +1759,55 @@ function exportVisiblePipeline() {
 function updateForwardingControl() {
   const outOfOrder = studioFeatures.multiIssueCpu
     && $("#cpu-model").value === "out-of-order";
+  const integerPanel = $("#integer-unit-settings");
+  const floatingPanel = $("#floating-unit-settings");
+  const integerAluRow = $("#int-alu").closest(".unit-row");
+  const unitFields = (outOfOrder ? floatingPanel : integerPanel).querySelector(".unit-fields");
+  unitFields.insertBefore(integerAluRow, unitFields.querySelector(".unit-heading").nextElementSibling);
+  integerPanel.hidden = outOfOrder;
+  floatingPanel.closest(".units-grid").classList.toggle("superscalar", outOfOrder);
+  floatingPanel.querySelector("legend").textContent = outOfOrder
+    ? "Functional units · clock cycles" : "Floating-point unit · clock cycles";
+  integerAluRow.firstElementChild.textContent = outOfOrder ? "Integer ALU" : "ALU";
+  for (const [id, singleLabel, combinedLabel] of [
+    ["float-alu", "ALU", "FP arithmetic"],
+    ["float-mul", "Multiply", "FP multiply"],
+    ["float-div", "Divide", "FP divide"]
+  ]) {
+    $("#" + id).closest(".unit-row").firstElementChild.textContent = outOfOrder
+      ? combinedLabel : singleLabel;
+  }
   $("#forwarding").disabled = outOfOrder;
   if (outOfOrder) $("#forwarding").checked = true;
   $("#forwarding-note").textContent = outOfOrder ? "(results use CDB/ROB forwarding)" : "";
   $("#o3-management").hidden = !outOfOrder;
+  $("#memory-management").hidden = !studioFeatures.memoryConfiguration;
+  $("#out-of-order-execution").closest("label").hidden = outOfOrder;
+  $("#out-of-order-execution").disabled = outOfOrder;
+  $("#branch-predictor").disabled = !outOfOrder;
+  ["int-mul", "int-div"].forEach(id => {
+    const row = $("#" + id).closest(".unit-row");
+    row.hidden = outOfOrder;
+    row.querySelectorAll("input").forEach(input => { input.disabled = outOfOrder; });
+  });
+  if (outOfOrder) {
+    $("#out-of-order-execution").checked = true;
+    $("#speculative-execution").checked = true;
+  }
 }
 
 function updateMemoryControls() {
   const mode = $("#memory-mode").value;
+  const available = studioFeatures.memoryConfiguration;
   const direct = mode === "direct";
   const cache = mode === "cache";
+  $("#memory-mode").disabled = !available;
   $("#direct-memory-fields").hidden = !direct;
   $("#cache-memory-fields").hidden = !cache;
   ["#instruction-memory-latency", "#data-read-latency", "#data-write-latency"]
-    .forEach(selector => { $(selector).disabled = !direct; });
+    .forEach(selector => { $(selector).disabled = !available || !direct; });
   ["#i-cache-size", "#d-cache-size", "#cache-line", "#cache-latency", "#memory-latency"]
-    .forEach(selector => { $(selector).disabled = !cache; });
+    .forEach(selector => { $(selector).disabled = !available || !cache; });
 }
 
 async function openCpuConfiguration() {
@@ -1812,7 +1851,8 @@ async function openCpuConfiguration() {
     $("#iq-entries").value = config.iqEntries;
     $("#lq-entries").value = config.lqEntries;
     $("#sq-entries").value = config.sqEntries;
-    $("#branch-predictor").value = config.branchPredictor || "local";
+    $("#branch-predictor").value = config.branchPredictor
+      || (config.cpu === "out-of-order" ? "ideal" : "local");
     $("#o3-evaluation-label").value = config.o3EvaluationLabel || "";
     $("#out-of-order-execution").checked = config.outOfOrderExecution !== false;
     $("#speculative-execution").checked = config.speculativeExecution !== false;
@@ -2201,9 +2241,20 @@ $("#advanced-logs").onchange = updateLog;
 $("#cpu-model").onchange = () => {
   if (cpuConfigurationOpenedAs === "in-order"
       && $("#cpu-model").value === "out-of-order") {
-    $("#issue-width").value = 2;
-    $("#writeback-width").value = 2;
-    $("#commit-width").value = 2;
+    $("#branch-predictor").value = o3Defaults.branchPredictor || "ideal";
+    const defaultInputs = {
+      intAlu: "int-alu", intMul: "int-mul", intDiv: "int-div",
+      floatAlu: "float-alu", floatMul: "float-mul", floatDiv: "float-div",
+      dispatchWidth: "dispatch-width", issueWidth: "issue-width",
+      writebackWidth: "writeback-width", commitWidth: "commit-width"
+    };
+    for (const [key, id] of Object.entries(defaultInputs)) {
+      if (o3Defaults[key] !== undefined) $("#" + id).value = o3Defaults[key];
+    }
+    for (const unit of ["int-alu", "int-mul", "int-div", "float-alu", "float-mul", "float-div"]) {
+      const key = unit.replace(/-([a-z])/g, (_match, letter) => letter.toUpperCase()) + "Pipelined";
+      if (o3Defaults[key] !== undefined) $("#" + unit + "-pipelined").checked = o3Defaults[key];
+    }
     const defaultStages = new Set(["issue", "execute", "memory", "cdb", "commit"]);
     document.querySelectorAll("[data-o3-stage]").forEach(input => {
       input.checked = defaultStages.has(input.dataset.o3Stage);
@@ -2211,6 +2262,7 @@ $("#cpu-model").onchange = () => {
     cpuConfigurationOpenedAs = "out-of-order";
   }
   updateForwardingControl();
+  updateMemoryControls();
 };
 $("#memory-mode").onchange = updateMemoryControls;
 $("#cancel-submission").onclick = () => $("#submission-dialog").close();
