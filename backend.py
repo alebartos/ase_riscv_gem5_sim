@@ -4439,9 +4439,15 @@ def write_pipeline_csv(data, output, expand_loops=False):
             for (cache, result), count in cache_groups.items()
         )
         flow = "; ".join(flow_parts)
+        stage_labels = {"C": "CDB", "W": "C"} if data.get("format") == "o3" else {}
+        cycle_cells = []
+        for cycle in range(1, data["cycles"] + 1):
+            stage = row["cycles"].get(str(cycle), "")
+            if stage_labels and stage:
+                stage = "/".join(stage_labels.get(marker, marker) for marker in stage)
+            cycle_cells.append(stage)
         writer.writerow([f"0x{row['address']}", row["instruction"], flow,
-                         *[row["cycles"].get(str(cycle), "")
-                           for cycle in range(1, data["cycles"] + 1)]])
+                         *cycle_cells])
 
 
 def pipeline_csv(data, expand_loops=False):

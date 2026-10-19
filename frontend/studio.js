@@ -1585,7 +1585,9 @@ function renderPipeline() {
       html += '<div class="pipeline-cycle-spacer" aria-hidden="true"></div>';
       for (let cycle = firstCycle; cycle <= lastCycle; cycle++) {
         const stage = row.cycles[cycle] || "";
-        const label = stage.length > 1 && stage !== "S" ? stage.split("").join("/") : stage;
+        const label = pipelineData.format === "o3"
+          ? stage.split("").map(marker => ({C: "CDB", W: "C"}[marker] || marker)).join("/")
+          : stage.length > 1 && stage !== "S" ? stage.split("").join("/") : stage;
         const stageClass = stage ? "stage-" + stage.slice(-1) : "";
         const columnClass = selectedColumn === cycle ? " column-selected" : "";
         html += `<div class="cell ${stageClass}${columnClass}${cycle > visibleCycle ? " future" : ""}" data-row="${rowIndex}" data-col="${cycle}" data-stage="${stage}">${label}</div>`;
@@ -1733,7 +1735,12 @@ function exportVisiblePipeline() {
         : [])
     ].join("; ");
     const values = [row.address ? `0x${row.address}` : "", row.instruction, flow];
-    for (let cycle = 1; cycle <= lastCycle; cycle++) values.push(row.cycles[String(cycle)] || "");
+    for (let cycle = 1; cycle <= lastCycle; cycle++) {
+      const stage = row.cycles[String(cycle)] || "";
+      values.push(pipelineData.format === "o3"
+        ? stage.split("").map(marker => ({C: "CDB", W: "C"}[marker] || marker)).join("/")
+        : stage);
+    }
     return values;
   });
   const summary = [
