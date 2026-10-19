@@ -348,10 +348,13 @@ def validate_config(value):
     config["o3VisibleStages"] = [stage for stage in (
         "fetch", "decode", "rename", "issue", "execute", "memory", "cdb", "commit"
     ) if stage in visible_stages]
-    predictor_name = value.get("branchPredictor", config["branchPredictor"])
-    if predictor_name not in {"ideal", "local", "tournament", "bimode", "tage"}:
-        fail("Select a supported branch predictor.")
-    config["branchPredictor"] = predictor_name
+    if multiple_issue:
+        config["branchPredictor"] = "ideal"
+    else:
+        predictor_name = value.get("branchPredictor", config["branchPredictor"])
+        if predictor_name not in {"ideal", "local", "tournament", "bimode", "tage"}:
+            fail("Select a supported branch predictor.")
+        config["branchPredictor"] = predictor_name
     speculation = value.get("speculativeExecution", config["speculativeExecution"])
     if not isinstance(speculation, bool):
         fail("The speculative-execution option must be enabled or disabled.")
@@ -1721,6 +1724,7 @@ def schedule_lecture_o3_pipeline(data, configuration, start_address=None):
     if data.get("format") != "o3":
         return False
     configuration = {**DEFAULT_O3_CONFIG, **configuration, **O3_FIXED_CONFIG}
+    configuration["branchPredictor"] = "ideal"
 
     def first_cycle(row):
         return min((int(cycle) for cycle in row.get("cycles", {})),
@@ -1884,6 +1888,8 @@ def schedule_lecture_o3_pipeline(data, configuration, start_address=None):
 
     cdb_width = max(1, int(configuration["writebackWidth"]))
     cdb_uses = defaultdict(int)
+    # Each functional unit has one output port to the shared CDBs.
+    unit_cdb_uses = defaultdict(set)
     unit_busy = defaultdict(set)
     memory_busy = set()
     latest_producer = {}
@@ -1902,11 +1908,12 @@ def schedule_lecture_o3_pipeline(data, configuration, start_address=None):
                 return cycle
             cycle += 1
 
-    def reserve_cdb(earliest):
+    def reserve_cdb(earliest, unit):
         cycle = earliest
-        while cdb_uses[cycle] >= cdb_width:
+        while cdb_uses[cycle] >= cdb_width or cycle in unit_cdb_uses[unit]:
             cycle += 1
         cdb_uses[cycle] += 1
+        unit_cdb_uses[unit].add(cycle)
         return cycle
 
     speculation = bool(configuration.get("speculativeExecution", True))
@@ -1953,8 +1960,9 @@ def schedule_lecture_o3_pipeline(data, configuration, start_address=None):
             memory_busy.update(range(memory_start, memory_end + 1))
 
         produces_result = info["destination"] is not None
-        cdb = reserve_cdb((memory_end if info["load"] else execute_end) + 1) \
-            if produces_result else None
+        cdb = (reserve_cdb((memory_end if info["load"] else execute_end) + 1,
+                           info["unit"])
+               if produces_result else None)
         record = {
             **info, "row": row, "I": issue, "E": execute,
             "EEnd": execute_end, "M": memory_start, "MEnd": memory_end,

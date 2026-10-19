@@ -1791,7 +1791,6 @@ function updateForwardingControl() {
   $("#memory-management").hidden = !studioFeatures.memoryConfiguration;
   $("#out-of-order-execution").closest("label").hidden = outOfOrder;
   $("#out-of-order-execution").disabled = outOfOrder;
-  $("#branch-predictor").disabled = !outOfOrder;
   ["int-mul", "int-div"].forEach(id => {
     const row = $("#" + id).closest(".unit-row");
     row.hidden = outOfOrder;
@@ -1858,8 +1857,6 @@ async function openCpuConfiguration() {
     $("#iq-entries").value = config.iqEntries;
     $("#lq-entries").value = config.lqEntries;
     $("#sq-entries").value = config.sqEntries;
-    $("#branch-predictor").value = config.branchPredictor
-      || (config.cpu === "out-of-order" ? "ideal" : "local");
     $("#o3-evaluation-label").value = config.o3EvaluationLabel || "";
     $("#out-of-order-execution").checked = config.outOfOrderExecution !== false;
     $("#speculative-execution").checked = config.speculativeExecution !== false;
@@ -2248,7 +2245,6 @@ $("#advanced-logs").onchange = updateLog;
 $("#cpu-model").onchange = () => {
   if (cpuConfigurationOpenedAs === "in-order"
       && $("#cpu-model").value === "out-of-order") {
-    $("#branch-predictor").value = o3Defaults.branchPredictor || "ideal";
     const defaultInputs = {
       intAlu: "int-alu", intMul: "int-mul", intDiv: "int-div",
       floatAlu: "float-alu", floatMul: "float-mul", floatDiv: "float-div",
@@ -2351,7 +2347,7 @@ $("#cpu-form").onsubmit = async event => {
     iqEntries: Number($("#iq-entries").value),
     lqEntries: Number($("#lq-entries").value),
     sqEntries: Number($("#sq-entries").value),
-    branchPredictor: $("#branch-predictor").value,
+    branchPredictor: $("#cpu-model").value === "out-of-order" ? "ideal" : "local",
     speculativeExecution: $("#speculative-execution").checked,
     outOfOrderExecution: $("#out-of-order-execution").checked,
     o3EvaluationLabel: $("#o3-evaluation-label").value.trim(),

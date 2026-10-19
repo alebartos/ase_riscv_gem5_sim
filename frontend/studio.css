@@ -293,7 +293,7 @@ dialog::backdrop { background: #0f172a73; }
 .o3-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px 15px; }
 .o3-grid label { display: grid; grid-template-columns: 1fr 75px; align-items: center; gap: 8px; }
 #o3-management { display: grid; gap: 12px; }
-.o3-policy-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px 15px; }
+.o3-policy-grid { display: grid; grid-template-columns: 1fr; gap: 8px 15px; }
 .o3-policy-grid > label:not(.check) { display: grid; grid-template-columns: 1fr minmax(120px, 1fr); align-items: center; gap: 8px; }
 .o3-policy-grid .check { min-height: 32px; }
 .o3-stage-heading { display: grid; gap: 2px; }
