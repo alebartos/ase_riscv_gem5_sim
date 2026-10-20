@@ -17,6 +17,8 @@ let lastNormalLog = "";
 let lastAdvancedLog = lastNormalLog;
 let savedSource = "";
 let sourceDirty = false;
+let scaffoldProtectionEnabled = true;
+let scaffoldEditAuthorized = false;
 let undoStack = [];
 let redoStack = [];
 let pendingEditorSnapshot = null;
@@ -31,6 +33,7 @@ let pipelineSelectTarget = null;
 let externalSyncBusy = false;
 let memoryWatches = [];
 let cpuConfigurationOpenedAs = null;
+let o3Defaults = {};
 let studioFeatures = {
   developerMode: false,
   memoryConfiguration: false,
@@ -40,6 +43,7 @@ let configuredProgramsDirectory = "";
 let memoryPopoutWindow = null;
 let pipelinePaintFrame = null;
 let pipelineResizeObserver = null;
+let changeContextMenu = null;
 const memoryWindowChannel = "BroadcastChannel" in window
   ? new BroadcastChannel("ase-studio-memory-window") : null;
 
@@ -55,6 +59,12 @@ if (memoryWindowChannel) {
     else if (message.action === "remove") removeMemoryWatch(message.index);
     else if (message.action === "clear") clearMemoryWatches();
     else if (message.action === "format") setMemoryFormat(message.value);
+    else if (message.action === "navigate-change") {
+      navigateToItemChange({
+        kind: "memory", key: message.address,
+        width: Number(message.width), label: message.label
+      }, message.direction);
+    }
   };
 }
 
@@ -136,6 +146,7 @@ function restoreEditorSnapshot(snapshot) {
   editor.setSelectionRange(snapshot.start, snapshot.end);
   applyingEditorHistory = false;
   markSourceEdited();
+  refreshScaffoldProtectionUi();
   syncEditor();
   restoreEditorViewport(viewport);
 }
@@ -189,6 +200,7 @@ async function api(url, options = {}) {
 async function loadStudioVersion() {
   try {
     const health = await api("/api/health");
+    o3Defaults = health.o3Defaults || {};
     $("#about-version").textContent = `Version ${health.version}`;
     applyDeveloperFeatures(health.features || {});
   } catch (_error) {
@@ -230,6 +242,113 @@ function markSourceEdited() {
   updateDirtyIndicator();
 }
 
+function scaffoldEditsAllowed() {
+  return !scaffoldProtectionEnabled || scaffoldEditAuthorized;
+}
+
+function updateScaffoldProtectionUi(message = "") {
+  const control = $("#scaffold-protection");
+  const status = $("#scaffold-protection-status");
+  control.checked = scaffoldProtectionEnabled;
+  control.disabled = !current;
+  control.title = scaffoldProtectionEnabled
+    ? "Required _start and End labels and the exit block are read-only."
+    : "Label protection is off. Required labels and the exit block can be edited.";
+  status.hidden = !current || (scaffoldProtectionEnabled && !message);
+  status.textContent = message || (scaffoldProtectionEnabled
+    ? ""
+    : "Label protection is off. Simulation requires one _start label and one valid End exit block.");
+}
+
+function validateSimulationScaffold(text) {
+  const labels = {start: [], end: []};
+  const statements = [];
+  let startIsGlobal = false;
+  const labelPattern = /^([A-Za-z_.$][\w.$]*)\s*:\s*/;
+
+  String(text).split(/\r?\n/).forEach((rawLine, index) => {
+    let code = rawLine.split("#", 1)[0].trim();
+    if (/^\.(?:globl|global)\s+_start\b/i.test(code)) startIsGlobal = true;
+    while (true) {
+      const match = code.match(labelPattern);
+      if (!match) break;
+      const label = match[1];
+      if (label === "_start") {
+        labels.start.push({line: index + 1, nextStatement: statements.length});
+      } else if (label.toLowerCase() === "end") {
+        labels.end.push({line: index + 1, nextStatement: statements.length});
+      }
+      code = code.slice(match[0].length).trimStart();
+    }
+    if (code) statements.push(code);
+  });
+
+  const issues = [];
+  const describeLabels = (name, found) => {
+    if (!found.length) issues.push(`Missing required ${name}: label.`);
+    else if (found.length > 1) {
+      issues.push(`Found ${name}: on lines ${found.map(item => item.line).join(", ")}; keep only one.`);
+    }
+  };
+  describeLabels("_start", labels.start);
+  if (labels.start.length === 1 && !startIsGlobal) {
+    issues.push("The _start label must be exported with .globl _start.");
+  }
+  describeLabels("End", labels.end);
+
+  if (labels.end.length === 1) {
+    const end = labels.end[0];
+    const exit = statements.slice(end.nextStatement, end.nextStatement + 3);
+    if (exit.length < 3
+        || !/^li\s+(?:a0|x10)\s*,\s*0$/i.test(exit[0])
+        || !/^li\s+(?:a7|x17)\s*,\s*93$/i.test(exit[1])
+        || !/^ecall$/i.test(exit[2])) {
+      issues.push(`End: on line ${end.line} must be followed by li a0, 0; li a7, 93; and ecall.`);
+    }
+  }
+  return issues;
+}
+
+function refreshScaffoldProtectionUi() {
+  if (!current) {
+    updateScaffoldProtectionUi();
+    return;
+  }
+  const issues = validateSimulationScaffold($("#body").value);
+  if (scaffoldProtectionEnabled && issues.length) {
+    scaffoldProtectionEnabled = false;
+    scaffoldEditAuthorized = true;
+  }
+  updateScaffoldProtectionUi(issues.length
+    ? `Label protection is off because: ${issues.join(" ")}`
+    : "");
+}
+
+function resetScaffoldProtection() {
+  scaffoldProtectionEnabled = true;
+  scaffoldEditAuthorized = false;
+  refreshScaffoldProtectionUi();
+}
+
+$("#scaffold-protection").addEventListener("change", event => {
+  if (!current) return;
+  if (event.target.checked) {
+    const issues = validateSimulationScaffold($("#body").value);
+    if (issues.length) {
+      scaffoldProtectionEnabled = false;
+      scaffoldEditAuthorized = true;
+      refreshScaffoldProtectionUi();
+      return;
+    }
+    scaffoldProtectionEnabled = true;
+  } else {
+    scaffoldProtectionEnabled = false;
+    scaffoldEditAuthorized = true;
+  }
+  refreshScaffoldProtectionUi();
+  syncEditor();
+});
+
 function highlightAsmLine(line) {
   const commentAt = line.indexOf("#");
   let code = commentAt >= 0 ? line.slice(0, commentAt) : line;
@@ -241,7 +360,7 @@ function highlightAsmLine(line) {
       '<span class="register">$&</span>')
     .replace(/\b(c[._][a-z][\w.]*|add|addi|sub|sll|slli|slt|slti|sltu|sltiu|xor|xori|srl|srli|sra|srai|or|ori|and|andi|lui|auipc|lb|lbu|lh|lhu|lw|lwu|ld|sb|sh|sw|sd|mul|mulh|mulhsu|mulhu|div|divu|rem|remu|flw|fld|fsw|fsd|f(?:add|sub|mul|div|min|max)\.[sd]|f(?:madd|msub|nmsub|nmadd)\.[sd]|fsqrt\.[sd]|fsgnj[nx]?\.[sd]|f(?:eq|lt|le|class)\.[sd]|fcvt\.(?:w|wu|l|lu|s|d)\.(?:w|wu|l|lu|s|d)|fmv\.(?:x\.w|w\.x)|(?:lr|sc|amo(?:swap|add|xor|and|or|min|max|minu|maxu))\.w|beqz|bnez|beq|bne|blt|bge|bltu|bgeu|jal|jalr|j|jr|ret|call|tail|li|la|mv|neg|not|seqz|snez|sltz|sgtz|csrrw|csrrs|csrrc|csrrwi|csrrsi|csrrci|csrr|csrw|csrs|csrc|csrwi|csrsi|csrci|rdcycle|rdtime|rdinstret|fence\.i|fence|nop|ecall|ebreak|wfi|mret)\b/gi,
       '<span class="opcode">$&</span>')
-    .replace(/^\s*([\w.]+):/, '<span class="label">$1</span>:');
+    .replace(/^(\s*)([\w.]+):/, '$1<span class="label">$2</span>:');
 
   return code + (comment ? `<span class="comment">${escapeHtml(comment)}</span>` : "");
 }
@@ -249,6 +368,7 @@ function highlightAsmLine(line) {
 function computeProtectedLines(text) {
   const lines = text.split("\n");
   const locked = new Set();
+  if (!scaffoldProtectionEnabled) return locked;
   const code = lines.map(line => line.split("#", 1)[0].trim());
   const scaffoldComments = new Set([
     "# The text section contains the instructions that the CPU runs.",
@@ -418,6 +538,7 @@ async function openProject(name, {skipUnsavedCheck = false} = {}) {
   $("#project-title").textContent = current.name;
   $("#source-name").textContent = current.sourceName;
   $("#body").value = current.text;
+  resetScaffoldProtection();
   resetEditorHistory();
   savedSource = current.text;
   sourceDirty = false;
@@ -455,8 +576,10 @@ async function save() {
   await api("/api/save", {
     method: "POST",
     headers: {"Content-Type": "application/json"},
-    body: JSON.stringify({name: current.name, text: $("#body").value})
+    body: JSON.stringify({name: current.name, text: $("#body").value,
+      allowScaffoldEdit: scaffoldEditsAllowed()})
   });
+  scaffoldEditAuthorized = false;
   savedSource = $("#body").value;
   sourceDirty = false;
   updateDirtyIndicator();
@@ -574,6 +697,7 @@ async function synchronizeExternalSource() {
     $("#cycle-next").disabled = true;
     $("#cycle-position").textContent = "Cycle —/—";
     updateDirtyIndicator();
+    refreshScaffoldProtectionUi();
     syncEditor();
     renderRegisters();
     renderPipeline();
@@ -650,6 +774,17 @@ async function prepareSubmission() {
     await showActionMessage("Prepare submission", "Select at least one project.");
     return;
   }
+  if (selectedNames.includes(current.name)) {
+    const scaffoldIssues = validateSimulationScaffold($("#body").value);
+    if (scaffoldIssues.length) {
+      const hint = scaffoldProtectionEnabled
+        ? "Turn off Protect labels to edit protected lines."
+        : "Correct the required labels and exit block, then try again.";
+      await showActionMessage("Cannot prepare submission",
+        `${scaffoldIssues.join("\n")}\n\n${hint}`);
+      return;
+    }
+  }
   const files = [...($("#submission-files").files || [])];
   if (files.length > 20) {
     await showActionMessage("Prepare submission", "Choose no more than 20 additional files.");
@@ -687,7 +822,8 @@ async function prepareSubmission() {
   const currentWasSelected = selectedNames.includes(submittedProjectName);
   const projects = selectedNames.map(name => ({
     name,
-    source: name === submittedProjectName ? submittedSource : null
+    source: name === submittedProjectName ? submittedSource : null,
+    allowScaffoldEdit: name === submittedProjectName && scaffoldEditsAllowed()
   }));
   $("#submission-dialog").close();
   confirmButton.disabled = false;
@@ -713,6 +849,7 @@ async function prepareSubmission() {
       })
     });
     if (currentWasSelected && current?.name === submittedProjectName) {
+      scaffoldEditAuthorized = false;
       savedSource = submittedSource;
       sourceDirty = $("#body").value !== submittedSource;
       updateDirtyIndicator();
@@ -800,6 +937,18 @@ function resetPipelineViewport() {
 
 async function run(stepAfterRun = false) {
   if (!current) return;
+  const source = $("#body").value;
+  const scaffoldIssues = validateSimulationScaffold(source);
+  if (scaffoldIssues.length) {
+    const hint = scaffoldProtectionEnabled
+      ? "Turn off Protect labels to edit protected lines."
+      : "Correct the required labels and exit block, then run again.";
+    lastNormalLog = `Cannot start simulation:\n${scaffoldIssues.map(issue => `• ${issue}`).join("\n")}\n\n${hint}`;
+    lastAdvancedLog = lastNormalLog;
+    updateLog();
+    showTab("output");
+    return;
+  }
   if (!stepAfterRun) {
     stepMode = false;
     $("#step").textContent = "Run Step";
@@ -821,8 +970,10 @@ async function run(stepAfterRun = false) {
     const result = await api("/api/run", {
       method: "POST",
       headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({name: current.name, text: $("#body").value})
+      body: JSON.stringify({name: current.name, text: source,
+        allowScaffoldEdit: scaffoldEditsAllowed()})
     });
+    scaffoldEditAuthorized = false;
     savedSource = $("#body").value;
     sourceDirty = false;
     updateDirtyIndicator();
@@ -966,7 +1117,7 @@ function renderRegisters() {
   const floatAbi = ["ft0", "ft1", "ft2", "ft3", "ft4", "ft5", "ft6", "ft7", "fs0", "fs1", "fa0", "fa1", "fa2", "fa3", "fa4", "fa5", "fa6", "fa7", "fs2", "fs3", "fs4", "fs5", "fs6", "fs7", "fs8", "fs9", "fs10", "fs11", "ft8", "ft9", "ft10", "ft11"];
   const renderColumn = (prefix, aliases, format, width) => aliases.map((alias, index) => {
     const name = `${prefix}${index}`;
-    return `<div class="register-value${changed.has(name) ? " changed" : ""}"><strong>${name}</strong><span>${alias}</span><code>${formatWordValue(state[name] || 0, format, width)}</code></div>`;
+    return `<div class="register-value${changed.has(name) ? " changed" : ""}" data-register-change="${name}"><strong>${name}</strong><span>${alias}</span><code>${formatWordValue(state[name] || 0, format, width)}</code></div>`;
   }).join("");
   $("#pipeline-pc").textContent = `PC ${pc}`;
   $("#pipeline-pc").classList.toggle("changed", pcChanged);
@@ -1097,13 +1248,17 @@ function renderPipelineDiagram() {
   const memoryDetails = memoryMode === "cache"
     ? `L1 I ${config.iCacheSize} · D ${config.dCacheSize}<br>Hit ${config.cacheLatency} cycles · RAM ${config.memoryLatency} cycles`
     : `Direct memory · I ${config.instructionMemoryLatency} · Read ${config.dataReadLatency} · Write ${config.dataWriteLatency} cycles`;
+  const predictorName = {
+    ideal: "Ideal (perfect prediction)", local: "Local two-bit",
+    tournament: "Tournament", bimode: "Bi-mode", tage: "TAGE"
+  }[config.branchPredictor] || "Ideal (perfect prediction)";
   const details = (o3
-    ? `${config.speculativeExecution ? "speculation on" : "speculation off"} · ${config.outOfOrderExecution !== false ? "out-of-order execution" : "in-order execution"}<br>Predictor: ${{ideal: "Ideal (perfect prediction)", local: "Local two-bit", tournament: "Tournament", bimode: "Bi-mode", tage: "TAGE"}[config.branchPredictor] || "Local two-bit"}<br>In-order issue ${config.dispatchWidth} · EXE issue ${config.issueWidth}<br>CDB ${config.writebackWidth} · Commit ${config.commitWidth}<br>ROB ${config.robEntries} · RS/IQ ${config.iqEntries}<br>LQ ${config.lqEntries} · SQ ${config.sqEntries}`
+    ? `Out-of-order execution · speculation on<br>Predictor: ${predictorName}<br>Issue ${config.dispatchWidth} · branches/jumps issue alone<br>CDB ${config.writebackWidth} · Commit ${config.commitWidth}<br>Address unit: 1 cycle · Jump unit: 1 cycle<br>ROB · RS/IQ · LQ · SQ: unlimited`
     : `Forwarding: ${config.forwarding ? "on" : "off"}<br>Out-of-order execution: ${config.outOfOrderExecution !== false ? "on" : "off"}`)
     + `<br>Floating point: ${config.floatingPointPrecision === "double" ? "double (64-bit)" : "single (32-bit)"}`
     + `<br>Compressed instructions: ${config.compressedInstructions ? "on" : "off"}`
     + `<br>${memoryDetails}`;
-  $("#pipeline-diagram").innerHTML = `<div class="diagram-title">${o3 ? "Multiple-issue processor with speculation" : "Five-stage pipeline (in-order fetch and issue)"}</div>${blocks}<div class="diagram-detail">${details}</div>`;
+  $("#pipeline-diagram").innerHTML = `<div class="diagram-title">${o3 ? "Superscalar" : "Five-Stage Pipeline (F/D/E/M/W)"}</div>${blocks}<div class="diagram-detail">${details}</div>`;
 }
 
 function memoryWatchStorageKey(projectName = current?.name) {
@@ -1372,6 +1527,7 @@ function renderMemory() {
       const elementFormat = format === "float" && width < 32 ? "hex" : format;
       rows.push({
         address,
+        width: layout.elementSize,
         symbol,
         label: layout.elementCount > 1 ? `${symbol.name}[${index}]` : symbol.name,
         access: latest ? latest.access : known ? "initial value" : "not accessed",
@@ -1385,9 +1541,153 @@ function renderMemory() {
   $("#memory-summary").textContent = `Memory watch through cycle ${playbackCycle} · ${rows.length} location${rows.length === 1 ? "" : "s"}${limitNote}`;
   table.innerHTML = rows.length ? rows.map(row => {
     const style = ` style="--memory-symbol-hue:${memorySymbolHue(row.symbol, symbols)}deg"`;
-    return `<div class="memory-value memory-symbol-color${row.changed ? " changed" : ""}"${style}><strong class="memory-symbol-name">${escapeHtml(row.label)}</strong><span class="memory-address">0x${row.address.toString(16)}</span><span>${row.access}</span><code>${row.value}</code></div>`;
+    return `<div class="memory-value memory-symbol-color${row.changed ? " changed" : ""}" data-memory-address="0x${row.address.toString(16)}" data-memory-width="${row.width}" data-memory-label="${escapeHtml(row.label)}"${style}><strong class="memory-symbol-name">${escapeHtml(row.label)}</strong><span class="memory-address">0x${row.address.toString(16)}</span><span>${row.access}</span><code>${row.value}</code></div>`;
   }).join("") : '<div class="memory-empty">No matching memory locations were found in this build.</div>';
   publishMemoryWindowState();
+}
+
+function closeChangeContextMenu() {
+  changeContextMenu?.remove();
+  changeContextMenu = null;
+}
+
+function openChangeContextMenu(event, item) {
+  closeChangeContextMenu();
+  event.preventDefault();
+  const menu = document.createElement("div");
+  menu.className = "change-context-menu";
+  menu.setAttribute("role", "menu");
+  [
+    ["next", "Go to next change"],
+    ["previous", "Go to previous change"]
+  ].forEach(([direction, label]) => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.setAttribute("role", "menuitem");
+    button.textContent = label;
+    button.onclick = () => {
+      closeChangeContextMenu();
+      navigateToItemChange(item, direction);
+    };
+    menu.append(button);
+  });
+  document.body.append(menu);
+  const bounds = menu.getBoundingClientRect();
+  menu.style.left = `${Math.max(8, Math.min(event.clientX, window.innerWidth - bounds.width - 8))}px`;
+  menu.style.top = `${Math.max(8, Math.min(event.clientY, window.innerHeight - bounds.height - 8))}px`;
+  changeContextMenu = menu;
+  menu.querySelector("button")?.focus();
+}
+
+function sameTraceValue(left, right) {
+  try {
+    return BigInt(left) === BigInt(right);
+  } catch (_error) {
+    return String(left) === String(right);
+  }
+}
+
+function registerChangeCycles(register) {
+  const deltas = pipelineData?.registerDeltas || {};
+  const initial = pipelineData?.initialRegisters || {};
+  let previous = initial[register] ?? "0x00000000";
+  const changes = [];
+  Object.keys(deltas).map(Number).sort((left, right) => left - right).forEach(cycle => {
+    const update = deltas[String(cycle)];
+    if (!Object.prototype.hasOwnProperty.call(update, register)) return;
+    const value = update[register];
+    if (!sameTraceValue(previous, value)) changes.push(cycle);
+    previous = value;
+  });
+  return changes;
+}
+
+function memoryChangeCycles(address, width) {
+  const start = Number(BigInt(canonicalMemoryAddress(address)));
+  const byteCount = Math.max(1, Math.floor(Number(width) || 1));
+  const bytes = Array(byteCount).fill(null);
+  const initialMemory = pipelineData?.initialMemory || current?.initialMemory || {};
+  Object.entries(initialMemory).forEach(([baseText, hex]) => {
+    if (typeof hex !== "string") return;
+    const base = Number(BigInt(baseText));
+    const first = Math.max(start, base);
+    const last = Math.min(start + byteCount, base + Math.floor(hex.length / 2));
+    for (let location = first; location < last; location++) {
+      const offset = (location - base) * 2;
+      const byte = Number.parseInt(hex.slice(offset, offset + 2), 16);
+      if (Number.isFinite(byte)) bytes[location - start] = byte;
+    }
+  });
+
+  const deltas = pipelineData?.memoryDeltas || {};
+  const changes = [];
+  Object.keys(deltas).map(Number).sort((left, right) => left - right).forEach(cycle => {
+    const before = bytes.slice();
+    Object.entries(deltas[String(cycle)] || {}).forEach(([eventAddress, event]) => {
+      if (event.access !== "write") return;
+      let value;
+      try {
+        value = BigInt(event.value);
+      } catch (_error) {
+        return;
+      }
+      const eventStart = Number(BigInt(eventAddress));
+      const eventWidth = Math.max(1, Math.floor((Number(event.bits) || 32) / 8));
+      const first = Math.max(start, eventStart);
+      const last = Math.min(start + byteCount, eventStart + eventWidth);
+      for (let location = first; location < last; location++) {
+        const offset = location - eventStart;
+        bytes[location - start] = Number((value >> BigInt(offset * 8)) & 0xffn);
+      }
+    });
+    if (bytes.some((value, index) => value !== before[index])) changes.push(cycle);
+  });
+  return changes;
+}
+
+async function navigateToItemChange(item, direction) {
+  const label = item.label || item.key;
+  const action = direction === "previous" ? "Go to previous change" : "Go to next change";
+  if (!stepMode || !pipelineData || playbackCycle === null) {
+    await showActionMessage(action, `${action} is available after starting Run Step.`);
+    return;
+  }
+
+  let changes = [];
+  try {
+    changes = item.kind === "register"
+      ? registerChangeCycles(item.key)
+      : memoryChangeCycles(item.key, item.width);
+  } catch (_error) {
+    changes = [];
+  }
+  const target = direction === "previous"
+    ? [...changes].reverse().find(cycle => cycle < playbackCycle)
+    : changes.find(cycle => cycle > playbackCycle);
+  if (target === undefined) {
+    await showActionMessage(action, `No ${direction === "previous" ? "previous" : "next"} value change for ${label} was found in this trace.`);
+    return;
+  }
+  navigateToPipelineCycle(target);
+}
+
+function navigateToPipelineCycle(cycle) {
+  playbackCycle = cycle;
+  selectedColumn = cycle;
+  $("#step").textContent = playbackCycle >= pipelineData.cycles
+    ? "Restart Step" : "Next Cycle";
+  renderPipeline();
+  showTab("pipeline");
+  positionPipelineCycle(cycle);
+  const eventRow = displayedPipelineRows().findIndex(row =>
+    row.cycles?.[String(cycle)] !== undefined);
+  if (eventRow >= 0) {
+    requestAnimationFrame(() => {
+      const instruction = $("#pipeline-grid")
+        .querySelector(`.cell.inst[data-row="${eventRow}"]`);
+      if (instruction) pipelineSelectTarget?.(instruction);
+    });
+  }
 }
 
 function expandedLoopView() {
@@ -1579,7 +1879,9 @@ function renderPipeline() {
       html += '<div class="pipeline-cycle-spacer" aria-hidden="true"></div>';
       for (let cycle = firstCycle; cycle <= lastCycle; cycle++) {
         const stage = row.cycles[cycle] || "";
-        const label = stage.length > 1 && stage !== "S" ? stage.split("").join("/") : stage;
+        const label = pipelineData.format === "o3"
+          ? stage.split("").map(marker => ({C: "CDB", W: "C"}[marker] || marker)).join("/")
+          : stage.length > 1 && stage !== "S" ? stage.split("").join("/") : stage;
         const stageClass = stage ? "stage-" + stage.slice(-1) : "";
         const columnClass = selectedColumn === cycle ? " column-selected" : "";
         html += `<div class="cell ${stageClass}${columnClass}${cycle > visibleCycle ? " future" : ""}" data-row="${rowIndex}" data-col="${cycle}" data-stage="${stage}">${label}</div>`;
@@ -1727,7 +2029,12 @@ function exportVisiblePipeline() {
         : [])
     ].join("; ");
     const values = [row.address ? `0x${row.address}` : "", row.instruction, flow];
-    for (let cycle = 1; cycle <= lastCycle; cycle++) values.push(row.cycles[String(cycle)] || "");
+    for (let cycle = 1; cycle <= lastCycle; cycle++) {
+      const stage = row.cycles[String(cycle)] || "";
+      values.push(pipelineData.format === "o3"
+        ? stage.split("").map(marker => ({C: "CDB", W: "C"}[marker] || marker)).join("/")
+        : stage);
+    }
     return values;
   });
   const summary = [
@@ -1753,22 +2060,54 @@ function exportVisiblePipeline() {
 function updateForwardingControl() {
   const outOfOrder = studioFeatures.multiIssueCpu
     && $("#cpu-model").value === "out-of-order";
+  const integerPanel = $("#integer-unit-settings");
+  const floatingPanel = $("#floating-unit-settings");
+  const integerAluRow = $("#int-alu").closest(".unit-row");
+  const unitFields = (outOfOrder ? floatingPanel : integerPanel).querySelector(".unit-fields");
+  unitFields.insertBefore(integerAluRow, unitFields.querySelector(".unit-heading").nextElementSibling);
+  integerPanel.hidden = outOfOrder;
+  floatingPanel.closest(".units-grid").classList.toggle("superscalar", outOfOrder);
+  floatingPanel.querySelector("legend").textContent = outOfOrder
+    ? "Functional units · clock cycles" : "Floating-point unit · clock cycles";
+  integerAluRow.firstElementChild.textContent = outOfOrder ? "Integer ALU" : "ALU";
+  for (const [id, singleLabel, combinedLabel] of [
+    ["float-alu", "ALU", "FP arithmetic"],
+    ["float-mul", "Multiply", "FP multiply"],
+    ["float-div", "Divide", "FP divide"]
+  ]) {
+    $("#" + id).closest(".unit-row").firstElementChild.textContent = outOfOrder
+      ? combinedLabel : singleLabel;
+  }
   $("#forwarding").disabled = outOfOrder;
   if (outOfOrder) $("#forwarding").checked = true;
   $("#forwarding-note").textContent = outOfOrder ? "(results use CDB/ROB forwarding)" : "";
   $("#o3-management").hidden = !outOfOrder;
+  $("#memory-management").hidden = !studioFeatures.memoryConfiguration;
+  $("#out-of-order-execution").closest("label").hidden = outOfOrder;
+  $("#out-of-order-execution").disabled = outOfOrder;
+  ["int-mul", "int-div"].forEach(id => {
+    const row = $("#" + id).closest(".unit-row");
+    row.hidden = outOfOrder;
+    row.querySelectorAll("input").forEach(input => { input.disabled = outOfOrder; });
+  });
+  if (outOfOrder) {
+    $("#out-of-order-execution").checked = true;
+    $("#speculative-execution").checked = true;
+  }
 }
 
 function updateMemoryControls() {
   const mode = $("#memory-mode").value;
+  const available = studioFeatures.memoryConfiguration;
   const direct = mode === "direct";
   const cache = mode === "cache";
+  $("#memory-mode").disabled = !available;
   $("#direct-memory-fields").hidden = !direct;
   $("#cache-memory-fields").hidden = !cache;
   ["#instruction-memory-latency", "#data-read-latency", "#data-write-latency"]
-    .forEach(selector => { $(selector).disabled = !direct; });
+    .forEach(selector => { $(selector).disabled = !available || !direct; });
   ["#i-cache-size", "#d-cache-size", "#cache-line", "#cache-latency", "#memory-latency"]
-    .forEach(selector => { $(selector).disabled = !cache; });
+    .forEach(selector => { $(selector).disabled = !available || !cache; });
 }
 
 async function openCpuConfiguration() {
@@ -1812,7 +2151,6 @@ async function openCpuConfiguration() {
     $("#iq-entries").value = config.iqEntries;
     $("#lq-entries").value = config.lqEntries;
     $("#sq-entries").value = config.sqEntries;
-    $("#branch-predictor").value = config.branchPredictor || "local";
     $("#o3-evaluation-label").value = config.o3EvaluationLabel || "";
     $("#out-of-order-execution").checked = config.outOfOrderExecution !== false;
     $("#speculative-execution").checked = config.speculativeExecution !== false;
@@ -1931,6 +2269,9 @@ async function openEnvironmentSettings() {
 
 function clearCurrentProject() {
   current = null;
+  scaffoldProtectionEnabled = true;
+  scaffoldEditAuthorized = false;
+  updateScaffoldProtectionUi();
   pipelineData = null;
   memoryWatches = [];
   savedSource = "";
@@ -2001,6 +2342,7 @@ function applyEditorChange(start, end, replacement, selectionStart, selectionEnd
   pendingEditorViewport = null;
   editor.value = editor.value.slice(0, start) + replacement + editor.value.slice(end);
   markSourceEdited();
+  refreshScaffoldProtectionUi();
   syncEditor();
   editor.setSelectionRange(selectionStart, selectionEnd);
   restoreEditorViewport(viewport);
@@ -2053,6 +2395,7 @@ $("#body").addEventListener("input", () => {
   pendingEditorSnapshot = null;
   pendingEditorViewport = null;
   markSourceEdited();
+  refreshScaffoldProtectionUi();
   syncEditor();
   restoreEditorViewport(viewport);
 });
@@ -2173,6 +2516,32 @@ $("#message-dialog").addEventListener("cancel", event => {
   closeActionDialog(null);
 });
 document.querySelectorAll("#bottom nav button").forEach(button => button.onclick = () => showTab(button.dataset.tab));
+document.addEventListener("contextmenu", event => {
+  const register = event.target.closest("[data-register-change]");
+  if (register) {
+    openChangeContextMenu(event, {
+      kind: "register", key: register.dataset.registerChange,
+      label: register.dataset.registerChange
+    });
+    return;
+  }
+  const memory = event.target.closest("[data-memory-address]");
+  if (!memory) return;
+  openChangeContextMenu(event, {
+    kind: "memory", key: memory.dataset.memoryAddress,
+    width: Number(memory.dataset.memoryWidth),
+    label: memory.dataset.memoryLabel || memory.dataset.memoryAddress
+  });
+});
+document.addEventListener("pointerdown", event => {
+  if (changeContextMenu && !changeContextMenu.contains(event.target)) {
+    closeChangeContextMenu();
+  }
+});
+document.addEventListener("keydown", event => {
+  if (event.key === "Escape") closeChangeContextMenu();
+});
+window.addEventListener("resize", closeChangeContextMenu);
 $("#memory-symbol-form").onsubmit = event => {
   event.preventDefault();
   addMemoryWatch($("#memory-symbol").value);
@@ -2201,9 +2570,19 @@ $("#advanced-logs").onchange = updateLog;
 $("#cpu-model").onchange = () => {
   if (cpuConfigurationOpenedAs === "in-order"
       && $("#cpu-model").value === "out-of-order") {
-    $("#issue-width").value = 2;
-    $("#writeback-width").value = 2;
-    $("#commit-width").value = 2;
+    const defaultInputs = {
+      intAlu: "int-alu", intMul: "int-mul", intDiv: "int-div",
+      floatAlu: "float-alu", floatMul: "float-mul", floatDiv: "float-div",
+      dispatchWidth: "dispatch-width", issueWidth: "issue-width",
+      writebackWidth: "writeback-width", commitWidth: "commit-width"
+    };
+    for (const [key, id] of Object.entries(defaultInputs)) {
+      if (o3Defaults[key] !== undefined) $("#" + id).value = o3Defaults[key];
+    }
+    for (const unit of ["int-alu", "int-mul", "int-div", "float-alu", "float-mul", "float-div"]) {
+      const key = unit.replace(/-([a-z])/g, (_match, letter) => letter.toUpperCase()) + "Pipelined";
+      if (o3Defaults[key] !== undefined) $("#" + unit + "-pipelined").checked = o3Defaults[key];
+    }
     const defaultStages = new Set(["issue", "execute", "memory", "cdb", "commit"]);
     document.querySelectorAll("[data-o3-stage]").forEach(input => {
       input.checked = defaultStages.has(input.dataset.o3Stage);
@@ -2211,6 +2590,7 @@ $("#cpu-model").onchange = () => {
     cpuConfigurationOpenedAs = "out-of-order";
   }
   updateForwardingControl();
+  updateMemoryControls();
 };
 $("#memory-mode").onchange = updateMemoryControls;
 $("#cancel-submission").onclick = () => $("#submission-dialog").close();
@@ -2292,7 +2672,7 @@ $("#cpu-form").onsubmit = async event => {
     iqEntries: Number($("#iq-entries").value),
     lqEntries: Number($("#lq-entries").value),
     sqEntries: Number($("#sq-entries").value),
-    branchPredictor: $("#branch-predictor").value,
+    branchPredictor: $("#cpu-model").value === "out-of-order" ? "ideal" : "local",
     speculativeExecution: $("#speculative-execution").checked,
     outOfOrderExecution: $("#out-of-order-execution").checked,
     o3EvaluationLabel: $("#o3-evaluation-label").value.trim(),

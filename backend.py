@@ -83,7 +83,7 @@ def developer_mode_enabled(environment=None):
 
 DEVELOPER_MODE = developer_mode_enabled()
 ENABLE_MEMORY_CONFIGURATION = DEVELOPER_MODE
-ENABLE_MULTI_ISSUE_CPU = DEVELOPER_MODE
+ENABLE_MULTI_ISSUE_CPU = True
 
 _ACTIVE_COMMANDS = set()
 _ACTIVE_COMMANDS_LOCK = threading.Lock()
@@ -117,6 +117,24 @@ DEFAULT_CONFIG = {
     "o3VisibleStages": ["issue", "execute", "memory", "cdb", "commit"],
     "branchPredictor": "local", "speculativeExecution": True,
     "outOfOrderExecution": True, "o3EvaluationLabel": "",
+}
+
+# The multiple-issue table models the examination architecture. gem5 still
+# needs finite queues to generate the architectural instruction/value trace;
+# these internal sizes never constrain the table's unlimited ROB and RS.
+O3_FIXED_CONFIG = {
+    "fetchWidth": 2, "decodeWidth": 2, "renameWidth": 2,
+    "issueWidth": 8,
+    "robEntries": 64, "iqEntries": 128, "lqEntries": 32, "sqEntries": 32,
+    "speculativeExecution": True,
+    "outOfOrderExecution": True, "forwarding": True,
+    "intMul": 1, "intDiv": 1,
+    "intMulPipelined": True, "intDivPipelined": True,
+}
+DEFAULT_O3_CONFIG = {
+    **DEFAULT_CONFIG, **O3_FIXED_CONFIG,
+    "cpu": "out-of-order", "floatMul": 6, "floatDiv": 6,
+    "branchPredictor": "ideal",
 }
 
 
@@ -232,9 +250,12 @@ def source_file(folder: Path) -> Path:
 def validate_config(value):
     if not isinstance(value, dict):
         fail("Invalid CPU configuration.")
-    config = DEFAULT_CONFIG.copy()
     if value.get("cpu") not in {"in-order", "out-of-order"}:
-        fail("Select an in-order or out-of-order CPU.")
+        fail("Select Five-Stage Pipeline or Superscalar.")
+    multiple_issue = ENABLE_MULTI_ISSUE_CPU and value["cpu"] == "out-of-order"
+    config = (DEFAULT_O3_CONFIG if multiple_issue else DEFAULT_CONFIG).copy()
+    if multiple_issue:
+        value = {**DEFAULT_O3_CONFIG, **value, **O3_FIXED_CONFIG}
     config["cpu"] = (value["cpu"] if ENABLE_MULTI_ISSUE_CPU
                      else DEFAULT_CONFIG["cpu"])
     for key in ("intAlu", "intMul", "intDiv", "floatAlu", "floatMul", "floatDiv"):
@@ -327,10 +348,13 @@ def validate_config(value):
     config["o3VisibleStages"] = [stage for stage in (
         "fetch", "decode", "rename", "issue", "execute", "memory", "cdb", "commit"
     ) if stage in visible_stages]
-    predictor_name = value.get("branchPredictor", config["branchPredictor"])
-    if predictor_name not in {"ideal", "local", "tournament", "bimode", "tage"}:
-        fail("Select a supported branch predictor.")
-    config["branchPredictor"] = predictor_name
+    if multiple_issue:
+        config["branchPredictor"] = "ideal"
+    else:
+        predictor_name = value.get("branchPredictor", config["branchPredictor"])
+        if predictor_name not in {"ideal", "local", "tournament", "bimode", "tage"}:
+            fail("Select a supported branch predictor.")
+        config["branchPredictor"] = predictor_name
     speculation = value.get("speculativeExecution", config["speculativeExecution"])
     if not isinstance(speculation, bool):
         fail("The speculative-execution option must be enabled or disabled.")
@@ -434,19 +458,69 @@ def protected_lines(source: str):
     return sorted(protected)
 
 
+def simulation_scaffold_issues(source: str):
+    """Describe missing or ambiguous labels required to run a project."""
+    labels = {"_start": [], "End": []}
+    statements = []
+    start_is_global = False
+    label_pattern = re.compile(r"^([A-Za-z_.$][\w.$]*)\s*:\s*")
+
+    for line_number, raw_line in enumerate(source.splitlines(), 1):
+        code = raw_line.split("#", 1)[0].strip()
+        if re.match(r"^\.(?:globl|global)\s+_start\b", code, re.I):
+            start_is_global = True
+        while match := label_pattern.match(code):
+            label = match.group(1)
+            if label == "_start":
+                labels["_start"].append((line_number, len(statements)))
+            elif label.lower() == "end":
+                labels["End"].append((line_number, len(statements)))
+            code = code[match.end():].lstrip()
+        if code:
+            statements.append(code)
+
+    issues = []
+    for name in ("_start", "End"):
+        found = labels[name]
+        if not found:
+            issues.append(f"Missing required {name}: label.")
+        elif len(found) > 1:
+            lines = ", ".join(str(line) for line, _ in found)
+            issues.append(f"Found {name}: on lines {lines}; keep only one.")
+
+    if len(labels["_start"]) == 1 and not start_is_global:
+        issues.append("The _start label must be exported with .globl _start.")
+
+    if len(labels["End"]) == 1:
+        line_number, statement_index = labels["End"][0]
+        exit_block = statements[statement_index:statement_index + 3]
+        if (len(exit_block) < 3
+                or not re.fullmatch(r"li\s+(?:a0|x10)\s*,\s*0", exit_block[0], re.I)
+                or not re.fullmatch(r"li\s+(?:a7|x17)\s*,\s*93", exit_block[1], re.I)
+                or not re.fullmatch(r"ecall", exit_block[2], re.I)):
+            issues.append(
+                f"End: on line {line_number} must be followed by li a0, 0; "
+                "li a7, 93; and ecall."
+            )
+    return issues
+
+
 def mandatory_signature(source: str):
     lines = clean_source(source).splitlines()
     return [re.sub(r"\s+", "", lines[index].split("#", 1)[0]).lower()
             for index in protected_lines("\n".join(lines))]
 
 
-def save_source(folder: Path, submitted):
+def save_source(folder: Path, submitted, allow_scaffold_edit=False):
     if not isinstance(submitted, str):
         fail("Invalid assembly source.")
+    if not isinstance(allow_scaffold_edit, bool):
+        fail("Invalid scaffold protection option.")
     src = source_file(folder)
     existing = clean_source(src.read_text())
     submitted = clean_source(submitted)
-    if mandatory_signature(existing) != mandatory_signature(submitted):
+    if (not allow_scaffold_edit
+            and mandatory_signature(existing) != mandatory_signature(submitted)):
         fail("The mandatory entry or exit instructions cannot be changed.")
     src.write_text(submitted)
     return src
@@ -1003,6 +1077,12 @@ def simulation_output_for_display(output, trace):
 
 def build(name):
     folder = project_dir(name)
+    issues = simulation_scaffold_issues(source_file(folder).read_text())
+    if issues:
+        output = "Simulation scaffold is invalid:\n" + "\n".join(
+            f"- {issue}" for issue in issues) + "\n"
+        return {"ok": False, "output": output, "advancedOutput": output,
+                "source": source_file(folder).name}
     env = settings_env()
     cpu_config = project_config(folder)
     floating_extensions = ("fd" if cpu_config["floatingPointPrecision"] == "double"
@@ -1246,7 +1326,7 @@ def parse_exec_playback(lines, ordered_ticks):
 
 
 def parse_taken_jumps(lines, ordered_ticks):
-    """Return control-flow transfers that changed the sequential PC."""
+    """Return control-flow transfers supported by the completed instruction trace."""
     executed = []
     for line in lines:
         match = EXEC_EVENT.match(line)
@@ -1262,12 +1342,32 @@ def parse_taken_jumps(lines, ordered_ticks):
         r"^(?:c\.)?(?:b(?:eq|eqz|ne|nez|lt|ge|ltu|geu)|j|jr|jal|jalr|ret)\b",
         re.I,
     )
+    conditional_branch = re.compile(
+        r"^(?:c\.)?b(?:eq|eqz|ne|nez|lt|ge|ltu|geu)\b", re.I,
+    )
+    branch_offset = re.compile(
+        r",\s*([+-]?(?:0x[0-9a-f]+|\d+))\s*$", re.I,
+    )
     for ((tick, source, instruction, instruction_bytes),
          (_next_tick, target, _next_instruction, _next_bytes)) in zip(executed, executed[1:]):
         if not control_instruction.match(instruction.strip()):
             continue
-        if int(target, 16) == int(source, 16) + instruction_bytes:
+        source_pc, target_pc = int(source, 16), int(target, 16)
+        if target_pc == source_pc + instruction_bytes:
             continue
+        if conditional_branch.match(instruction):
+            offset = branch_offset.search(instruction)
+            if offset:
+                value = offset.group(1)
+                displacement = (int(value, 16) if "0x" in value.lower()
+                                else int(value, 10))
+                # Exec records completion order. A long-running instruction
+                # immediately after a not-taken branch can complete after a
+                # younger instruction, making that younger PC look like a
+                # branch target. A real taken branch must land at its encoded
+                # PC-relative destination.
+                if target_pc != source_pc + displacement:
+                    continue
         jumps.append({
             "fromAddress": source,
             "toAddress": target,
@@ -1672,14 +1772,15 @@ def complete_o3_waits(rows):
 def schedule_lecture_o3_pipeline(data, configuration, start_address=None):
     """Build the multiple-issue Tomasulo/ROB table used in the lectures.
 
-    gem5's trace remains the source of the committed dynamic instruction
-    stream and architectural values. This projection intentionally removes
-    gem5 front-end and time-buffer transport delays. With speculation off,
-    issue into the ROB/RS continues along the predicted path, but execution
-    of younger instructions waits until every older branch has resolved.
+    gem5 supplies the committed dynamic instruction stream and architectural
+    values. The exam model uses unlimited queues, configurable prediction and
+    independent functional units, without gem5's internal transport delays.
+    Every control transfer occupies an Issue cycle of its own.
     """
     if data.get("format") != "o3":
         return False
+    configuration = {**DEFAULT_O3_CONFIG, **configuration, **O3_FIXED_CONFIG}
+    configuration["branchPredictor"] = "ideal"
 
     def first_cycle(row):
         return min((int(cycle) for cycle in row.get("cycles", {})),
@@ -1734,14 +1835,16 @@ def schedule_lecture_o3_pipeline(data, configuration, start_address=None):
         load = bool(re.fullmatch(r"(?:l(?:b|bu|h|hu|w|wu|d)|fl[wdq])", opcode))
         store = bool(re.fullmatch(r"(?:s[bhwdq]|fs[wdq])", opcode))
         control = bool(re.fullmatch(
-            r"(?:b(?:eq|ne|lt|ge|ltu|geu)|j|jr|jal|jalr|ret)", opcode))
+            r"(?:b(?:eq|ne|lt|ge|ltu|geu|eqz|nez|ltz|gez|lez|gtz)|j|jr|jal|jalr|ret)", opcode))
         no_destination = store or opcode.startswith("b") or opcode in {"j", "jr", "ret"}
         destination = registers[0] if registers and not no_destination else None
         sources = registers if no_destination else registers[1:]
         store_data = registers[0] if store and registers else None
         execute_sources = registers[1:] if store else sources
 
-        if load or store:
+        if control:
+            unit, latency, pipelined = "jump", 1, True
+        elif load or store:
             unit, latency, pipelined = "address", 1, True
         elif re.match(r"^fmul", opcode):
             unit, latency, pipelined = (
@@ -1788,9 +1891,9 @@ def schedule_lecture_o3_pipeline(data, configuration, start_address=None):
         stage_uses = {stage: defaultdict(int)
                       for stage in ("F", "D", "R", "I")}
 
-        def reserve_front_stage(stage, earliest, width):
+        def reserve_front_stage(stage, earliest, width, exclusive=False):
             cycle = earliest
-            while stage_uses[stage][cycle] >= width:
+            while stage_uses[stage][cycle] >= (1 if exclusive else width):
                 cycle += 1
             stage_uses[stage][cycle] += 1
             return cycle
@@ -1810,7 +1913,7 @@ def schedule_lecture_o3_pipeline(data, configuration, start_address=None):
                 max(1, int(configuration["renameWidth"])))
             issue = reserve_front_stage(
                 "I", max(rename + 1, issue_floor, previous_stage["I"]),
-                issue_width)
+                issue_width, exclusive=info["control"])
             front_end_cycles[id(row)] = {
                 "F": fetch, "D": decode, "R": rename,
             }
@@ -1827,18 +1930,22 @@ def schedule_lecture_o3_pipeline(data, configuration, start_address=None):
         issue_cycle, issue_slots = 1, 0
         for row in committed:
             info = information[id(row)]
+            # Every control transfer occupies an Issue cycle of its own,
+            # including when a preceding instruction used only one slot.
+            if info["control"] and issue_slots:
+                issue_cycle += 1
+                issue_slots = 0
             issue_cycles[id(row)] = issue_cycle
             issue_slots += 1
-            # A predicted control transfer supplies its successor for the next
-            # cycle; it cannot share the remaining issue slot in this cycle.
+            # The predicted successor issues no earlier than the next cycle.
             if info["control"] or issue_slots >= issue_width:
                 issue_cycle += 1
                 issue_slots = 0
 
-    execution_width = max(1, int(configuration["issueWidth"]))
     cdb_width = max(1, int(configuration["writebackWidth"]))
-    execution_starts = defaultdict(int)
     cdb_uses = defaultdict(int)
+    # Each functional unit has one output port to the shared CDBs.
+    unit_cdb_uses = defaultdict(set)
     unit_busy = defaultdict(set)
     memory_busy = set()
     latest_producer = {}
@@ -1850,18 +1957,19 @@ def schedule_lecture_o3_pipeline(data, configuration, start_address=None):
         while True:
             occupied = ({cycle} if info["pipelined"]
                         else set(range(cycle, cycle + info["latency"])))
-            if (execution_starts[cycle] < execution_width
-                    and not (occupied & unit_busy[info["unit"]])):
-                execution_starts[cycle] += 1
+            # No global EXE-queue/width limit: independent functional units
+            # may start together. Each unit still enforces its own capacity.
+            if not (occupied & unit_busy[info["unit"]]):
                 unit_busy[info["unit"]].update(occupied)
                 return cycle
             cycle += 1
 
-    def reserve_cdb(earliest):
+    def reserve_cdb(earliest, unit):
         cycle = earliest
-        while cdb_uses[cycle] >= cdb_width:
+        while cdb_uses[cycle] >= cdb_width or cycle in unit_cdb_uses[unit]:
             cycle += 1
         cdb_uses[cycle] += 1
+        unit_cdb_uses[unit].add(cycle)
         return cycle
 
     speculation = bool(configuration.get("speculativeExecution", True))
@@ -1908,8 +2016,9 @@ def schedule_lecture_o3_pipeline(data, configuration, start_address=None):
             memory_busy.update(range(memory_start, memory_end + 1))
 
         produces_result = info["destination"] is not None
-        cdb = reserve_cdb((memory_end if info["load"] else execute_end) + 1) \
-            if produces_result else None
+        cdb = (reserve_cdb((memory_end if info["load"] else execute_end) + 1,
+                           info["unit"])
+               if produces_result else None)
         record = {
             **info, "row": row, "I": issue, "E": execute,
             "EEnd": execute_end, "M": memory_start, "MEnd": memory_end,
@@ -4394,9 +4503,15 @@ def write_pipeline_csv(data, output, expand_loops=False):
             for (cache, result), count in cache_groups.items()
         )
         flow = "; ".join(flow_parts)
+        stage_labels = {"C": "CDB", "W": "C"} if data.get("format") == "o3" else {}
+        cycle_cells = []
+        for cycle in range(1, data["cycles"] + 1):
+            stage = row["cycles"].get(str(cycle), "")
+            if stage_labels and stage:
+                stage = "/".join(stage_labels.get(marker, marker) for marker in stage)
+            cycle_cells.append(stage)
         writer.writerow([f"0x{row['address']}", row["instruction"], flow,
-                         *[row["cycles"].get(str(cycle), "")
-                           for cycle in range(1, data["cycles"] + 1)]])
+                         *cycle_cells])
 
 
 def pipeline_csv(data, expand_loops=False):
@@ -4533,7 +4648,11 @@ def create_submission(projects, assignment, attachments=None, expand_loops=False
         source = entry.get("source")
         if source is not None and not isinstance(source, str):
             fail(f"The source for project '{name}' is invalid.")
-        selected_projects.append({"name": name, "source": source})
+        allow_scaffold_edit = entry.get("allowScaffoldEdit", False)
+        if not isinstance(allow_scaffold_edit, bool):
+            fail(f"The scaffold protection option for project '{name}' is invalid.")
+        selected_projects.append({"name": name, "source": source,
+                                  "allowScaffoldEdit": allow_scaffold_edit})
 
     decoded_attachments = decode_submission_attachments(attachments)
     archive_entries = []
@@ -4553,8 +4672,9 @@ def create_submission(projects, assignment, attachments=None, expand_loops=False
     for index, entry in enumerate(selected_projects, start=1):
         name = entry["name"]
         folder = project_dir(name)
-        source_path = (save_source(folder, entry["source"])
-                       if entry["source"] is not None else source_file(folder))
+        source_path = (source_file(folder) if entry["source"] is None
+                       else save_source(folder, entry["source"],
+                                        entry["allowScaffoldEdit"]))
         built = build(name)
         normal_sections.append(f"[{name}]\n{built['output']}")
         advanced_sections.append(f"[{name}]\n{built['advancedOutput']}")
@@ -5573,6 +5693,7 @@ class Handler(SimpleHTTPRequestHandler):
             if url.path == "/api/health":
                 return self.send_json({"ok": True, "apiVersion": STUDIO_API_VERSION,
                                        "version": STUDIO_VERSION,
+                                       "o3Defaults": DEFAULT_O3_CONFIG,
                                        "features": {
                                            "developerMode": DEVELOPER_MODE,
                                            "memoryConfiguration":
@@ -5617,11 +5738,13 @@ class Handler(SimpleHTTPRequestHandler):
             data = self.read_json()
             if self.path == "/api/save":
                 folder = project_dir(data.get("name"))
-                save_source(folder, data.get("text"))
+                save_source(folder, data.get("text"),
+                            data.get("allowScaffoldEdit", False))
                 return self.send_json({"ok": True})
             if self.path == "/api/run":
                 name = data.get("name")
-                save_source(project_dir(name), data.get("text"))
+                save_source(project_dir(name), data.get("text"),
+                            data.get("allowScaffoldEdit", False))
                 built = build(name)
                 if not built["ok"]:
                     return self.send_json({"ok": False, "phase": "build", "output": built["output"],
@@ -5667,7 +5790,9 @@ class Handler(SimpleHTTPRequestHandler):
                 # Retain compatibility with clients from before submission v2.
                 if projects is None and data.get("name") is not None:
                     projects = [{"name": data.get("name"),
-                                 "source": data.get("text")}]
+                                 "source": data.get("text"),
+                                 "allowScaffoldEdit": data.get(
+                                     "allowScaffoldEdit", False)}]
                 return self.send_json(create_submission(
                     projects, data.get("assignment"), data.get("attachments"),
                     data.get("expandLoops", False)))
