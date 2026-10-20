@@ -458,19 +458,69 @@ def protected_lines(source: str):
     return sorted(protected)
 
 
+def simulation_scaffold_issues(source: str):
+    """Describe missing or ambiguous labels required to run a project."""
+    labels = {"_start": [], "End": []}
+    statements = []
+    start_is_global = False
+    label_pattern = re.compile(r"^([A-Za-z_.$][\w.$]*)\s*:\s*")
+
+    for line_number, raw_line in enumerate(source.splitlines(), 1):
+        code = raw_line.split("#", 1)[0].strip()
+        if re.match(r"^\.(?:globl|global)\s+_start\b", code, re.I):
+            start_is_global = True
+        while match := label_pattern.match(code):
+            label = match.group(1)
+            if label == "_start":
+                labels["_start"].append((line_number, len(statements)))
+            elif label.lower() == "end":
+                labels["End"].append((line_number, len(statements)))
+            code = code[match.end():].lstrip()
+        if code:
+            statements.append(code)
+
+    issues = []
+    for name in ("_start", "End"):
+        found = labels[name]
+        if not found:
+            issues.append(f"Missing required {name}: label.")
+        elif len(found) > 1:
+            lines = ", ".join(str(line) for line, _ in found)
+            issues.append(f"Found {name}: on lines {lines}; keep only one.")
+
+    if len(labels["_start"]) == 1 and not start_is_global:
+        issues.append("The _start label must be exported with .globl _start.")
+
+    if len(labels["End"]) == 1:
+        line_number, statement_index = labels["End"][0]
+        exit_block = statements[statement_index:statement_index + 3]
+        if (len(exit_block) < 3
+                or not re.fullmatch(r"li\s+(?:a0|x10)\s*,\s*0", exit_block[0], re.I)
+                or not re.fullmatch(r"li\s+(?:a7|x17)\s*,\s*93", exit_block[1], re.I)
+                or not re.fullmatch(r"ecall", exit_block[2], re.I)):
+            issues.append(
+                f"End: on line {line_number} must be followed by li a0, 0; "
+                "li a7, 93; and ecall."
+            )
+    return issues
+
+
 def mandatory_signature(source: str):
     lines = clean_source(source).splitlines()
     return [re.sub(r"\s+", "", lines[index].split("#", 1)[0]).lower()
             for index in protected_lines("\n".join(lines))]
 
 
-def save_source(folder: Path, submitted):
+def save_source(folder: Path, submitted, allow_scaffold_edit=False):
     if not isinstance(submitted, str):
         fail("Invalid assembly source.")
+    if not isinstance(allow_scaffold_edit, bool):
+        fail("Invalid scaffold protection option.")
     src = source_file(folder)
     existing = clean_source(src.read_text())
     submitted = clean_source(submitted)
-    if mandatory_signature(existing) != mandatory_signature(submitted):
+    if (not allow_scaffold_edit
+            and mandatory_signature(existing) != mandatory_signature(submitted)):
         fail("The mandatory entry or exit instructions cannot be changed.")
     src.write_text(submitted)
     return src
@@ -1027,6 +1077,12 @@ def simulation_output_for_display(output, trace):
 
 def build(name):
     folder = project_dir(name)
+    issues = simulation_scaffold_issues(source_file(folder).read_text())
+    if issues:
+        output = "Simulation scaffold is invalid:\n" + "\n".join(
+            f"- {issue}" for issue in issues) + "\n"
+        return {"ok": False, "output": output, "advancedOutput": output,
+                "source": source_file(folder).name}
     env = settings_env()
     cpu_config = project_config(folder)
     floating_extensions = ("fd" if cpu_config["floatingPointPrecision"] == "double"
@@ -4592,7 +4648,11 @@ def create_submission(projects, assignment, attachments=None, expand_loops=False
         source = entry.get("source")
         if source is not None and not isinstance(source, str):
             fail(f"The source for project '{name}' is invalid.")
-        selected_projects.append({"name": name, "source": source})
+        allow_scaffold_edit = entry.get("allowScaffoldEdit", False)
+        if not isinstance(allow_scaffold_edit, bool):
+            fail(f"The scaffold protection option for project '{name}' is invalid.")
+        selected_projects.append({"name": name, "source": source,
+                                  "allowScaffoldEdit": allow_scaffold_edit})
 
     decoded_attachments = decode_submission_attachments(attachments)
     archive_entries = []
@@ -4612,8 +4672,9 @@ def create_submission(projects, assignment, attachments=None, expand_loops=False
     for index, entry in enumerate(selected_projects, start=1):
         name = entry["name"]
         folder = project_dir(name)
-        source_path = (save_source(folder, entry["source"])
-                       if entry["source"] is not None else source_file(folder))
+        source_path = (source_file(folder) if entry["source"] is None
+                       else save_source(folder, entry["source"],
+                                        entry["allowScaffoldEdit"]))
         built = build(name)
         normal_sections.append(f"[{name}]\n{built['output']}")
         advanced_sections.append(f"[{name}]\n{built['advancedOutput']}")
@@ -5677,11 +5738,13 @@ class Handler(SimpleHTTPRequestHandler):
             data = self.read_json()
             if self.path == "/api/save":
                 folder = project_dir(data.get("name"))
-                save_source(folder, data.get("text"))
+                save_source(folder, data.get("text"),
+                            data.get("allowScaffoldEdit", False))
                 return self.send_json({"ok": True})
             if self.path == "/api/run":
                 name = data.get("name")
-                save_source(project_dir(name), data.get("text"))
+                save_source(project_dir(name), data.get("text"),
+                            data.get("allowScaffoldEdit", False))
                 built = build(name)
                 if not built["ok"]:
                     return self.send_json({"ok": False, "phase": "build", "output": built["output"],
@@ -5727,7 +5790,9 @@ class Handler(SimpleHTTPRequestHandler):
                 # Retain compatibility with clients from before submission v2.
                 if projects is None and data.get("name") is not None:
                     projects = [{"name": data.get("name"),
-                                 "source": data.get("text")}]
+                                 "source": data.get("text"),
+                                 "allowScaffoldEdit": data.get(
+                                     "allowScaffoldEdit", False)}]
                 return self.send_json(create_submission(
                     projects, data.get("assignment"), data.get("attachments"),
                     data.get("expandLoops", False)))

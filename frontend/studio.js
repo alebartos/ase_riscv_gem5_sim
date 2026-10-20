@@ -17,6 +17,8 @@ let lastNormalLog = "";
 let lastAdvancedLog = lastNormalLog;
 let savedSource = "";
 let sourceDirty = false;
+let scaffoldProtectionEnabled = true;
+let scaffoldEditAuthorized = false;
 let undoStack = [];
 let redoStack = [];
 let pendingEditorSnapshot = null;
@@ -137,6 +139,7 @@ function restoreEditorSnapshot(snapshot) {
   editor.setSelectionRange(snapshot.start, snapshot.end);
   applyingEditorHistory = false;
   markSourceEdited();
+  refreshScaffoldProtectionUi();
   syncEditor();
   restoreEditorViewport(viewport);
 }
@@ -232,6 +235,113 @@ function markSourceEdited() {
   updateDirtyIndicator();
 }
 
+function scaffoldEditsAllowed() {
+  return !scaffoldProtectionEnabled || scaffoldEditAuthorized;
+}
+
+function updateScaffoldProtectionUi(message = "") {
+  const control = $("#scaffold-protection");
+  const status = $("#scaffold-protection-status");
+  control.checked = scaffoldProtectionEnabled;
+  control.disabled = !current;
+  control.title = scaffoldProtectionEnabled
+    ? "Required _start and End labels and the exit block are read-only."
+    : "Label protection is off. Required labels and the exit block can be edited.";
+  status.hidden = !current || (scaffoldProtectionEnabled && !message);
+  status.textContent = message || (scaffoldProtectionEnabled
+    ? ""
+    : "Label protection is off. Simulation requires one _start label and one valid End exit block.");
+}
+
+function validateSimulationScaffold(text) {
+  const labels = {start: [], end: []};
+  const statements = [];
+  let startIsGlobal = false;
+  const labelPattern = /^([A-Za-z_.$][\w.$]*)\s*:\s*/;
+
+  String(text).split(/\r?\n/).forEach((rawLine, index) => {
+    let code = rawLine.split("#", 1)[0].trim();
+    if (/^\.(?:globl|global)\s+_start\b/i.test(code)) startIsGlobal = true;
+    while (true) {
+      const match = code.match(labelPattern);
+      if (!match) break;
+      const label = match[1];
+      if (label === "_start") {
+        labels.start.push({line: index + 1, nextStatement: statements.length});
+      } else if (label.toLowerCase() === "end") {
+        labels.end.push({line: index + 1, nextStatement: statements.length});
+      }
+      code = code.slice(match[0].length).trimStart();
+    }
+    if (code) statements.push(code);
+  });
+
+  const issues = [];
+  const describeLabels = (name, found) => {
+    if (!found.length) issues.push(`Missing required ${name}: label.`);
+    else if (found.length > 1) {
+      issues.push(`Found ${name}: on lines ${found.map(item => item.line).join(", ")}; keep only one.`);
+    }
+  };
+  describeLabels("_start", labels.start);
+  if (labels.start.length === 1 && !startIsGlobal) {
+    issues.push("The _start label must be exported with .globl _start.");
+  }
+  describeLabels("End", labels.end);
+
+  if (labels.end.length === 1) {
+    const end = labels.end[0];
+    const exit = statements.slice(end.nextStatement, end.nextStatement + 3);
+    if (exit.length < 3
+        || !/^li\s+(?:a0|x10)\s*,\s*0$/i.test(exit[0])
+        || !/^li\s+(?:a7|x17)\s*,\s*93$/i.test(exit[1])
+        || !/^ecall$/i.test(exit[2])) {
+      issues.push(`End: on line ${end.line} must be followed by li a0, 0; li a7, 93; and ecall.`);
+    }
+  }
+  return issues;
+}
+
+function refreshScaffoldProtectionUi() {
+  if (!current) {
+    updateScaffoldProtectionUi();
+    return;
+  }
+  const issues = validateSimulationScaffold($("#body").value);
+  if (scaffoldProtectionEnabled && issues.length) {
+    scaffoldProtectionEnabled = false;
+    scaffoldEditAuthorized = true;
+  }
+  updateScaffoldProtectionUi(issues.length
+    ? `Label protection is off because: ${issues.join(" ")}`
+    : "");
+}
+
+function resetScaffoldProtection() {
+  scaffoldProtectionEnabled = true;
+  scaffoldEditAuthorized = false;
+  refreshScaffoldProtectionUi();
+}
+
+$("#scaffold-protection").addEventListener("change", event => {
+  if (!current) return;
+  if (event.target.checked) {
+    const issues = validateSimulationScaffold($("#body").value);
+    if (issues.length) {
+      scaffoldProtectionEnabled = false;
+      scaffoldEditAuthorized = true;
+      refreshScaffoldProtectionUi();
+      return;
+    }
+    scaffoldProtectionEnabled = true;
+  } else {
+    scaffoldProtectionEnabled = false;
+    scaffoldEditAuthorized = true;
+  }
+  refreshScaffoldProtectionUi();
+  syncEditor();
+});
+
 function highlightAsmLine(line) {
   const commentAt = line.indexOf("#");
   let code = commentAt >= 0 ? line.slice(0, commentAt) : line;
@@ -251,6 +361,7 @@ function highlightAsmLine(line) {
 function computeProtectedLines(text) {
   const lines = text.split("\n");
   const locked = new Set();
+  if (!scaffoldProtectionEnabled) return locked;
   const code = lines.map(line => line.split("#", 1)[0].trim());
   const scaffoldComments = new Set([
     "# The text section contains the instructions that the CPU runs.",
@@ -420,6 +531,7 @@ async function openProject(name, {skipUnsavedCheck = false} = {}) {
   $("#project-title").textContent = current.name;
   $("#source-name").textContent = current.sourceName;
   $("#body").value = current.text;
+  resetScaffoldProtection();
   resetEditorHistory();
   savedSource = current.text;
   sourceDirty = false;
@@ -457,8 +569,10 @@ async function save() {
   await api("/api/save", {
     method: "POST",
     headers: {"Content-Type": "application/json"},
-    body: JSON.stringify({name: current.name, text: $("#body").value})
+    body: JSON.stringify({name: current.name, text: $("#body").value,
+      allowScaffoldEdit: scaffoldEditsAllowed()})
   });
+  scaffoldEditAuthorized = false;
   savedSource = $("#body").value;
   sourceDirty = false;
   updateDirtyIndicator();
@@ -576,6 +690,7 @@ async function synchronizeExternalSource() {
     $("#cycle-next").disabled = true;
     $("#cycle-position").textContent = "Cycle —/—";
     updateDirtyIndicator();
+    refreshScaffoldProtectionUi();
     syncEditor();
     renderRegisters();
     renderPipeline();
@@ -652,6 +767,17 @@ async function prepareSubmission() {
     await showActionMessage("Prepare submission", "Select at least one project.");
     return;
   }
+  if (selectedNames.includes(current.name)) {
+    const scaffoldIssues = validateSimulationScaffold($("#body").value);
+    if (scaffoldIssues.length) {
+      const hint = scaffoldProtectionEnabled
+        ? "Turn off Protect labels to edit protected lines."
+        : "Correct the required labels and exit block, then try again.";
+      await showActionMessage("Cannot prepare submission",
+        `${scaffoldIssues.join("\n")}\n\n${hint}`);
+      return;
+    }
+  }
   const files = [...($("#submission-files").files || [])];
   if (files.length > 20) {
     await showActionMessage("Prepare submission", "Choose no more than 20 additional files.");
@@ -689,7 +815,8 @@ async function prepareSubmission() {
   const currentWasSelected = selectedNames.includes(submittedProjectName);
   const projects = selectedNames.map(name => ({
     name,
-    source: name === submittedProjectName ? submittedSource : null
+    source: name === submittedProjectName ? submittedSource : null,
+    allowScaffoldEdit: name === submittedProjectName && scaffoldEditsAllowed()
   }));
   $("#submission-dialog").close();
   confirmButton.disabled = false;
@@ -715,6 +842,7 @@ async function prepareSubmission() {
       })
     });
     if (currentWasSelected && current?.name === submittedProjectName) {
+      scaffoldEditAuthorized = false;
       savedSource = submittedSource;
       sourceDirty = $("#body").value !== submittedSource;
       updateDirtyIndicator();
@@ -802,6 +930,18 @@ function resetPipelineViewport() {
 
 async function run(stepAfterRun = false) {
   if (!current) return;
+  const source = $("#body").value;
+  const scaffoldIssues = validateSimulationScaffold(source);
+  if (scaffoldIssues.length) {
+    const hint = scaffoldProtectionEnabled
+      ? "Turn off Protect labels to edit protected lines."
+      : "Correct the required labels and exit block, then run again.";
+    lastNormalLog = `Cannot start simulation:\n${scaffoldIssues.map(issue => `• ${issue}`).join("\n")}\n\n${hint}`;
+    lastAdvancedLog = lastNormalLog;
+    updateLog();
+    showTab("output");
+    return;
+  }
   if (!stepAfterRun) {
     stepMode = false;
     $("#step").textContent = "Run Step";
@@ -823,8 +963,10 @@ async function run(stepAfterRun = false) {
     const result = await api("/api/run", {
       method: "POST",
       headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({name: current.name, text: $("#body").value})
+      body: JSON.stringify({name: current.name, text: source,
+        allowScaffoldEdit: scaffoldEditsAllowed()})
     });
+    scaffoldEditAuthorized = false;
     savedSource = $("#body").value;
     sourceDirty = false;
     updateDirtyIndicator();
@@ -1975,6 +2117,9 @@ async function openEnvironmentSettings() {
 
 function clearCurrentProject() {
   current = null;
+  scaffoldProtectionEnabled = true;
+  scaffoldEditAuthorized = false;
+  updateScaffoldProtectionUi();
   pipelineData = null;
   memoryWatches = [];
   savedSource = "";
@@ -2045,6 +2190,7 @@ function applyEditorChange(start, end, replacement, selectionStart, selectionEnd
   pendingEditorViewport = null;
   editor.value = editor.value.slice(0, start) + replacement + editor.value.slice(end);
   markSourceEdited();
+  refreshScaffoldProtectionUi();
   syncEditor();
   editor.setSelectionRange(selectionStart, selectionEnd);
   restoreEditorViewport(viewport);
@@ -2097,6 +2243,7 @@ $("#body").addEventListener("input", () => {
   pendingEditorSnapshot = null;
   pendingEditorViewport = null;
   markSourceEdited();
+  refreshScaffoldProtectionUi();
   syncEditor();
   restoreEditorViewport(viewport);
 });

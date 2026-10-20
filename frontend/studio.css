@@ -95,9 +95,13 @@ h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .05em; color: v
 #source-name { min-width: 0; padding-left: 9px; border-left: 1px solid var(--line); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .editor-tools { flex: none; display: flex; align-items: center; gap: 10px; }
 .editor-font-control { display: flex; align-items: center; gap: 5px; font-size: 11px; white-space: nowrap; }
+.scaffold-protection-control { display: flex; align-items: center; gap: 5px; color: var(--muted); font-size: 11px; white-space: nowrap; cursor: pointer; }
+.scaffold-protection-control input { margin: 0; }
 #editor-font-size { width: 85px; }
 #editor-font-value { min-width: 34px; font-variant-numeric: tabular-nums; }
 #search { width: 190px; border: 1px solid var(--line); border-radius: 4px; padding: 5px; }
+.scaffold-protection-control input:not(:checked) + span { color: #b45309; }
+#scaffold-protection-status { padding: 5px 12px; border-bottom: 1px solid #fed7aa; color: #9a3412; background: #fff7ed; font-size: 12px; }
 .editor-area { min-height: 0; overflow: auto; overflow-anchor: none; font: var(--editor-font-size)/var(--editor-line-height) "DejaVu Sans Mono", ui-monospace, SFMono-Regular, Menlo, monospace; font-variant-ligatures: none; scroll-behavior: smooth; }
 .editor-wrap { position: relative; min-height: 300px; background: #fff; }
 .editor-wrap textarea, .editor-wrap pre { margin: 0; border: 0; padding: 10px 14px 10px 55px; width: 100%; min-height: 100%; font: inherit; line-height: var(--editor-line-height); letter-spacing: 0; word-spacing: 0; tab-size: 4; white-space: pre-wrap; overflow-wrap: normal; overflow: hidden; }
@@ -431,6 +435,7 @@ html[data-theme="dark"] .primary { color: #07111f; background: #60a5fa; border-c
 html[data-theme="dark"] .project.selected { background: #17365f; color: #bfdbfe; }
 html[data-theme="dark"] .editor-wrap textarea { caret-color: #f8fafc; }
 html[data-theme="dark"] .source-line.protected { background: #202b3a; color: #aebdd0; box-shadow: inset 3px 0 #64748b; }
+html[data-theme="dark"] #scaffold-protection-status { border-color: #7c2d12; color: #fdba74; background: #431407; }
 html[data-theme="dark"] .source-line.pipeline-selected,
 html[data-theme="dark"] .pipeline-row.row-selected .inst,
 html[data-theme="dark"] .pipeline-row.row-selected .address-cell,
