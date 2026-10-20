@@ -43,6 +43,7 @@ let configuredProgramsDirectory = "";
 let memoryPopoutWindow = null;
 let pipelinePaintFrame = null;
 let pipelineResizeObserver = null;
+let changeContextMenu = null;
 const memoryWindowChannel = "BroadcastChannel" in window
   ? new BroadcastChannel("ase-studio-memory-window") : null;
 
@@ -58,6 +59,12 @@ if (memoryWindowChannel) {
     else if (message.action === "remove") removeMemoryWatch(message.index);
     else if (message.action === "clear") clearMemoryWatches();
     else if (message.action === "format") setMemoryFormat(message.value);
+    else if (message.action === "navigate-change") {
+      navigateToItemChange({
+        kind: "memory", key: message.address,
+        width: Number(message.width), label: message.label
+      }, message.direction);
+    }
   };
 }
 
@@ -1110,7 +1117,7 @@ function renderRegisters() {
   const floatAbi = ["ft0", "ft1", "ft2", "ft3", "ft4", "ft5", "ft6", "ft7", "fs0", "fs1", "fa0", "fa1", "fa2", "fa3", "fa4", "fa5", "fa6", "fa7", "fs2", "fs3", "fs4", "fs5", "fs6", "fs7", "fs8", "fs9", "fs10", "fs11", "ft8", "ft9", "ft10", "ft11"];
   const renderColumn = (prefix, aliases, format, width) => aliases.map((alias, index) => {
     const name = `${prefix}${index}`;
-    return `<div class="register-value${changed.has(name) ? " changed" : ""}"><strong>${name}</strong><span>${alias}</span><code>${formatWordValue(state[name] || 0, format, width)}</code></div>`;
+    return `<div class="register-value${changed.has(name) ? " changed" : ""}" data-register-change="${name}"><strong>${name}</strong><span>${alias}</span><code>${formatWordValue(state[name] || 0, format, width)}</code></div>`;
   }).join("");
   $("#pipeline-pc").textContent = `PC ${pc}`;
   $("#pipeline-pc").classList.toggle("changed", pcChanged);
@@ -1520,6 +1527,7 @@ function renderMemory() {
       const elementFormat = format === "float" && width < 32 ? "hex" : format;
       rows.push({
         address,
+        width: layout.elementSize,
         symbol,
         label: layout.elementCount > 1 ? `${symbol.name}[${index}]` : symbol.name,
         access: latest ? latest.access : known ? "initial value" : "not accessed",
@@ -1533,9 +1541,153 @@ function renderMemory() {
   $("#memory-summary").textContent = `Memory watch through cycle ${playbackCycle} · ${rows.length} location${rows.length === 1 ? "" : "s"}${limitNote}`;
   table.innerHTML = rows.length ? rows.map(row => {
     const style = ` style="--memory-symbol-hue:${memorySymbolHue(row.symbol, symbols)}deg"`;
-    return `<div class="memory-value memory-symbol-color${row.changed ? " changed" : ""}"${style}><strong class="memory-symbol-name">${escapeHtml(row.label)}</strong><span class="memory-address">0x${row.address.toString(16)}</span><span>${row.access}</span><code>${row.value}</code></div>`;
+    return `<div class="memory-value memory-symbol-color${row.changed ? " changed" : ""}" data-memory-address="0x${row.address.toString(16)}" data-memory-width="${row.width}" data-memory-label="${escapeHtml(row.label)}"${style}><strong class="memory-symbol-name">${escapeHtml(row.label)}</strong><span class="memory-address">0x${row.address.toString(16)}</span><span>${row.access}</span><code>${row.value}</code></div>`;
   }).join("") : '<div class="memory-empty">No matching memory locations were found in this build.</div>';
   publishMemoryWindowState();
+}
+
+function closeChangeContextMenu() {
+  changeContextMenu?.remove();
+  changeContextMenu = null;
+}
+
+function openChangeContextMenu(event, item) {
+  closeChangeContextMenu();
+  event.preventDefault();
+  const menu = document.createElement("div");
+  menu.className = "change-context-menu";
+  menu.setAttribute("role", "menu");
+  [
+    ["next", "Go to next change"],
+    ["previous", "Go to previous change"]
+  ].forEach(([direction, label]) => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.setAttribute("role", "menuitem");
+    button.textContent = label;
+    button.onclick = () => {
+      closeChangeContextMenu();
+      navigateToItemChange(item, direction);
+    };
+    menu.append(button);
+  });
+  document.body.append(menu);
+  const bounds = menu.getBoundingClientRect();
+  menu.style.left = `${Math.max(8, Math.min(event.clientX, window.innerWidth - bounds.width - 8))}px`;
+  menu.style.top = `${Math.max(8, Math.min(event.clientY, window.innerHeight - bounds.height - 8))}px`;
+  changeContextMenu = menu;
+  menu.querySelector("button")?.focus();
+}
+
+function sameTraceValue(left, right) {
+  try {
+    return BigInt(left) === BigInt(right);
+  } catch (_error) {
+    return String(left) === String(right);
+  }
+}
+
+function registerChangeCycles(register) {
+  const deltas = pipelineData?.registerDeltas || {};
+  const initial = pipelineData?.initialRegisters || {};
+  let previous = initial[register] ?? "0x00000000";
+  const changes = [];
+  Object.keys(deltas).map(Number).sort((left, right) => left - right).forEach(cycle => {
+    const update = deltas[String(cycle)];
+    if (!Object.prototype.hasOwnProperty.call(update, register)) return;
+    const value = update[register];
+    if (!sameTraceValue(previous, value)) changes.push(cycle);
+    previous = value;
+  });
+  return changes;
+}
+
+function memoryChangeCycles(address, width) {
+  const start = Number(BigInt(canonicalMemoryAddress(address)));
+  const byteCount = Math.max(1, Math.floor(Number(width) || 1));
+  const bytes = Array(byteCount).fill(null);
+  const initialMemory = pipelineData?.initialMemory || current?.initialMemory || {};
+  Object.entries(initialMemory).forEach(([baseText, hex]) => {
+    if (typeof hex !== "string") return;
+    const base = Number(BigInt(baseText));
+    const first = Math.max(start, base);
+    const last = Math.min(start + byteCount, base + Math.floor(hex.length / 2));
+    for (let location = first; location < last; location++) {
+      const offset = (location - base) * 2;
+      const byte = Number.parseInt(hex.slice(offset, offset + 2), 16);
+      if (Number.isFinite(byte)) bytes[location - start] = byte;
+    }
+  });
+
+  const deltas = pipelineData?.memoryDeltas || {};
+  const changes = [];
+  Object.keys(deltas).map(Number).sort((left, right) => left - right).forEach(cycle => {
+    const before = bytes.slice();
+    Object.entries(deltas[String(cycle)] || {}).forEach(([eventAddress, event]) => {
+      if (event.access !== "write") return;
+      let value;
+      try {
+        value = BigInt(event.value);
+      } catch (_error) {
+        return;
+      }
+      const eventStart = Number(BigInt(eventAddress));
+      const eventWidth = Math.max(1, Math.floor((Number(event.bits) || 32) / 8));
+      const first = Math.max(start, eventStart);
+      const last = Math.min(start + byteCount, eventStart + eventWidth);
+      for (let location = first; location < last; location++) {
+        const offset = location - eventStart;
+        bytes[location - start] = Number((value >> BigInt(offset * 8)) & 0xffn);
+      }
+    });
+    if (bytes.some((value, index) => value !== before[index])) changes.push(cycle);
+  });
+  return changes;
+}
+
+async function navigateToItemChange(item, direction) {
+  const label = item.label || item.key;
+  const action = direction === "previous" ? "Go to previous change" : "Go to next change";
+  if (!stepMode || !pipelineData || playbackCycle === null) {
+    await showActionMessage(action, `${action} is available after starting Run Step.`);
+    return;
+  }
+
+  let changes = [];
+  try {
+    changes = item.kind === "register"
+      ? registerChangeCycles(item.key)
+      : memoryChangeCycles(item.key, item.width);
+  } catch (_error) {
+    changes = [];
+  }
+  const target = direction === "previous"
+    ? [...changes].reverse().find(cycle => cycle < playbackCycle)
+    : changes.find(cycle => cycle > playbackCycle);
+  if (target === undefined) {
+    await showActionMessage(action, `No ${direction === "previous" ? "previous" : "next"} value change for ${label} was found in this trace.`);
+    return;
+  }
+  navigateToPipelineCycle(target);
+}
+
+function navigateToPipelineCycle(cycle) {
+  playbackCycle = cycle;
+  selectedColumn = cycle;
+  $("#step").textContent = playbackCycle >= pipelineData.cycles
+    ? "Restart Step" : "Next Cycle";
+  renderPipeline();
+  showTab("pipeline");
+  positionPipelineCycle(cycle);
+  const eventRow = displayedPipelineRows().findIndex(row =>
+    row.cycles?.[String(cycle)] !== undefined);
+  if (eventRow >= 0) {
+    requestAnimationFrame(() => {
+      const instruction = $("#pipeline-grid")
+        .querySelector(`.cell.inst[data-row="${eventRow}"]`);
+      if (instruction) pipelineSelectTarget?.(instruction);
+    });
+  }
 }
 
 function expandedLoopView() {
@@ -2364,6 +2516,32 @@ $("#message-dialog").addEventListener("cancel", event => {
   closeActionDialog(null);
 });
 document.querySelectorAll("#bottom nav button").forEach(button => button.onclick = () => showTab(button.dataset.tab));
+document.addEventListener("contextmenu", event => {
+  const register = event.target.closest("[data-register-change]");
+  if (register) {
+    openChangeContextMenu(event, {
+      kind: "register", key: register.dataset.registerChange,
+      label: register.dataset.registerChange
+    });
+    return;
+  }
+  const memory = event.target.closest("[data-memory-address]");
+  if (!memory) return;
+  openChangeContextMenu(event, {
+    kind: "memory", key: memory.dataset.memoryAddress,
+    width: Number(memory.dataset.memoryWidth),
+    label: memory.dataset.memoryLabel || memory.dataset.memoryAddress
+  });
+});
+document.addEventListener("pointerdown", event => {
+  if (changeContextMenu && !changeContextMenu.contains(event.target)) {
+    closeChangeContextMenu();
+  }
+});
+document.addEventListener("keydown", event => {
+  if (event.key === "Escape") closeChangeContextMenu();
+});
+window.addEventListener("resize", closeChangeContextMenu);
 $("#memory-symbol-form").onsubmit = event => {
   event.preventDefault();
   addMemoryWatch($("#memory-symbol").value);

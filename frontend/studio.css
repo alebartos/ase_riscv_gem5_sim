@@ -263,6 +263,10 @@ h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .05em; color: v
 .memory-value .memory-address { color: var(--muted); }
 .memory-value code { min-width: 0; max-width: 100%; overflow-wrap: anywhere; word-break: break-all; white-space: normal; text-align: right; }
 .memory-value.changed { background: #fef3c7; border-color: #fbbf24; }
+.register-value[data-register-change], .memory-value[data-memory-address] { cursor: context-menu; }
+.change-context-menu { position: fixed; z-index: 1000; display: grid; min-width: 190px; padding: 4px; border: 1px solid #b8c5d6; border-radius: 6px; background: #fff; box-shadow: 0 8px 24px #0f172a38; }
+.change-context-menu button { border: 0; border-radius: 3px; padding: 8px 10px; color: var(--ink); background: transparent; text-align: left; white-space: nowrap; }
+.change-context-menu button:hover, .change-context-menu button:focus-visible { background: #eaf2fc; outline: none; }
 .memory-symbol-color { --memory-symbol-color: hsl(var(--memory-symbol-hue) 72% 32%); }
 .memory-value.memory-symbol-color { border-left: 4px solid var(--memory-symbol-color); }
 .memory-value.changed.memory-symbol-color { border-left-color: var(--memory-symbol-color); }
@@ -450,6 +454,10 @@ html[data-theme="dark"] #register-resizer,
 html[data-theme="dark"] #splitter { background: #253246; border-color: #435269; }
 html[data-theme="dark"] .register-value,
 html[data-theme="dark"] .memory-value { border-color: #344256; color: #cbd5e1; background: #182233; }
+html[data-theme="dark"] .change-context-menu { border-color: #4b5d73; background: #182233; box-shadow: 0 8px 24px #0008; }
+html[data-theme="dark"] .change-context-menu button { color: #e5edf7; }
+html[data-theme="dark"] .change-context-menu button:hover,
+html[data-theme="dark"] .change-context-menu button:focus-visible { background: #263a53; }
 html[data-theme="dark"] .register-value code { color: #e5edf7; }
 html[data-theme="dark"] .register-value.changed,
 html[data-theme="dark"] .memory-value.changed { background: #493b16; border-color: #d97706; }
