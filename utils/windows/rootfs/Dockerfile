@@ -77,9 +77,10 @@ ARG ASE_STUDIO_DIR=ase_studio
 ARG GEM5_COMMIT=fc0ef46
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      python3 python3-minimal make curl ca-certificates \
+      python3 python3-minimal libpython3.11 make curl ca-certificates \
       gcc-riscv64-unknown-elf binutils-riscv64-unknown-elf \
-      libprotobuf32 libgoogle-perftools4 libhdf5-103-1 \
+      libprotobuf32 libgoogle-perftools4 libhdf5-103-1 libhdf5-cpp-103-1 \
+      libpng16-16 \
     && rm -rf /var/lib/apt/lists/* \
     && useradd -m -s /bin/bash ase \
     && mkdir -p /opt/ase

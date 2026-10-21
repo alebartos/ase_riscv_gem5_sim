@@ -152,22 +152,39 @@ Prima stesura completa di tutti i pezzi, scritta in `utils/windows/`:
 - `rootfs/Dockerfile` + `rootfs/build_rootfs.py`: build a due stage (gem5
   compilato in un builder, rootfs finale solo runtime), esporta
   `dist/ase-studio-rootfs.tar` e l'update di gem5 (`gem5-linux-x86_64.tar.gz`
-  + `gem5.json`). Build reale in corso su questa macchina (ha Docker); già
-  trovate e risolte due incompatibilità Python 3.11 di gem5 `fc0ef46`
-  (pensato per Python 3.10, come temuto in questo stesso documento):
+  + `gem5.json`). **Build completa e testata end-to-end su questa macchina**
+  (Docker + `wsl --import` reale). Lungo il percorso trovate e risolte
+  quattro incompatibilità Python 3.11 di gem5 `fc0ef46` (pensato per Python
+  3.10, come temuto in questo stesso documento) più due librerie runtime
+  mancanti nel rootfs:
   1. il pybind11 vendorizzato in `ext/pybind11` non supporta l'API opaca di
      `PyFrameObject`/`PyCodeObject` di 3.11 → rimosso nel Dockerfile, usa il
      pacchetto Debian `pybind11-dev` (2.10.3) via l'include path.
-  2. il lexer ply di `src/arch/arm/fastmodel/SConscript` usa un flag regex
-     `(?m)` che `re` di 3.11 rifiuta una volta concatenato da ply → patch in
-     `utils/windows/gem5_patches/0001-ply-regex-flag-python311.patch`
-     (applicata nel Dockerfile, stesso meccanismo di `utils/macOS/gem5_patches`).
+  2. due lexer ply (`src/arch/arm/fastmodel/SConscript`, l'ISA parser RISCV)
+     usano un flag regex `(?m)` che `re` di 3.11 rifiuta una volta
+     concatenato da ply → patch 0001/0002 in `utils/windows/gem5_patches/`.
+  3. quel flag `(?m)`, su Python pre-3.11, applicava MULTILINE all'**intera**
+     regex combinata di ply, non solo al proprio token: tre regole dell'ISA
+     parser usano `^` senza dichiarare il flag da sole, contando su questo
+     comportamento "storico". Rimuovere solo i flag (punto 2) le avrebbe
+     rotte in silenzio → patch 0003, `build_tools/grammar.py` ora passa
+     `reflags=re.MULTILINE` esplicitamente a `ply.lex.lex()`.
+  4. `inspect.getargspec` (usato da `SimObject.py`) è stato rimosso in 3.11
+     → patch 0004, sostituito con `inspect.getfullargspec()[:4]`.
+  5. (runtime, non di compilazione) il rootfs finale mancava di
+     `libpython3.11`, `libhdf5-cpp-103-1` e `libpng16-16`: `gem5.opt` si
+     linka contro queste a runtime (pybind11/embed, HDF5 C++, libpng) ma
+     non erano nella lista apt dello stage finale → aggiunte al Dockerfile.
 - `start.sh` + `ase_studio_wsl.py`: adattatore WSL equivalente a
   `utils/macOS/launcher.sh` + `ase_studio_app.py` (stessa logica di update
   senza git, stessa gestione degli spazi nei percorsi, stesso contratto per
-  `GEM5_INSTALLATION_PATH`).
+  `GEM5_INSTALLATION_PATH`). **Testato end-to-end**: `wsl --import` (sia
+  `--version 2` sia `--version 1`, quest'ultimo è quello usato dalla CI),
+  utente di default `ase` via `wsl.conf`, `start.sh` crea il workspace in
+  `C:\Users\<utente>\...`, il server risponde su `/` e `/api/health`.
 - `utils/macOS/gem5_selftest.py` (condiviso): ora accetta sia
   `riscv64-elf-gcc` (Mac) sia `riscv64-unknown-elf-gcc` (rootfs Debian).
+  **Passa** dentro il rootfs reale (floating point OK).
 - `launcher/` (C# .NET Framework 4.8, WinForms + WebView2): `MainForm.cs`,
   `WslManager.cs`, `PopupForm.cs`. Non ancora compilato (questa macchina ha
   solo il runtime .NET, non l'SDK) — da validare in CI o su una macchina con
@@ -176,11 +193,16 @@ Prima stesura completa di tutti i pezzi, scritta in `utils/windows/`:
   `.github/workflows/windows-app.yml` (due job: rootfs su Linux, launcher +
   installer + smoke test WSL1 su Windows, bozza di release).
 
-Non ancora fatto / da verificare su una macchina reale:
-- Import `wsl --import` end-to-end non ancora eseguito (il build del rootfs
-  è la priorità attuale).
+Commit `e6203a5` (branch `windows-app`), pushato.
+
+Non ancora fatto / da verificare:
 - Icona dell'app (`AppIcon.ico` per il launcher, converso da
   `utils/macOS/AppIcon.icns`).
-- Compilazione reale del launcher C# e test della finestra/WebView2.
+- Compilazione reale del launcher C# e test della finestra/WebView2 (serve
+  l'SDK .NET, non presente su questa macchina; lo farà la CI).
 - `iscc` (Inno Setup) non installato su questa macchina: lo script non è
-  stato ancora compilato localmente.
+  stato ancora compilato localmente — lo fa la CI (`choco install innosetup`).
+- Test del flusso di update in-app (`ase_studio_wsl.py`: scaricare un gem5 o
+  un ASE Studio più recenti da GitHub release/branch) e del launcher C# vero
+  e proprio (finestra, popup, download, chiusura) — richiedono il binario
+  compilato.
