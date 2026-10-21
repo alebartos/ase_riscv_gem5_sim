@@ -144,3 +144,43 @@ backend di ASE Studio usa bash, gruppi di processi e `make`. Quindi:
 
 - Va bene `C:\Users\<utente>\ASE Studio` per i progetti?
 - Nome della distribuzione WSL: `ASEStudio`?
+
+## Stato implementazione (ottobre 2026)
+
+Prima stesura completa di tutti i pezzi, scritta in `utils/windows/`:
+
+- `rootfs/Dockerfile` + `rootfs/build_rootfs.py`: build a due stage (gem5
+  compilato in un builder, rootfs finale solo runtime), esporta
+  `dist/ase-studio-rootfs.tar` e l'update di gem5 (`gem5-linux-x86_64.tar.gz`
+  + `gem5.json`). Build reale in corso su questa macchina (ha Docker); già
+  trovate e risolte due incompatibilità Python 3.11 di gem5 `fc0ef46`
+  (pensato per Python 3.10, come temuto in questo stesso documento):
+  1. il pybind11 vendorizzato in `ext/pybind11` non supporta l'API opaca di
+     `PyFrameObject`/`PyCodeObject` di 3.11 → rimosso nel Dockerfile, usa il
+     pacchetto Debian `pybind11-dev` (2.10.3) via l'include path.
+  2. il lexer ply di `src/arch/arm/fastmodel/SConscript` usa un flag regex
+     `(?m)` che `re` di 3.11 rifiuta una volta concatenato da ply → patch in
+     `utils/windows/gem5_patches/0001-ply-regex-flag-python311.patch`
+     (applicata nel Dockerfile, stesso meccanismo di `utils/macOS/gem5_patches`).
+- `start.sh` + `ase_studio_wsl.py`: adattatore WSL equivalente a
+  `utils/macOS/launcher.sh` + `ase_studio_app.py` (stessa logica di update
+  senza git, stessa gestione degli spazi nei percorsi, stesso contratto per
+  `GEM5_INSTALLATION_PATH`).
+- `utils/macOS/gem5_selftest.py` (condiviso): ora accetta sia
+  `riscv64-elf-gcc` (Mac) sia `riscv64-unknown-elf-gcc` (rootfs Debian).
+- `launcher/` (C# .NET Framework 4.8, WinForms + WebView2): `MainForm.cs`,
+  `WslManager.cs`, `PopupForm.cs`. Non ancora compilato (questa macchina ha
+  solo il runtime .NET, non l'SDK) — da validare in CI o su una macchina con
+  l'SDK.
+- `installer/setup.iss` (Inno Setup) e
+  `.github/workflows/windows-app.yml` (due job: rootfs su Linux, launcher +
+  installer + smoke test WSL1 su Windows, bozza di release).
+
+Non ancora fatto / da verificare su una macchina reale:
+- Import `wsl --import` end-to-end non ancora eseguito (il build del rootfs
+  è la priorità attuale).
+- Icona dell'app (`AppIcon.ico` per il launcher, converso da
+  `utils/macOS/AppIcon.icns`).
+- Compilazione reale del launcher C# e test della finestra/WebView2.
+- `iscc` (Inno Setup) non installato su questa macchina: lo script non è
+  stato ancora compilato localmente.

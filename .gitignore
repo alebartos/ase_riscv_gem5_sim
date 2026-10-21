@@ -70,3 +70,4 @@ tools/
 ASE Studio.app/
 Ferma ASE Studio.command
 dist/
+/utils/windows/rootfs/versions.json

@@ -1,0 +1,29 @@
+diff --git a/build_tools/grammar.py b/build_tools/grammar.py
+index 6ac638bcd0..c73e9ae9d8 100644
+--- a/build_tools/grammar.py
++++ b/build_tools/grammar.py
+@@ -25,6 +25,7 @@
+ # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ 
+ import os
++import re
+ 
+ import ply.lex
+ import ply.yacc
+@@ -69,7 +70,15 @@ class Grammar(object):
+             return self.yacc_kwargs
+ 
+         if attr == "lex":
+-            self.lex = ply.lex.lex(module=self, **self.lex_kwargs)
++            # Some grammars (e.g. the RISCV ISA parser) have token
++            # rules using '^' and rely on MULTILINE matching. Pre-3.11
++            # Python applied an inline (?m) flag found anywhere in
++            # ply's combined master regex globally; 3.11 requires
++            # global flags at position 0, so that style no longer
++            # works. Request MULTILINE explicitly instead.
++            kwargs = dict(self.lex_kwargs)
++            kwargs.setdefault("reflags", re.VERBOSE | re.MULTILINE)
++            self.lex = ply.lex.lex(module=self, **kwargs)
+             return self.lex
+ 
+         if attr == "yacc":

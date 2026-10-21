@@ -1,0 +1,92 @@
+name: Windows app
+
+on:
+  workflow_dispatch:
+    inputs:
+      studio_branch:
+        description: "ASE Studio branch to build from"
+        default: "ase-studio-macos"
+        required: false
+
+permissions:
+  contents: write
+
+jobs:
+  rootfs:
+    name: Build WSL2 rootfs (gem5 + ASE Studio)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+          fetch-depth: 0
+
+      - name: Build rootfs
+        run: python3 utils/windows/rootfs/build_rootfs.py --studio-branch "${{ inputs.studio_branch || 'ase-studio-macos' }}"
+
+      - name: Upload rootfs
+        uses: actions/upload-artifact@v4
+        with:
+          name: rootfs
+          path: |
+            dist/ase-studio-rootfs.tar
+            dist/gem5-linux-x86_64.tar.gz
+            dist/gem5.json
+            dist/ase_studio-src/VERSION
+            utils/windows/rootfs/versions.json
+
+  launcher:
+    name: Build launcher + installer
+    runs-on: windows-latest
+    needs: rootfs
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: rootfs
+          path: dist
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: Build launcher
+        run: dotnet publish utils/windows/launcher/Launcher.csproj -c Release -o dist/launcher
+
+      - name: Smoke-test the rootfs (WSL1; this runner has no WSL2 nesting)
+        shell: pwsh
+        run: |
+          wsl --import ASEStudioSmoke "$env:RUNNER_TEMP\ASEStudioSmoke" dist\ase-studio-rootfs.tar --version 1
+          wsl -d ASEStudioSmoke -- python3 /opt/ase/gem5_selftest.py /opt/ase/gem5/build/RISCV/gem5.opt --toolchain /usr/bin
+          wsl --unregister ASEStudioSmoke
+
+      - name: Install Inno Setup
+        run: choco install innosetup --no-progress -y
+
+      - name: Read version
+        id: version
+        shell: pwsh
+        run: |
+          $version = (Get-Content dist/ase_studio-src/VERSION -ErrorAction SilentlyContinue)
+          if (-not $version) { $version = "0.0.0" }
+          echo "version=$version" >> $env:GITHUB_OUTPUT
+
+      - name: Build installer
+        run: |
+          iscc utils\windows\installer\setup.iss /DAppVersion=${{ steps.version.outputs.version }}
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: ASE-Studio-Setup
+          path: dist/ASE-Studio-Setup-*.exe
+
+      - name: Draft release
+        if: github.event_name == 'workflow_dispatch'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.version.outputs.version }}-windows
+          draft: true
+          files: dist/ASE-Studio-Setup-*.exe

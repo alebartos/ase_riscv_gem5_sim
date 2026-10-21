@@ -62,6 +62,21 @@ m5.simulate(100000)
 """
 
 
+TOOLCHAIN_PREFIXES = ("riscv64-elf-", "riscv64-unknown-elf-")
+
+
+def find_gcc(toolchain: Path) -> Path:
+    """The RISC-V gcc in `toolchain`, under whichever prefix is installed.
+
+    macOS (Homebrew) uses riscv64-elf-; the Debian packages used by the
+    Windows/WSL rootfs use riscv64-unknown-elf-."""
+    for prefix in TOOLCHAIN_PREFIXES:
+        candidate = toolchain / f"{prefix}gcc"
+        if candidate.exists():
+            return candidate
+    return toolchain / f"{TOOLCHAIN_PREFIXES[0]}gcc"   # let the run fail with a clear error
+
+
 def check(gem5: Path, toolchain: Path, env=None, timeout=120) -> tuple[bool, str]:
     """Return (ok, explanation)."""
     gem5, toolchain = Path(gem5).absolute(), Path(toolchain).absolute()
@@ -70,7 +85,7 @@ def check(gem5: Path, toolchain: Path, env=None, timeout=120) -> tuple[bool, str
         (tmp / "t.s").write_text(PROGRAM)
         (tmp / "config.py").write_text(CONFIG)
         try:
-            build = subprocess.run([str(toolchain / "riscv64-elf-gcc"), *FLAGS, "t.s", "-o", "t.elf"],
+            build = subprocess.run([str(find_gcc(toolchain)), *FLAGS, "t.s", "-o", "t.elf"],
                                    cwd=tmp, capture_output=True, text=True, env=env)
         except OSError as error:
             return False, f"the RISC-V compiler could not run: {error}"

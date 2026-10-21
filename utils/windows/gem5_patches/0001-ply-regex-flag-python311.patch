@@ -1,0 +1,13 @@
+diff --git a/src/arch/arm/fastmodel/SConscript b/src/arch/arm/fastmodel/SConscript
+index 9d9d183516..d93f65c781 100644
+--- a/src/arch/arm/fastmodel/SConscript
++++ b/src/arch/arm/fastmodel/SConscript
+@@ -218,7 +218,7 @@ class ProjectFileParser(Grammar):
+     t_ID = r'[A-Za-z_]\w*'
+ 
+     def t_STRLIT(self, t):
+-        r'(?m)"([^"])*"'
++        r'"([^"])*"'
+         # strip off quotes
+         t.value = t.value[1:-1]
+         t.lexer.lineno += t.value.count('\n')
