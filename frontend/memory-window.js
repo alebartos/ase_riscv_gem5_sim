@@ -5,9 +5,43 @@
 const $ = selector => document.querySelector(selector);
 const channel = "BroadcastChannel" in window
   ? new BroadcastChannel("ase-studio-memory-window") : null;
+let changeContextMenu = null;
 
 function send(action, details = {}) {
   if (channel) channel.postMessage({type: "memory-action", action, ...details});
+}
+
+function closeChangeContextMenu() {
+  changeContextMenu?.remove();
+  changeContextMenu = null;
+}
+
+function openChangeContextMenu(event, item) {
+  closeChangeContextMenu();
+  event.preventDefault();
+  const menu = document.createElement("div");
+  menu.className = "change-context-menu";
+  menu.setAttribute("role", "menu");
+  [
+    ["next", "Go to next change"],
+    ["previous", "Go to previous change"]
+  ].forEach(([direction, label]) => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.setAttribute("role", "menuitem");
+    button.textContent = label;
+    button.onclick = () => {
+      closeChangeContextMenu();
+      send("navigate-change", {...item, direction});
+    };
+    menu.append(button);
+  });
+  document.body.append(menu);
+  const bounds = menu.getBoundingClientRect();
+  menu.style.left = `${Math.max(8, Math.min(event.clientX, window.innerWidth - bounds.width - 8))}px`;
+  menu.style.top = `${Math.max(8, Math.min(event.clientY, window.innerHeight - bounds.height - 8))}px`;
+  changeContextMenu = menu;
+  menu.querySelector("button")?.focus();
 }
 
 function applyState(state) {
@@ -37,6 +71,25 @@ if (channel) {
 } else {
   $("#memory-summary").textContent = "This WebKit version cannot synchronize a separate memory window.";
 }
+
+document.addEventListener("contextmenu", event => {
+  const memory = event.target.closest("[data-memory-address]");
+  if (!memory) return;
+  openChangeContextMenu(event, {
+    address: memory.dataset.memoryAddress,
+    width: Number(memory.dataset.memoryWidth),
+    label: memory.dataset.memoryLabel || memory.dataset.memoryAddress
+  });
+});
+document.addEventListener("pointerdown", event => {
+  if (changeContextMenu && !changeContextMenu.contains(event.target)) {
+    closeChangeContextMenu();
+  }
+});
+document.addEventListener("keydown", event => {
+  if (event.key === "Escape") closeChangeContextMenu();
+});
+window.addEventListener("resize", closeChangeContextMenu);
 
 $("#memory-symbol-form").onsubmit = event => {
   event.preventDefault();

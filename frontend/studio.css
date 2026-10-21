@@ -95,9 +95,13 @@ h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .05em; color: v
 #source-name { min-width: 0; padding-left: 9px; border-left: 1px solid var(--line); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .editor-tools { flex: none; display: flex; align-items: center; gap: 10px; }
 .editor-font-control { display: flex; align-items: center; gap: 5px; font-size: 11px; white-space: nowrap; }
+.scaffold-protection-control { display: flex; align-items: center; gap: 5px; color: var(--muted); font-size: 11px; white-space: nowrap; cursor: pointer; }
+.scaffold-protection-control input { margin: 0; }
 #editor-font-size { width: 85px; }
 #editor-font-value { min-width: 34px; font-variant-numeric: tabular-nums; }
 #search { width: 190px; border: 1px solid var(--line); border-radius: 4px; padding: 5px; }
+.scaffold-protection-control input:not(:checked) + span { color: #b45309; }
+#scaffold-protection-status { padding: 5px 12px; border-bottom: 1px solid #fed7aa; color: #9a3412; background: #fff7ed; font-size: 12px; }
 .editor-area { min-height: 0; overflow: auto; overflow-anchor: none; font: var(--editor-font-size)/var(--editor-line-height) "DejaVu Sans Mono", ui-monospace, SFMono-Regular, Menlo, monospace; font-variant-ligatures: none; scroll-behavior: smooth; }
 .editor-wrap { position: relative; min-height: 300px; background: #fff; }
 .editor-wrap textarea, .editor-wrap pre { margin: 0; border: 0; padding: 10px 14px 10px 55px; width: 100%; min-height: 100%; font: inherit; line-height: var(--editor-line-height); letter-spacing: 0; word-spacing: 0; tab-size: 4; white-space: pre-wrap; overflow-wrap: normal; overflow: hidden; }
@@ -259,6 +263,10 @@ h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .05em; color: v
 .memory-value .memory-address { color: var(--muted); }
 .memory-value code { min-width: 0; max-width: 100%; overflow-wrap: anywhere; word-break: break-all; white-space: normal; text-align: right; }
 .memory-value.changed { background: #fef3c7; border-color: #fbbf24; }
+.register-value[data-register-change], .memory-value[data-memory-address] { cursor: context-menu; }
+.change-context-menu { position: fixed; z-index: 1000; display: grid; min-width: 190px; padding: 4px; border: 1px solid #b8c5d6; border-radius: 6px; background: #fff; box-shadow: 0 8px 24px #0f172a38; }
+.change-context-menu button { border: 0; border-radius: 3px; padding: 8px 10px; color: var(--ink); background: transparent; text-align: left; white-space: nowrap; }
+.change-context-menu button:hover, .change-context-menu button:focus-visible { background: #eaf2fc; outline: none; }
 .memory-symbol-color { --memory-symbol-color: hsl(var(--memory-symbol-hue) 72% 32%); }
 .memory-value.memory-symbol-color { border-left: 4px solid var(--memory-symbol-color); }
 .memory-value.changed.memory-symbol-color { border-left-color: var(--memory-symbol-color); }
@@ -274,7 +282,8 @@ dialog::backdrop { background: #0f172a73; }
 #cpu-form select, #cpu-form input[type="number"], #cpu-form input[type="text"] { border: 1px solid #b8c5d6; border-radius: 5px; padding: 7px; background: #fff; }
 #cpu-form fieldset { border: 1px solid var(--line); border-radius: 6px; }
 .units-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
-.floating-precision { display: grid; grid-template-columns: minmax(75px, 1fr) 152px; align-items: center; gap: 8px; margin-bottom: 10px; font-size: 11px; font-weight: 600; }
+.units-grid.superscalar { grid-template-columns: minmax(0, 1fr); }
+.floating-precision { display: grid; grid-template-columns: minmax(75px, 1fr) 152px; align-items: center; gap: 8px; margin-top: 12px; font-size: 11px; font-weight: 600; }
 .floating-precision select { width: 100%; min-width: 0; }
 .unit-fields { display: grid; gap: 9px; }
 .unit-heading, .unit-row { display: grid; grid-template-columns: minmax(75px, 1fr) 68px 72px; align-items: center; gap: 8px; }
@@ -292,7 +301,7 @@ dialog::backdrop { background: #0f172a73; }
 .o3-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px 15px; }
 .o3-grid label { display: grid; grid-template-columns: 1fr 75px; align-items: center; gap: 8px; }
 #o3-management { display: grid; gap: 12px; }
-.o3-policy-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px 15px; }
+.o3-policy-grid { display: grid; grid-template-columns: 1fr; gap: 8px 15px; }
 .o3-policy-grid > label:not(.check) { display: grid; grid-template-columns: 1fr minmax(120px, 1fr); align-items: center; gap: 8px; }
 .o3-policy-grid .check { min-height: 32px; }
 .o3-stage-heading { display: grid; gap: 2px; }
@@ -478,6 +487,7 @@ html[data-theme="dark"] .primary { color: #07111f; background: #60a5fa; border-c
 html[data-theme="dark"] .project.selected { background: #17365f; color: #bfdbfe; }
 html[data-theme="dark"] .editor-wrap textarea { caret-color: #f8fafc; }
 html[data-theme="dark"] .source-line.protected { background: #202b3a; color: #aebdd0; box-shadow: inset 3px 0 #64748b; }
+html[data-theme="dark"] #scaffold-protection-status { border-color: #7c2d12; color: #fdba74; background: #431407; }
 html[data-theme="dark"] .source-line.pipeline-selected,
 html[data-theme="dark"] .pipeline-row.row-selected .inst,
 html[data-theme="dark"] .pipeline-row.row-selected .address-cell,
@@ -492,6 +502,10 @@ html[data-theme="dark"] #register-resizer,
 html[data-theme="dark"] #splitter { background: #253246; border-color: #435269; }
 html[data-theme="dark"] .register-value,
 html[data-theme="dark"] .memory-value { border-color: #344256; color: #cbd5e1; background: #182233; }
+html[data-theme="dark"] .change-context-menu { border-color: #4b5d73; background: #182233; box-shadow: 0 8px 24px #0008; }
+html[data-theme="dark"] .change-context-menu button { color: #e5edf7; }
+html[data-theme="dark"] .change-context-menu button:hover,
+html[data-theme="dark"] .change-context-menu button:focus-visible { background: #263a53; }
 html[data-theme="dark"] .register-value code { color: #e5edf7; }
 html[data-theme="dark"] .register-value.changed,
 html[data-theme="dark"] .memory-value.changed { background: #493b16; border-color: #d97706; }
