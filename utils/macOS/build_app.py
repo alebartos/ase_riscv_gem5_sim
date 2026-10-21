@@ -62,11 +62,13 @@ SIMULATOR_REPO = "cad-polito-it/ase_riscv_gem5_sim"
 # ASE Studio for macOS (the course's ase-studio plus the Portale della
 # Didattica features) lives on a branch of this fork; the in-app update
 # follows the same branch. New full apps are GitHub releases tagged
-# v<version>-macos, which the app announces.
+# v<version> -- one shared tag per version, carrying both the macOS .dmg
+# and the Windows installer as assets (see build_rootfs.py's
+# APP_RELEASE_TAG, kept in sync with this one) -- which the app announces.
 STUDIO_REPO = "alebartos/ase_riscv_gem5_sim"
 STUDIO_BRANCH = "ase-studio-macos"
 STUDIO_SRC = DIST / "ase_studio-src"
-APP_RELEASE_TAG = "v{version}-macos"
+APP_RELEASE_TAG = "v{version}"
 _studio: dict = {}
 GEM5_MANIFEST = DIST / "gem5.json"
 
