@@ -11,7 +11,7 @@ downloads the latest sources from GitHub:
   * gem5.opt (from the GitHub release named in versions.json, checked with
     gem5_selftest.py before use) -> ~/Library/Application Support/ASE Studio/gem5
 
-A newer full app (a v<version>-macos release of the repo in versions.json)
+A newer full app (a v<version> or v<version>-macos release of the repo in versions.json)
 is announced with a link to its download page.
 
 Python and the compiler are binaries: they only change with a new app.
@@ -193,7 +193,9 @@ def remote_commit(repo: str, branch: str) -> str:
 
 
 def release_version(tag: str) -> tuple[int, ...] | None:
-    match = re.fullmatch(r"v(\d+(?:\.\d+)*)-macos", tag or "")
+    # One release can carry every platform (v1.5.0); older ones were tagged
+    # per platform (v1.3.0-macos).
+    match = re.fullmatch(r"v(\d+(?:\.\d+)*)(?:-macos)?", tag or "")
     return tuple(int(part) for part in match[1].split(".")) if match else None
 
 
