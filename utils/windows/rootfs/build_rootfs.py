@@ -54,7 +54,7 @@ STUDIO_BRANCH = "ase-studio-macos"          # also the branch used on Windows
 GEM5_RELEASE = "gem5-linux-x86_64"
 GEM5_ASSET = DIST / f"{GEM5_RELEASE}.tar.gz"
 GEM5_MANIFEST = DIST / "gem5.json"
-APP_RELEASE_TAG = "v{version}-windows"
+APP_RELEASE_TAG = "v{version}"
 _studio: dict = {}
 
 

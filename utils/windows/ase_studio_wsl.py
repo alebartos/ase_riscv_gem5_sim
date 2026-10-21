@@ -13,7 +13,7 @@ utils/macOS/ase_studio_app.py (this file mirrors its logic):
   * gem5.opt (from the GitHub release named in versions.json, checked with
     gem5_selftest.py before use) -> ~/.local/share/ASE Studio/gem5
 
-A newer full app (a v<version>-windows release of the repo in versions.json)
+A newer full app (a v<version> or v<version>-windows release of the repo in versions.json)
 is announced with a link to its download page.
 
 Python, the compiler and make are rootfs packages: they only change with a
@@ -179,7 +179,9 @@ def remote_commit(repo: str, branch: str) -> str:
 
 
 def release_version(tag: str) -> tuple[int, ...] | None:
-    match = re.fullmatch(r"v(\d+(?:\.\d+)*)-windows", tag or "")
+    # One release can carry every platform (v1.5.0); the first Windows
+    # release was tagged per platform (v1.5.0-windows).
+    match = re.fullmatch(r"v(\d+(?:\.\d+)*)(?:-windows)?", tag or "")
     return tuple(int(part) for part in match[1].split(".")) if match else None
 
 
