@@ -72,7 +72,31 @@ namespace AseStudio.Launcher
             }
         }
 
+        // Microsoft's stable "Evergreen Bootstrapper" redirect: always resolves
+        // to the latest WebView2 Runtime installer, supports a silent switch.
+        private const string WebView2BootstrapperUrl = "https://go.microsoft.com/fwlink/p/?LinkId=2124703";
+
         private async Task<bool> EnsureWebView2RuntimeAsync()
+        {
+            if (IsWebView2RuntimeAvailable()) return true;
+
+            _status.Text = "Installazione del componente Microsoft Edge WebView2...";
+            await InstallWebView2RuntimeAsync();
+            if (IsWebView2RuntimeAvailable()) return true;
+
+            var result = MessageBox.Show(
+                "Impossibile installare automaticamente il componente Microsoft Edge WebView2, " +
+                "necessario per ASE Studio.\n\nVuoi aprire la pagina di download?",
+                Title, MessageBoxButtons.YesNo, MessageBoxIcon.Warning);
+            if (result == DialogResult.Yes)
+            {
+                Process.Start(new ProcessStartInfo(
+                    "https://developer.microsoft.com/microsoft-edge/webview2/") { UseShellExecute = true });
+            }
+            return false;
+        }
+
+        private static bool IsWebView2RuntimeAvailable()
         {
             try
             {
@@ -81,16 +105,36 @@ namespace AseStudio.Launcher
             }
             catch (WebView2RuntimeNotFoundException)
             {
-                var result = MessageBox.Show(
-                    "ASE Studio richiede il componente Microsoft Edge WebView2, che non è installato.\n\n" +
-                    "Vuoi aprire la pagina di download?",
-                    Title, MessageBoxButtons.YesNo, MessageBoxIcon.Warning);
-                if (result == DialogResult.Yes)
+                return false;
+            }
+        }
+
+        private static async Task InstallWebView2RuntimeAsync()
+        {
+            string bootstrapper = Path.Combine(Path.GetTempPath(), "MicrosoftEdgeWebView2Setup.exe");
+            try
+            {
+                using (var client = new HttpClient { Timeout = TimeSpan.FromSeconds(120) })
                 {
-                    Process.Start(new ProcessStartInfo(
-                        "https://developer.microsoft.com/microsoft-edge/webview2/") { UseShellExecute = true });
+                    byte[] data = await client.GetByteArrayAsync(WebView2BootstrapperUrl);
+                    File.WriteAllBytes(bootstrapper, data);
                 }
-                return await Task.FromResult(false);
+                // The bootstrapper requests elevation itself (via its own
+                // manifest) only if a per-machine install is actually needed;
+                // UseShellExecute lets Windows honor that, same as the
+                // one-off "wsl --install" elevation elsewhere in this class.
+                var psi = new ProcessStartInfo(bootstrapper, "/silent /install")
+                {
+                    UseShellExecute = true,
+                    WindowStyle = ProcessWindowStyle.Hidden,
+                };
+                using (var process = Process.Start(psi))
+                    await Task.Run(() => process.WaitForExit());
+            }
+            catch (Exception) { /* IsWebView2RuntimeAvailable() re-check below decides the outcome */ }
+            finally
+            {
+                try { File.Delete(bootstrapper); } catch (Exception) { /* best effort cleanup */ }
             }
         }
 
