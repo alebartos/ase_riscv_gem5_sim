@@ -4,8 +4,8 @@
   <trustInfo xmlns="urn:schemas-microsoft-com:asm.v2">
     <security>
       <requestedPrivileges xmlns="urn:schemas-microsoft-com:asm.v3">
-        <!-- Runs as the current user; the one elevation needed (wsl --install
-             --no-distribution, first run only) is requested on its own via a
+        <!-- Runs as the current user; the one elevation needed (enabling the
+             WSL feature, first run only) is requested on its own via a
              separate "runas" process, not for the whole launcher. -->
         <requestedExecutionLevel level="asInvoker" uiAccess="false"/>
       </requestedPrivileges>

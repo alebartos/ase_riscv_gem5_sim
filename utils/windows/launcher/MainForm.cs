@@ -35,10 +35,16 @@ namespace AseStudio.Launcher
         public MainForm()
         {
             Text = Title;
+            // The frontend wants real estate close to 1400x900 (same as the
+            // macOS launcher's NSMakeRect) and overlaps/misreflows if given
+            // much less. Rather than size relative to Screen.WorkingArea
+            // (unreliable across DPI scaling/multi-monitor setups), just
+            // maximize: it always gives the most room the display has.
             Width = 1400;
             Height = 900;
             MinimumSize = new System.Drawing.Size(900, 600);
             StartPosition = FormStartPosition.CenterScreen;
+            WindowState = FormWindowState.Maximized;
             Controls.Add(_status);
             _status.Text = "Avvio di ASE Studio...";
             Load += OnLoadAsync;
