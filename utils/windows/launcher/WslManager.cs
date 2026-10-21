@@ -2,6 +2,7 @@ using System;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
+using System.Security.Cryptography;
 using System.Text;
 using System.Threading.Tasks;
 
@@ -60,29 +61,68 @@ namespace AseStudio.Launcher
             }
         }
 
+        private static string InstallDir => Path.Combine(
+            Environment.GetEnvironmentVariable("LOCALAPPDATA") ?? "", "ASE Studio", "wsl");
+
+        // Records the sha256 of the rootfs tar actually imported, next to it
+        // (not inside the distro: cheap to read, and survives re-registering
+        // the distro under the same name). Used to tell a stale distro from
+        // an up-to-date one across app updates -- see EnsureDistroUpToDateAsync.
+        private static string ImportedRootfsMarkerPath =>
+            Path.Combine(InstallDir, ".rootfs-sha256");
+
+        private static string ComputeSha256(string filePath)
+        {
+            using (var sha256 = SHA256.Create())
+            using (var stream = File.OpenRead(filePath))
+                return BitConverter.ToString(sha256.ComputeHash(stream)).Replace("-", "");
+        }
+
         /// <summary>Imports the ASEStudio distro from the rootfs tar bundled
-        /// with the installer. Tries WSL2 first, falls back to WSL1 if the
-        /// machine cannot run WSL2 (e.g. virtualization disabled).</summary>
-        public static async Task<RunResult> ImportDistroAsync(string rootfsTarPath,
+        /// with the installer if it is missing, or replaces it in place if a
+        /// newer app version bundled a different rootfs (critical fixes,
+        /// e.g. a broken gem5) -- never leaves two imports side by side, nor
+        /// silently keeps running a stale one. Tries WSL2 first, falls back
+        /// to WSL1 if the machine cannot run WSL2 (e.g. virtualization
+        /// disabled).</summary>
+        public static async Task<RunResult> EnsureDistroUpToDateAsync(string rootfsTarPath,
             IProgress<string> progress = null)
         {
-            string installDir = Path.Combine(
-                Environment.GetEnvironmentVariable("LOCALAPPDATA") ?? "", "ASE Studio", "wsl");
-            Directory.CreateDirectory(installDir);
+            // Hashing a 1GB+ tar on the caller's (UI) thread would stall it.
+            string currentHash = await Task.Run(() => ComputeSha256(rootfsTarPath));
+            bool installed = IsDistroInstalled();
+            string importedHash = null;
+            try { importedHash = File.ReadAllText(ImportedRootfsMarkerPath).Trim(); }
+            catch (IOException) { } catch (UnauthorizedAccessException) { }
 
+            if (installed && importedHash == currentHash)
+                return new RunResult { ExitCode = 0 };
+
+            if (installed)
+            {
+                progress?.Report("Aggiornamento dell'ambiente di ASE Studio...");
+                UnregisterDistro();
+            }
+
+            Directory.CreateDirectory(InstallDir);
             progress?.Report("Installazione della distribuzione ASEStudio (WSL2)...");
             var result = await RunAsync("wsl.exe",
-                $"--import {DistroName} \"{installDir}\" \"{rootfsTarPath}\" --version 2");
-            if (result.ExitCode == 0) return result;
-
-            progress?.Report("WSL2 non disponibile, provo con WSL1...");
-            return await RunAsync("wsl.exe",
-                $"--import {DistroName} \"{installDir}\" \"{rootfsTarPath}\" --version 1");
+                $"--import {DistroName} \"{InstallDir}\" \"{rootfsTarPath}\" --version 2");
+            if (result.ExitCode != 0)
+            {
+                progress?.Report("WSL2 non disponibile, provo con WSL1...");
+                result = await RunAsync("wsl.exe",
+                    $"--import {DistroName} \"{InstallDir}\" \"{rootfsTarPath}\" --version 1");
+            }
+            if (result.ExitCode == 0)
+                File.WriteAllText(ImportedRootfsMarkerPath, currentHash);
+            return result;
         }
 
         public static void UnregisterDistro()
         {
             Run("wsl.exe", $"--unregister {DistroName}");
+            try { File.Delete(ImportedRootfsMarkerPath); } catch (IOException) { } catch (UnauthorizedAccessException) { }
         }
 
         /// <summary>Starts the backend inside WSL and returns the running

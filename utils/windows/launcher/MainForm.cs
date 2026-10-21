@@ -160,21 +160,22 @@ namespace AseStudio.Launcher
                 return false;
             }
 
-            if (!WslManager.IsDistroInstalled())
+            if (!File.Exists(RootfsTarPath))
             {
-                if (!File.Exists(RootfsTarPath))
-                {
-                    Fatal($"File dell'app mancante: {RootfsTarPath}");
-                    return false;
-                }
-                _status.Text = "Preparazione del primo avvio (può richiedere qualche minuto)...";
-                var progress = new Progress<string>(message => _status.Text = message);
-                var result = await WslManager.ImportDistroAsync(RootfsTarPath, progress);
-                if (result.ExitCode != 0)
-                {
-                    Fatal($"Impossibile creare l'ambiente di ASE Studio:\n{result.StdErr}");
-                    return false;
-                }
+                Fatal($"File dell'app mancante: {RootfsTarPath}");
+                return false;
+            }
+            // Also catches an app update that bundled a newer rootfs (e.g. a
+            // critical gem5 fix): replaces the existing distro in place
+            // rather than leaving a stale one running or importing a second
+            // copy alongside it.
+            _status.Text = "Verifica dell'ambiente di ASE Studio...";
+            var progress = new Progress<string>(message => _status.Text = message);
+            var ensureResult = await WslManager.EnsureDistroUpToDateAsync(RootfsTarPath, progress);
+            if (ensureResult.ExitCode != 0)
+            {
+                Fatal($"Impossibile preparare l'ambiente di ASE Studio:\n{ensureResult.StdErr}");
+                return false;
             }
             return true;
         }
