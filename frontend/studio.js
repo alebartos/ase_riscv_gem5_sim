@@ -47,6 +47,7 @@ let changeContextMenu = null;
 let opcodePopupState = null;
 let opcodeSnippetSession = null;
 let opcodePopupSuppressed = false;
+let draftSaveTimer = null;
 const memoryWindowChannel = "BroadcastChannel" in window
   ? new BroadcastChannel("ase-studio-memory-window") : null;
 
@@ -151,7 +152,10 @@ function restoreEditorSnapshot(snapshot) {
   editor.setSelectionRange(snapshot.start, snapshot.end);
   applyingEditorHistory = false;
   markSourceEdited();
+  scheduleLocalDraft();
+  clearDiagnostics();
   refreshScaffoldProtectionUi();
+  selectedSourceLine = null;
   syncEditor();
   restoreEditorViewport(viewport);
 }
@@ -452,6 +456,221 @@ function markSourceEdited() {
   updateDirtyIndicator();
 }
 
+function draftStorageKey(name) {
+  return name ? `ase-studio-draft:${name}` : "";
+}
+
+function setDraftStatus(message = "") {
+  const status = $("#draft-status");
+  if (!status) return;
+  status.textContent = message;
+  status.hidden = !message;
+  status.title = message;
+}
+
+function readLocalDraft(name) {
+  const key = draftStorageKey(name);
+  if (!key) return null;
+  try {
+    const raw = localStorage.getItem(key);
+    if (!raw) return null;
+    const draft = JSON.parse(raw);
+    if (!draft || typeof draft.text !== "string" || typeof draft.timestamp !== "number") return null;
+    return draft;
+  } catch (_error) {
+    return null;
+  }
+}
+
+function clearLocalDraft(name = current?.name) {
+  if (draftSaveTimer !== null) {
+    clearTimeout(draftSaveTimer);
+    draftSaveTimer = null;
+  }
+  const key = draftStorageKey(name);
+  if (key) {
+    try { localStorage.removeItem(key); } catch (_error) { /* Storage may be unavailable. */ }
+  }
+  setDraftStatus();
+}
+
+function writeLocalDraft() {
+  draftSaveTimer = null;
+  if (!current || !sourceDirty) return;
+  const text = $("#body").value;
+  if (text === savedSource) {
+    clearLocalDraft(current.name);
+    return;
+  }
+  try {
+    localStorage.setItem(draftStorageKey(current.name), JSON.stringify({
+      text,
+      timestamp: Date.now(),
+      sourceName: current.sourceName
+    }));
+    setDraftStatus("Local draft saved");
+  } catch (_error) {
+    setDraftStatus("Local draft unavailable");
+  }
+}
+
+function scheduleLocalDraft() {
+  if (!current) return;
+  if (!sourceDirty) {
+    clearLocalDraft(current.name);
+    return;
+  }
+  if (draftSaveTimer !== null) clearTimeout(draftSaveTimer);
+  draftSaveTimer = setTimeout(writeLocalDraft, 250);
+}
+
+function clearDiagnostics() {
+  const container = $("#diagnostics");
+  if (!container) return;
+  container.hidden = true;
+  container.innerHTML = "";
+}
+
+function jumpToSourcePosition(lineNumber, columnNumber = 1) {
+  if (!current) return;
+  const editor = $("#body");
+  const lines = editor.value.split(/\r?\n/);
+  const line = Math.max(1, Math.min(Number(lineNumber) || 1, lines.length));
+  const column = Math.max(1, Number(columnNumber) || 1);
+  let offset = 0;
+  for (let index = 0; index < line - 1; index++) offset += lines[index].length + 1;
+  offset += Math.min(lines[line - 1].length, column - 1);
+  editor.focus();
+  highlightSourceLine(line);
+  editor.setSelectionRange(offset, offset);
+  scrollEditorToLine(line);
+}
+
+function linkerSymbolFromDiagnostic(text) {
+  const match = String(text || "").match(
+    /(?:undefined reference to|multiple definition of|against (?:the )?symbol)\s+[`'\"]([^`'\"]+)[`'\"]/i
+  );
+  return match ? match[1].trim() : "";
+}
+
+function linkerFunctionFromDiagnostic(text) {
+  const quoted = String(text || "").match(/\bin function\s+[`'\"]([^`'\"]+)[`'\"]/i);
+  if (quoted) return quoted[1].trim();
+  const plain = String(text || "").match(/\bin function\s+([A-Za-z_.$][\w.$]*)/i);
+  return plain ? plain[1].trim() : "";
+}
+
+function linkerSourceLocation(sourceText, symbol, functionName) {
+  if (!sourceText) return null;
+  const lines = String(sourceText).split(/\r?\n/);
+  const escapeRegExp = value => String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const functionPattern = functionName
+    ? new RegExp(`^\\s*${escapeRegExp(functionName)}\\s*:`)
+    : null;
+  const symbolPattern = symbol
+    ? new RegExp(`(^|[^A-Za-z0-9_.$])${escapeRegExp(symbol)}(?=$|[^A-Za-z0-9_.$])`, "g")
+    : null;
+  const candidates = [];
+  let functionLine = -1;
+
+  lines.forEach((rawLine, index) => {
+    const code = rawLine.split("#", 1)[0];
+    if (functionPattern && functionLine < 0 && functionPattern.test(code)) functionLine = index;
+    if (!symbolPattern || !code.trim()
+        || /^\s*\.(?:globl|global|extern|weak|hidden|type|size|local|set)\b/i.test(code)
+        || new RegExp(`^\\s*${escapeRegExp(symbol)}\\s*:`).test(code)) return;
+    symbolPattern.lastIndex = 0;
+    let match;
+    while ((match = symbolPattern.exec(code))) {
+      const tokenOffset = match.index + (match[1] ? 1 : 0);
+      candidates.push({line: index + 1, column: tokenOffset + 1});
+      if (match.index === symbolPattern.lastIndex) symbolPattern.lastIndex += 1;
+    }
+  });
+
+  const scopedCandidates = functionLine >= 0
+    ? candidates.filter(candidate => candidate.line >= functionLine + 1)
+    : candidates;
+  const location = scopedCandidates[0] || candidates[0];
+  if (location) return location;
+  if (functionLine >= 0) {
+    const column = Math.max(1, lines[functionLine].search(/\S/) + 1);
+    return {line: functionLine + 1, column};
+  }
+  return null;
+}
+
+function parseCompilerDiagnostics(output) {
+  const sourceName = String(current?.sourceName || "").toLowerCase();
+  const sourceText = typeof document === "undefined"
+    ? "" : document.getElementById("body")?.value || "";
+  const diagnostics = [];
+  let linkerFunction = "";
+  String(output || "").split(/\r?\n/).forEach((line, index) => {
+    const match = line.match(/^(.*?\.(?:s|asm)):(\d+)(?::(\d+))?:\s*(?:(?:fatal\s+)?(error|warning|note)\s*:\s*)?(.*)$/i);
+    if (match) {
+      const file = match[1].trim();
+      const basename = file.split(/[\\/]/).pop().toLowerCase();
+      if (!sourceName || (basename !== sourceName && file.toLowerCase() !== sourceName)) return;
+      const severity = (match[4] || "error").toLowerCase();
+      const message = match[5].trim() || "Assembler diagnostic";
+      diagnostics.push({
+        severity,
+        file: basename,
+        line: Number(match[2]),
+        column: Number(match[3] || 1),
+        message,
+        outputLine: index + 1,
+        kind: "compiler"
+      });
+      return;
+    }
+    const trimmed = line.trim();
+    if (!trimmed || /^make(?:\[.*\])?:/i.test(trimmed)) return;
+    const functionName = linkerFunctionFromDiagnostic(trimmed);
+    if (functionName) linkerFunction = functionName;
+    if (!/(?:undefined reference to|multiple definition of|relocation .*\bagainst\s+(?:the\s+)?symbol|collect2:\s*error:|cannot find\s+-l|(?:ld|as):.*\bfatal error:|(?:ld|as):.*\berror:)/i.test(trimmed)) return;
+    const symbol = linkerSymbolFromDiagnostic(trimmed);
+    const location = symbol ? linkerSourceLocation(sourceText, symbol, linkerFunction) : null;
+    diagnostics.push({severity: "error", file: location ? sourceName : "",
+      line: location?.line || null, column: location?.column || 1,
+      message: trimmed, outputLine: index + 1, kind: "linker",
+      inferred: Boolean(location)});
+  });
+  return diagnostics;
+}
+
+function renderDiagnostics(entries, heading = "Source diagnostics") {
+  const container = $("#diagnostics");
+  if (!container) return;
+  if (!entries.length) {
+    clearDiagnostics();
+    return;
+  }
+  const shown = entries.slice(0, 40);
+  const remaining = entries.length - shown.length;
+  container.hidden = false;
+  container.innerHTML = `<div class="diagnostics-header">${escapeHtml(heading)} · ${entries.length}</div><div class="diagnostics-list">${shown.map((entry, index) => {
+    const location = entry.line
+      ? `${entry.file ? `${entry.file}:` : ""}${entry.line}:${entry.column || 1}`
+      : entry.kind === "linker" ? "linker" : "source";
+    const content = `<span class="diagnostic-location">${escapeHtml(location)}</span><span class="diagnostic-message">${escapeHtml(entry.message)}</span>`;
+    if (!entry.line) return `<div class="diagnostic-item ${escapeHtml(entry.severity || "error")}">${content}</div>`;
+    const title = entry.inferred ? "Jump to the inferred source location" : "Jump to source location";
+    return `<button type="button" class="diagnostic-item ${escapeHtml(entry.severity || "error")}" data-diagnostic-index="${index}" title="${title}">${content}</button>`;
+  }).join("")}${remaining > 0 ? `<div class="diagnostic-message">… and ${remaining} more diagnostics</div>` : ""}</div>`;
+  container.querySelectorAll("[data-diagnostic-index]").forEach(button => {
+    button.onclick = () => {
+      const entry = shown[Number(button.dataset.diagnosticIndex)];
+      if (entry?.line) jumpToSourcePosition(entry.line, entry.column);
+    };
+  });
+}
+
+function setDiagnostics(entries, heading = "Source diagnostics") {
+  renderDiagnostics(entries, heading);
+}
+
 function scaffoldEditsAllowed() {
   return !scaffoldProtectionEnabled || scaffoldEditAuthorized;
 }
@@ -517,6 +736,192 @@ function validateSimulationScaffold(text) {
     }
   }
   return issues;
+}
+
+const INTEGER_REGISTER_ALIASES = {
+  zero: "x0", ra: "x1", sp: "x2", gp: "x3", tp: "x4",
+  t0: "x5", t1: "x6", t2: "x7", s0: "x8", fp: "x8", s1: "x9",
+  a0: "x10", a1: "x11", a2: "x12", a3: "x13", a4: "x14", a5: "x15",
+  a6: "x16", a7: "x17", s2: "x18", s3: "x19", s4: "x20", s5: "x21",
+  s6: "x22", s7: "x23", s8: "x24", s9: "x25", s10: "x26", s11: "x27",
+  t3: "x28", t4: "x29", t5: "x30", t6: "x31"
+};
+const FLOAT_REGISTER_ALIASES = {
+  ft0: "f0", ft1: "f1", ft2: "f2", ft3: "f3", ft4: "f4", ft5: "f5",
+  ft6: "f6", ft7: "f7", fs0: "f8", fs1: "f9", fa0: "f10", fa1: "f11",
+  fa2: "f12", fa3: "f13", fa4: "f14", fa5: "f15", fa6: "f16", fa7: "f17",
+  fs2: "f18", fs3: "f19", fs4: "f20", fs5: "f21", fs6: "f22", fs7: "f23",
+  fs8: "f24", fs9: "f25", fs10: "f26", fs11: "f27", ft8: "f28", ft9: "f29",
+  ft10: "f30", ft11: "f31"
+};
+
+function splitAssemblyOperands(text) {
+  const operands = [];
+  let token = "";
+  let depth = 0;
+  for (const character of String(text || "")) {
+    if (character === "(") depth += 1;
+    if (character === ")") depth = Math.max(0, depth - 1);
+    if (character === "," && depth === 0) {
+      operands.push(token.trim());
+      token = "";
+    } else token += character;
+  }
+  if (token.trim() || operands.length) operands.push(token.trim());
+  return operands;
+}
+
+function parseAssemblyLine(rawLine, lineNumber) {
+  let code = String(rawLine).split("#", 1)[0].trim();
+  const labels = [];
+  const labelPattern = /^([A-Za-z_.$][\w.$]*)\s*:\s*/;
+  while (code) {
+    const label = code.match(labelPattern);
+    if (!label) break;
+    labels.push(label[1]);
+    code = code.slice(label[0].length).trimStart();
+  }
+  if (!code || code.startsWith(".")) return {line: lineNumber, labels, instruction: null};
+  const match = code.match(/^([A-Za-z][A-Za-z0-9_.]*)(?:\s+(.*))?$/);
+  if (!match) return {line: lineNumber, labels, instruction: null, malformed: code};
+  return {
+    line: lineNumber,
+    labels,
+    instruction: {mnemonic: match[1].toLowerCase(), operandsText: match[2] || ""}
+  };
+}
+
+function canonicalRegister(token) {
+  const value = String(token || "").trim().toLowerCase();
+  if (INTEGER_REGISTER_ALIASES[value]) return INTEGER_REGISTER_ALIASES[value];
+  if (FLOAT_REGISTER_ALIASES[value]) return FLOAT_REGISTER_ALIASES[value];
+  const integer = value.match(/^x(\d+)$/);
+  if (integer && Number(integer[1]) < 32) return `x${Number(integer[1])}`;
+  const floating = value.match(/^f(\d+)$/);
+  if (floating && Number(floating[1]) < 32) return `f${Number(floating[1])}`;
+  return null;
+}
+
+function registerTokens(text) {
+  const pattern = /\b(?:x\d+|f\d+|zero|ra|sp|gp|tp|fp|[ast]\d+|f[tsa]\d+)\b/gi;
+  return [...String(text || "").matchAll(pattern)].map(match => ({token: match[0], index: match.index}));
+}
+
+function instructionTemplateOperandCount(entry) {
+  const sample = String(entry.template || "").replace(/\{\d+\}/g, "x1");
+  const operandText = sample.replace(/^[^\s]+\s*/, "");
+  return operandText ? splitAssemblyOperands(operandText).length : 0;
+}
+
+function numericTokens(text) {
+  return splitAssemblyOperands(text).flatMap(operand => operand
+    .split(/[\s()]+/).map(token => token.trim()).filter(token =>
+      /^[-+]?(?:0x[0-9a-f]+|0b[01]+|0o[0-7]+|\d+)$/i.test(token)));
+}
+
+function numericValue(token) {
+  try {
+    const value = String(token).trim();
+    const sign = value.startsWith("-") ? -1 : 1;
+    const unsigned = value.replace(/^[+-]/, "");
+    return sign * Number(BigInt(unsigned));
+  } catch (_error) {
+    return null;
+  }
+}
+
+function immediateConstraint(mnemonic, value) {
+  if (value === null || mnemonic.startsWith("c.")) return null;
+  if (/^(?:slli|srli|srai)$/.test(mnemonic)) return {min: 0, max: 31, label: "shift amount"};
+  if (/^csr(?:rw|rs|rc)i$/.test(mnemonic)) return {min: 0, max: 31, label: "CSR immediate"};
+  if (/^(?:beq|bne|blt|bge|bltu|bgeu)$/.test(mnemonic)) {
+    return {min: -4096, max: 4094, alignment: 2, label: "branch offset"};
+  }
+  if (/^(?:jal)$/.test(mnemonic)) {
+    return {min: -1048576, max: 1048574, alignment: 2, label: "jump offset"};
+  }
+  if (/^(?:lui|auipc)$/.test(mnemonic)) return {min: -524288, max: 1048575, label: "upper immediate"};
+  if (/^(?:addi|slti|sltiu|xori|ori|andi|jalr|lb|lh|lw|lbu|lhu|sb|sh|sw|flw|fld|fsw|fsd)$/.test(mnemonic)) {
+    return {min: -2048, max: 2047, label: "immediate"};
+  }
+  return null;
+}
+
+function validateProgramSource(text) {
+  const parsedLines = String(text).split(/\r?\n/)
+    .map((line, index) => parseAssemblyLine(line, index + 1));
+  const labels = new Map();
+  const errors = [];
+  parsedLines.forEach(parsed => parsed.labels.forEach(label => {
+    if (labels.has(label)) {
+      errors.push({severity: "error", line: parsed.line, column: 1,
+        message: `Duplicate label “${label}”.`, kind: "validation"});
+    } else labels.set(label, parsed.line);
+  }));
+
+  parsedLines.forEach(parsed => {
+    if (parsed.malformed) {
+      errors.push({severity: "error", line: parsed.line, column: 1,
+        message: "Could not parse this assembly statement.", kind: "validation"});
+      return;
+    }
+    if (!parsed.instruction) return;
+    const {mnemonic, operandsText} = parsed.instruction;
+    const allMatches = RISCV_OPCODE_CATALOG.filter(entry => entry.mnemonic.toLowerCase() === mnemonic);
+    const enabledMatches = activeOpcodeCandidates(mnemonic).filter(entry =>
+      entry.mnemonic.toLowerCase() === mnemonic);
+    if (!enabledMatches.length) {
+      const reason = allMatches.length
+        ? `Opcode “${mnemonic}” is not enabled by the active ISA.`
+        : `Unknown opcode “${mnemonic}”.`;
+      errors.push({severity: "error", line: parsed.line, column: 1, message: reason, kind: "validation"});
+      return;
+    }
+    const entry = enabledMatches[0];
+    const operands = splitAssemblyOperands(operandsText);
+    const expected = instructionTemplateOperandCount(entry);
+    const acceptsSymbolBaseForm = /^(?:l[bhwd]|fl[wd]|s[bhwd]|fs[wd])$/.test(mnemonic)
+      && operands.length === 3 && canonicalRegister(operands[2]);
+    if (operands.length !== expected && !acceptsSymbolBaseForm) {
+      errors.push({severity: "error", line: parsed.line, column: 1,
+        message: `${mnemonic} expects ${expected}${acceptsSymbolBaseForm ? " or 3" : ""} operand${expected === 1 ? "" : "s"}; found ${operands.length}.`,
+        kind: "validation"});
+    }
+
+    registerTokens(operandsText).forEach(({token, index}) => {
+      const canonical = canonicalRegister(token);
+      if (canonical) return;
+      errors.push({severity: "error", line: parsed.line,
+        column: Math.max(1, String(text).split(/\r?\n/)[parsed.line - 1].indexOf(token) + 1),
+        message: `Invalid register “${token}”. Register numbers must be x0–x31 or f0–f31.`,
+        kind: "validation"});
+    });
+
+    const numbers = numericTokens(operandsText);
+    const range = immediateConstraint(mnemonic, numericValue(numbers[numbers.length - 1]));
+    if (range && numbers.length) {
+      const value = numericValue(numbers[numbers.length - 1]);
+      if (value < range.min || value > range.max) {
+        errors.push({severity: "error", line: parsed.line, column: 1,
+          message: `${range.label} ${value} is outside ${range.min}…${range.max}.`, kind: "validation"});
+      } else if (range.alignment && value % range.alignment !== 0) {
+        errors.push({severity: "error", line: parsed.line, column: 1,
+          message: `${range.label} must be aligned to ${range.alignment} bytes.`, kind: "validation"});
+      }
+    }
+
+    if (entry.operands.some(operand => operand.kind === "label") && operands.length) {
+      const target = operands[operands.length - 1].trim().replace(/[()]/g, "");
+      const targetMatch = target.match(/^([A-Za-z_.$][\w.$]*)/);
+      if (targetMatch && !canonicalRegister(targetMatch[1])
+          && !/^[-+]?(?:0x[0-9a-f]+|0b[01]+|0o[0-7]+|\d+)$/i.test(targetMatch[1])
+          && !labels.has(targetMatch[1])) {
+        errors.push({severity: "error", line: parsed.line, column: 1,
+          message: `Label “${targetMatch[1]}” is not defined in this source.`, kind: "validation"});
+      }
+    }
+  });
+  return errors;
 }
 
 function refreshScaffoldProtectionUi() {
@@ -687,6 +1092,12 @@ function highlightSourceLine(lineNumber) {
   scrollEditorToLine(selectedSourceLine);
 }
 
+function clearSourceLineHighlight() {
+  if (selectedSourceLine === null) return;
+  selectedSourceLine = null;
+  syncEditor();
+}
+
 async function loadProjects() {
   const data = await api("/api/projects");
   const heading = document.querySelector(".project-panel-header h2");
@@ -710,7 +1121,10 @@ async function resolveUnsavedProject(action) {
     alternateValue: "discard",
     cancelLabel: "Cancel"
   });
-  if (choice === "discard") return true;
+  if (choice === "discard") {
+    clearLocalDraft(current.name);
+    return true;
+  }
   if (choice !== "save") return false;
   try {
     await save();
@@ -732,6 +1146,28 @@ async function openProject(name, {skipUnsavedCheck = false} = {}) {
     api("/api/project?name=" + encodedName),
     api("/api/symbols?name=" + encodedName).catch(() => ({symbols: []}))
   ]);
+  const localDraft = readLocalDraft(name);
+  let recoveredDraft = null;
+  if (localDraft && localDraft.text !== opened.text) {
+    const timestamp = new Date(localDraft.timestamp).toLocaleString();
+    const choice = await actionDialog({
+      title: "Recover local draft?",
+      message: `ASE Studio found a local draft for “${name}” saved ${timestamp}. Recover it instead of the saved source?`,
+      confirmLabel: "Recover",
+      confirmValue: "recover",
+      alternateLabel: "Discard draft",
+      alternateValue: "discard",
+      cancelLabel: "Cancel"
+    });
+    if (choice === null) {
+      await loadProjects();
+      return false;
+    }
+    if (choice === "recover") recoveredDraft = localDraft;
+    else clearLocalDraft(name);
+  } else if (localDraft) {
+    clearLocalDraft(name);
+  }
   opened.dataSymbols = symbolData.symbols || [];
   opened.initialMemory = symbolData.initialMemory || {};
   opened.memoryMap = symbolData.memoryMap || [];
@@ -750,12 +1186,15 @@ async function openProject(name, {skipUnsavedCheck = false} = {}) {
   searchMatchIndex = -1;
   $("#project-title").textContent = current.name;
   $("#source-name").textContent = current.sourceName;
-  $("#body").value = current.text;
+  $("#body").value = recoveredDraft ? recoveredDraft.text : current.text;
   resetScaffoldProtection();
   resetEditorHistory();
   savedSource = current.text;
-  sourceDirty = false;
+  sourceDirty = Boolean(recoveredDraft);
   updateDirtyIndicator();
+  setDraftStatus(recoveredDraft
+    ? `Recovered draft · ${new Date(recoveredDraft.timestamp).toLocaleTimeString()}` : "");
+  clearDiagnostics();
   $("#save").disabled = false;
   $("#duplicate").disabled = false;
   $("#open-with").disabled = false;
@@ -779,6 +1218,10 @@ async function openProject(name, {skipUnsavedCheck = false} = {}) {
   await loadProjects();
   lastNormalLog = "";
   lastAdvancedLog = lastNormalLog;
+  if (recoveredDraft) {
+    lastNormalLog = `Recovered a local draft for ${current.sourceName}. Save it when you are ready.`;
+    lastAdvancedLog = lastNormalLog;
+  }
   updateLog();
   showTab("output");
   return true;
@@ -796,6 +1239,8 @@ async function save() {
   savedSource = $("#body").value;
   sourceDirty = false;
   updateDirtyIndicator();
+  clearLocalDraft(current.name);
+  clearSourceLineHighlight();
   lastNormalLog = "Saved " + current.sourceName + ".";
   lastAdvancedLog = lastNormalLog;
   updateLog();
@@ -834,6 +1279,7 @@ async function renameCurrentProject() {
   try {
     const oldWatchKey = memoryWatchStorageKey(oldName);
     const savedWatches = oldWatchKey ? localStorage.getItem(oldWatchKey) : null;
+    const savedDraft = readLocalDraft(oldName);
     const result = await api("/api/projects", {
       method: "PATCH",
       headers: {"Content-Type": "application/json"},
@@ -843,6 +1289,10 @@ async function renameCurrentProject() {
     if (savedWatches !== null) {
       localStorage.setItem(memoryWatchStorageKey(result.name), savedWatches);
       localStorage.removeItem(oldWatchKey);
+    }
+    if (savedDraft) {
+      localStorage.setItem(draftStorageKey(result.name), JSON.stringify(savedDraft));
+      localStorage.removeItem(draftStorageKey(oldName));
     }
     updateDirtyIndicator();
     await loadProjects();
@@ -1069,6 +1519,12 @@ async function prepareSubmission() {
     }
     lastNormalLog = result.output;
     lastAdvancedLog = result.advancedOutput || result.output;
+    if (currentWasSelected && current?.name === submittedProjectName) {
+      const diagnostics = parseCompilerDiagnostics(lastAdvancedLog);
+      setDiagnostics(diagnostics, diagnostics.some(item => item.severity === "error")
+        ? "Compiler diagnostics" : "Compiler messages");
+      if (!sourceDirty) clearLocalDraft(current.name);
+    }
     updateLog();
     if (result.ok && result.archive) {
       try {
@@ -1124,8 +1580,31 @@ async function prepareSubmission() {
   }
 }
 
+function renderLogOutput(log) {
+  const output = $("#output");
+  if (!output) return;
+  const text = String(log || "");
+  const diagnostics = parseCompilerDiagnostics(text);
+  const byLine = new Map(diagnostics.filter(entry => entry.outputLine)
+    .map(entry => [entry.outputLine, entry]));
+  output.innerHTML = text.split(/\r?\n/).map((line, index) => {
+    const diagnostic = byLine.get(index + 1);
+    const content = escapeHtml(line) || "&#8203;";
+    if (diagnostic?.line) {
+      return `<button type="button" class="log-diagnostic ${escapeHtml(diagnostic.severity || "error")}" data-log-line="${index + 1}" title="Jump to ${escapeHtml(diagnostic.file || current?.sourceName || "source")} line ${diagnostic.line}">${content}</button>`;
+    }
+    return `<span class="log-line">${content}</span>`;
+  }).join("");
+  output.querySelectorAll("[data-log-line]").forEach(button => {
+    button.onclick = () => {
+      const entry = byLine.get(Number(button.dataset.logLine));
+      if (entry?.line) jumpToSourcePosition(entry.line, entry.column);
+    };
+  });
+}
+
 function updateLog() {
-  $("#output").textContent = $("#advanced-logs").checked ? lastAdvancedLog : lastNormalLog;
+  renderLogOutput($("#advanced-logs").checked ? lastAdvancedLog : lastNormalLog);
 }
 
 function showTab(tab) {
@@ -1151,17 +1630,14 @@ function resetPipelineViewport() {
 async function run(stepAfterRun = false) {
   if (!current) return;
   const source = $("#body").value;
+  const sourceIssues = validateProgramSource(source);
   const scaffoldIssues = validateSimulationScaffold(source);
-  if (scaffoldIssues.length) {
-    const hint = scaffoldProtectionEnabled
-      ? "Turn off Protect labels to edit protected lines."
-      : "Correct the required labels and exit block, then run again.";
-    lastNormalLog = `Cannot start simulation:\n${scaffoldIssues.map(issue => `• ${issue}`).join("\n")}\n\n${hint}`;
-    lastAdvancedLog = lastNormalLog;
-    updateLog();
-    showTab("output");
-    return;
-  }
+  const preRunIssues = [
+    ...sourceIssues,
+    ...scaffoldIssues.map(message => ({severity: "error", message, kind: "scaffold"}))
+  ];
+  clearDiagnostics();
+  clearSourceLineHighlight();
   if (!stepAfterRun) {
     stepMode = false;
     $("#step").textContent = "Run Step";
@@ -1190,8 +1666,18 @@ async function run(stepAfterRun = false) {
     savedSource = $("#body").value;
     sourceDirty = false;
     updateDirtyIndicator();
+    clearLocalDraft(current.name);
     lastNormalLog = result.output;
     lastAdvancedLog = result.advancedOutput || result.output;
+    const compilerDiagnostics = parseCompilerDiagnostics(lastAdvancedLog);
+    if (compilerDiagnostics.length) {
+      setDiagnostics(compilerDiagnostics, compilerDiagnostics.some(item => item.severity === "error")
+        ? "Compiler diagnostics" : "Compiler messages");
+    } else if (!result.ok && preRunIssues.length) {
+      setDiagnostics(preRunIssues.map(issue => ({...issue, severity: "warning"})), "Pre-run hints");
+    } else {
+      clearDiagnostics();
+    }
     updateLog();
     if (result.ok) {
       const trace = await api("/api/pipeline?name=" + encodeURIComponent(current.name));
@@ -1328,15 +1814,18 @@ function renderRegisters() {
   }
   const integerAbi = ["zero", "ra", "sp", "gp", "tp", "t0", "t1", "t2", "s0/fp", "s1", "a0", "a1", "a2", "a3", "a4", "a5", "a6", "a7", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10", "s11", "t3", "t4", "t5", "t6"];
   const floatAbi = ["ft0", "ft1", "ft2", "ft3", "ft4", "ft5", "ft6", "ft7", "fs0", "fs1", "fa0", "fa1", "fa2", "fa3", "fa4", "fa5", "fa6", "fa7", "fs2", "fs3", "fs4", "fs5", "fs6", "fs7", "fs8", "fs9", "fs10", "fs11", "ft8", "ft9", "ft10", "ft11"];
-  const renderColumn = (prefix, aliases, format, width) => aliases.map((alias, index) => {
+  const integerRoles = ["constant zero", "return address", "stack pointer", "global pointer", "thread pointer", "temporary", "temporary", "temporary", "saved register / frame pointer", "saved register", "argument / return value", "argument / return value", "argument / return value", "argument / return value", "argument / return value", "argument / return value", "argument / return value", "argument / return value", "saved register", "saved register", "saved register", "saved register", "saved register", "saved register", "saved register", "saved register", "saved register", "saved register", "temporary", "temporary", "temporary", "temporary"];
+  const floatRoles = ["temporary FP register", "temporary FP register", "temporary FP register", "temporary FP register", "temporary FP register", "temporary FP register", "temporary FP register", "temporary FP register", "saved FP register", "saved FP register", "FP argument / return value", "FP argument / return value", "FP argument / return value", "FP argument / return value", "FP argument / return value", "FP argument / return value", "FP argument / return value", "FP argument / return value", "saved FP register", "saved FP register", "saved FP register", "saved FP register", "saved FP register", "saved FP register", "saved FP register", "saved FP register", "saved FP register", "saved FP register", "temporary FP register", "temporary FP register", "temporary FP register", "temporary FP register"];
+  const renderColumn = (prefix, aliases, roles, format, width) => aliases.map((alias, index) => {
     const name = `${prefix}${index}`;
-    return `<div class="register-value${changed.has(name) ? " changed" : ""}" data-register-change="${name}"><strong>${name}</strong><span>${alias}</span><code>${formatWordValue(state[name] || 0, format, width)}</code></div>`;
+    const label = `${name} / ${alias.replace("/", " / ")} — ${roles[index] || "register"}`;
+    return `<div class="register-value${changed.has(name) ? " changed" : ""}" data-register-change="${name}" title="${escapeHtml(label)}" aria-label="${escapeHtml(label)}"><strong>${name}</strong><span>${escapeHtml(alias)}</span><code>${formatWordValue(state[name] || 0, format, width)}</code></div>`;
   }).join("");
   $("#pipeline-pc").textContent = `PC ${pc}`;
   $("#pipeline-pc").classList.toggle("changed", pcChanged);
   const floatWidth = pipelineData.configuration?.floatingPointPrecision === "double" ? 64 : 32;
-  integerContainer.innerHTML = renderColumn("x", integerAbi, $("#integer-register-format").value, 32);
-  floatContainer.innerHTML = renderColumn("f", floatAbi, $("#float-register-format").value, floatWidth);
+  integerContainer.innerHTML = renderColumn("x", integerAbi, integerRoles, $("#integer-register-format").value, 32);
+  floatContainer.innerHTML = renderColumn("f", floatAbi, floatRoles, $("#float-register-format").value, floatWidth);
 }
 
 async function runStep() {
@@ -2481,6 +2970,10 @@ async function openEnvironmentSettings() {
 }
 
 function clearCurrentProject() {
+  if (draftSaveTimer !== null) {
+    clearTimeout(draftSaveTimer);
+    draftSaveTimer = null;
+  }
   current = null;
   clearOpcodeSnippetSession();
   closeOpcodePopup();
@@ -2493,6 +2986,8 @@ function clearCurrentProject() {
   savedSource = "";
   sourceDirty = false;
   updateDirtyIndicator();
+  setDraftStatus();
+  clearDiagnostics();
   $("#project-title").textContent = "Open a project";
   $("#source-name").textContent = "Assembly Editor";
   $("#body").value = "";
@@ -2538,6 +3033,7 @@ async function deleteCurrentProject() {
       body: JSON.stringify({name, confirmation})
     });
     localStorage.removeItem(memoryWatchStorageKey(name));
+    clearLocalDraft(name);
     clearCurrentProject();
     lastNormalLog = `Deleted project ${name}. Generated results were kept.`;
     lastAdvancedLog = lastNormalLog;
@@ -2558,7 +3054,10 @@ function applyEditorChange(start, end, replacement, selectionStart, selectionEnd
   pendingEditorViewport = null;
   editor.value = editor.value.slice(0, start) + replacement + editor.value.slice(end);
   markSourceEdited();
+  scheduleLocalDraft();
+  clearDiagnostics();
   refreshScaffoldProtectionUi();
+  selectedSourceLine = null;
   syncEditor();
   editor.setSelectionRange(selectionStart, selectionEnd);
   restoreEditorViewport(viewport);
@@ -2613,7 +3112,10 @@ $("#body").addEventListener("input", () => {
   pendingEditorSnapshot = null;
   pendingEditorViewport = null;
   markSourceEdited();
+  scheduleLocalDraft();
+  clearDiagnostics();
   refreshScaffoldProtectionUi();
+  selectedSourceLine = null;
   syncEditor();
   restoreEditorViewport(viewport);
   updateOpcodePopup();
@@ -3124,6 +3626,7 @@ document.addEventListener("keydown", event => {
   }
 }, true);
 window.aseHasUnsavedChanges = () => sourceDirty;
+window.addEventListener("beforeunload", writeLocalDraft);
 
 const splitter = $("#splitter");
 splitter.addEventListener("pointerdown", event => {

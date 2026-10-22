@@ -209,6 +209,10 @@ const RISCV_OPCODE_CATALOG = (() => {
     [intReg("destination", "x1"), target()], "Load address pseudo-instruction");
   pseudo("mv", "rd, rs1", "mv {0}, {1}",
     [intReg("destination", "x1"), intReg("source", "x2")], "Register move pseudo-instruction");
+  pseudo("fmv.s", "fd, fs1", "fmv.s {0}, {1}",
+    [floatReg("destination", "f1"), floatReg("source", "f2")], "Single-precision floating-point move pseudo-instruction");
+  pseudo("fmv.d", "fd, fs1", "fmv.d {0}, {1}",
+    [floatReg("destination", "f1"), floatReg("source", "f2")], "Double-precision floating-point move pseudo-instruction");
   pseudo("not", "rd, rs1", "not {0}, {1}",
     [intReg("destination", "x1"), intReg("source", "x2")], "Bitwise-not pseudo-instruction");
   pseudo("neg", "rd, rs1", "neg {0}, {1}",
