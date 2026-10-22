@@ -44,6 +44,9 @@ let memoryPopoutWindow = null;
 let pipelinePaintFrame = null;
 let pipelineResizeObserver = null;
 let changeContextMenu = null;
+let opcodePopupState = null;
+let opcodeSnippetSession = null;
+let opcodePopupSuppressed = false;
 const memoryWindowChannel = "BroadcastChannel" in window
   ? new BroadcastChannel("ase-studio-memory-window") : null;
 
@@ -139,6 +142,8 @@ function resetEditorHistory() {
 
 function restoreEditorSnapshot(snapshot) {
   if (!snapshot) return;
+  clearOpcodeSnippetSession();
+  closeOpcodePopup();
   const editor = $("#body");
   const viewport = editorViewport();
   applyingEditorHistory = true;
@@ -153,12 +158,16 @@ function restoreEditorSnapshot(snapshot) {
 
 function undoEditor() {
   if (!current || !undoStack.length) return;
+  clearOpcodeSnippetSession();
+  closeOpcodePopup();
   redoStack.push(editorSnapshot());
   restoreEditorSnapshot(undoStack.pop());
 }
 
 function redoEditor() {
   if (!current || !redoStack.length) return;
+  clearOpcodeSnippetSession();
+  closeOpcodePopup();
   undoStack.push(editorSnapshot());
   restoreEditorSnapshot(redoStack.pop());
 }
@@ -229,6 +238,207 @@ function escapeHtml(text) {
   return String(text).replace(/[&<>"']/g, character => ({
     "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
   })[character]);
+}
+
+function closeOpcodePopup({suppress = false} = {}) {
+  opcodePopupState = null;
+  if (suppress) opcodePopupSuppressed = true;
+  const popup = $("#opcode-popup");
+  if (popup) popup.hidden = true;
+}
+
+function clearOpcodeSnippetSession() {
+  opcodeSnippetSession = null;
+}
+
+function opcodeContext(editor = $("#body")) {
+  if (!current || !editor || editor.selectionStart !== editor.selectionEnd) return null;
+  const caret = editor.selectionStart;
+  const lineStart = caret > 0 ? editor.value.lastIndexOf("\n", caret - 1) + 1 : 0;
+  const lineEndIndex = editor.value.indexOf("\n", caret);
+  const lineEnd = lineEndIndex < 0 ? editor.value.length : lineEndIndex;
+  const beforeCaret = editor.value.slice(lineStart, caret);
+  const afterCaret = editor.value.slice(caret, lineEnd);
+  const codeBeforeCaret = beforeCaret.split("#", 1)[0];
+  const codeAfterCaret = afterCaret.split("#", 1)[0];
+  if (codeAfterCaret.trim()) return null;
+  const match = codeBeforeCaret.match(/^(\s*)(?:[A-Za-z_.$][\w.$]*:\s*)?([A-Za-z][A-Za-z0-9_.]*)$/);
+  if (!match || match[2].startsWith(".")) return null;
+  const tokenStart = lineStart + codeBeforeCaret.length - match[2].length;
+  const tokenEnd = tokenStart + match[2].length;
+  if (editTouchesProtected(editor.value, tokenStart, tokenEnd)) return null;
+  return {
+    prefix: match[2].toLowerCase(), tokenStart, tokenEnd,
+    lineNumber: editor.value.slice(0, lineStart).split("\n").length,
+    linePrefix: codeBeforeCaret
+  };
+}
+
+function opcodeExtensionEnabled(entry) {
+  if (entry.extension === "Pseudo") return true;
+  const extensions = new Set((current?.isa?.extensions
+    || ["i", "m", "a", "f", "zicsr", "zifencei"])
+    .map(extension => extension.toLowerCase()));
+  return extensions.has(entry.extension.toLowerCase());
+}
+
+function activeOpcodeCandidates(prefix) {
+  return RISCV_OPCODE_CATALOG
+    .filter(entry => opcodeExtensionEnabled(entry)
+      && entry.mnemonic.toLowerCase().startsWith(prefix));
+}
+
+function opcodeExtensionLabel(extension) {
+  return extension === "Pseudo" ? "pseudo" : extension;
+}
+
+function renderOpcodePopup() {
+  const popup = $("#opcode-popup");
+  if (!popup || !opcodePopupState) return;
+  const {context, matches, selectedIndex} = opcodePopupState;
+  $("#opcode-popup-isa").textContent = `ISA ${(current?.isa?.march || "rv32imaf_zicsr_zifencei").toUpperCase()} · ABI ${current?.isa?.abi || "ilp32"}`;
+  $("#opcode-popup-filter").textContent = `Filter: ${context.prefix}`;
+  const list = $("#opcode-popup-list");
+  if (!matches.length) {
+    list.innerHTML = `<div class="opcode-empty">No enabled instruction matches “${escapeHtml(context.prefix)}”.</div>`;
+  } else {
+    list.innerHTML = matches.map((entry, index) => `
+      <button type="button" class="opcode-option" role="option" data-opcode-index="${index}"
+        aria-selected="${index === selectedIndex ? "true" : "false"}">
+        <code>${escapeHtml(entry.mnemonic)}</code>
+        <span class="opcode-syntax">${escapeHtml(entry.syntax)}</span>
+        <span class="opcode-extension">${escapeHtml(opcodeExtensionLabel(entry.extension))}</span>
+        <span class="opcode-description">${escapeHtml(entry.description || "")}</span>
+      </button>`).join("");
+  }
+  popup.hidden = false;
+  positionOpcodePopup();
+}
+
+function positionOpcodePopup() {
+  const popup = $("#opcode-popup");
+  const editor = $("#body");
+  const wrap = document.querySelector(".editor-wrap");
+  const area = document.querySelector(".editor-area");
+  const context = opcodePopupState?.context;
+  if (!popup || popup.hidden || !editor || !wrap || !area || !context) return;
+  const line = document.querySelector(`#highlight .source-line[data-line="${context.lineNumber}"]`);
+  if (!line) return;
+  const lineRect = line.getBoundingClientRect();
+  const wrapRect = wrap.getBoundingClientRect();
+  const font = getComputedStyle(editor);
+  const canvas = positionOpcodePopup.canvas
+    || (positionOpcodePopup.canvas = document.createElement("canvas"));
+  const context2d = canvas.getContext("2d");
+  context2d.font = font.font;
+  const left = lineRect.left - wrapRect.left
+    + Math.min(context2d.measureText(context.linePrefix).width, Math.max(0, wrap.clientWidth - 120));
+  const lineTop = lineRect.top - wrapRect.top;
+  let top = lineRect.bottom - wrapRect.top + 4;
+  const minLeft = 10;
+  const maxLeft = Math.max(minLeft, wrap.clientWidth - popup.offsetWidth - 10);
+  const visibleTop = area.scrollTop + 8;
+  const visibleBottom = area.scrollTop + area.clientHeight - 8;
+  if (top + popup.offsetHeight > visibleBottom && lineTop - popup.offsetHeight - 4 >= visibleTop) {
+    top = lineTop - popup.offsetHeight - 4;
+  }
+  popup.style.left = `${Math.min(maxLeft, Math.max(minLeft, left))}px`;
+  popup.style.top = `${Math.max(visibleTop, top)}px`;
+}
+
+function updateOpcodePopup() {
+  if (!current || opcodePopupSuppressed) return closeOpcodePopup();
+  const context = opcodeContext();
+  if (!context) return closeOpcodePopup();
+  const matches = activeOpcodeCandidates(context.prefix);
+  const previousMnemonic = opcodePopupState?.matches?.[opcodePopupState.selectedIndex]?.mnemonic;
+  let selectedIndex = matches.findIndex(entry => entry.mnemonic === previousMnemonic);
+  if (selectedIndex < 0) selectedIndex = 0;
+  opcodePopupState = {context, matches, selectedIndex};
+  renderOpcodePopup();
+}
+
+function selectOpcodeSuggestion(delta) {
+  if (!opcodePopupState?.matches.length) return;
+  const count = opcodePopupState.matches.length;
+  opcodePopupState.selectedIndex = (opcodePopupState.selectedIndex + delta + count) % count;
+  renderOpcodePopup();
+}
+
+function instantiateOpcode(entry) {
+  const fields = [];
+  const pattern = /\{(\d+)\}/g;
+  let output = "";
+  let cursor = 0;
+  let match;
+  while ((match = pattern.exec(entry.template))) {
+    output += entry.template.slice(cursor, match.index);
+    const fieldIndex = Number(match[1]);
+    const value = entry.operands[fieldIndex]?.placeholder || "";
+    const start = output.length;
+    output += value;
+    fields.push({
+      start, end: output.length,
+      role: entry.operands[fieldIndex]?.role || "operand"
+    });
+    cursor = match.index + match[0].length;
+  }
+  output += entry.template.slice(cursor);
+  return {text: output, fields};
+}
+
+function completeOpcodeSuggestion() {
+  if (!opcodePopupState) return;
+  const editor = $("#body");
+  const {context, matches, selectedIndex} = opcodePopupState;
+  const entry = matches[selectedIndex];
+  if (!entry || editTouchesProtected(editor.value, context.tokenStart, context.tokenEnd)) return;
+  const snippet = instantiateOpcode(entry);
+  const viewport = editorViewport();
+  const absoluteFields = snippet.fields.map(field => ({
+    start: context.tokenStart + field.start,
+    end: context.tokenStart + field.end,
+    role: field.role
+  }));
+  const first = absoluteFields[0];
+  const caret = context.tokenStart + snippet.text.length;
+  applyEditorChange(context.tokenStart, context.tokenEnd, snippet.text,
+    first?.start ?? caret, first?.end ?? caret, viewport);
+  opcodePopupSuppressed = false;
+  closeOpcodePopup();
+  opcodeSnippetSession = absoluteFields.length
+    ? {fields: absoluteFields, index: 0} : null;
+  if (first) editor.setSelectionRange(first.start, first.end);
+}
+
+function moveOpcodeSnippet(delta) {
+  const session = opcodeSnippetSession;
+  const editor = $("#body");
+  if (!session || !editor) return false;
+  const next = session.index + delta;
+  if (next < 0 || next >= session.fields.length) {
+    const currentField = session.fields[session.index];
+    const caret = delta > 0 ? currentField.end : currentField.start;
+    editor.setSelectionRange(caret, caret);
+    clearOpcodeSnippetSession();
+    return true;
+  }
+  session.index = next;
+  const field = session.fields[next];
+  editor.setSelectionRange(field.start, field.end);
+  return true;
+}
+
+function handleOpcodeSelectionChange() {
+  const editor = $("#body");
+  if (!editor || document.activeElement !== editor) return;
+  if (opcodeSnippetSession) {
+    const field = opcodeSnippetSession.fields[opcodeSnippetSession.index];
+    if (!field || editor.selectionStart !== field.start || editor.selectionEnd !== field.end) {
+      clearOpcodeSnippetSession();
+    }
+  }
+  if (!opcodeSnippetSession) updateOpcodePopup();
 }
 
 function updateDirtyIndicator() {
@@ -457,6 +667,7 @@ function syncEditor() {
     editorArea.scrollTop = savedScrollTop;
     editorArea.scrollLeft = savedScrollLeft;
   }
+  if (opcodePopupState) positionOpcodePopup();
 }
 
 function scrollEditorToLine(lineNumber) {
@@ -525,6 +736,9 @@ async function openProject(name, {skipUnsavedCheck = false} = {}) {
   opened.initialMemory = symbolData.initialMemory || {};
   opened.memoryMap = symbolData.memoryMap || [];
   current = opened;
+  clearOpcodeSnippetSession();
+  closeOpcodePopup();
+  opcodePopupSuppressed = false;
   loadMemoryWatches();
   selectedSourceLine = null;
   selectedRow = null;
@@ -2268,6 +2482,9 @@ async function openEnvironmentSettings() {
 
 function clearCurrentProject() {
   current = null;
+  clearOpcodeSnippetSession();
+  closeOpcodePopup();
+  opcodePopupSuppressed = false;
   scaffoldProtectionEnabled = true;
   scaffoldEditAuthorized = false;
   updateScaffoldProtectionUi();
@@ -2360,6 +2577,8 @@ function editTouchesProtected(text, start, end) {
 
 $("#body").addEventListener("beforeinput", event => {
   if (!current) return;
+  clearOpcodeSnippetSession();
+  opcodePopupSuppressed = false;
   pendingEditorViewport = editorViewport();
   if (event.inputType === "historyUndo" || event.inputType === "historyRedo") {
     event.preventDefault();
@@ -2397,9 +2616,37 @@ $("#body").addEventListener("input", () => {
   refreshScaffoldProtectionUi();
   syncEditor();
   restoreEditorViewport(viewport);
+  updateOpcodePopup();
+});
+$("#body").addEventListener("blur", () => {
+  clearOpcodeSnippetSession();
+  closeOpcodePopup();
 });
 $("#body").addEventListener("keydown", event => {
-  if (event.key === "Tab" || event.key === "ISO_Left_Tab" || event.code === "Tab") {
+  const isTab = event.key === "Tab" || event.key === "ISO_Left_Tab" || event.code === "Tab";
+  if (isTab && opcodeSnippetSession) {
+    event.preventDefault();
+    moveOpcodeSnippet(event.shiftKey ? -1 : 1);
+    return;
+  }
+  if (isTab && !event.shiftKey && opcodePopupState?.matches.length) {
+    event.preventDefault();
+    completeOpcodeSuggestion();
+    return;
+  }
+  if (opcodePopupState && (event.key === "ArrowDown" || event.key === "ArrowUp")) {
+    event.preventDefault();
+    selectOpcodeSuggestion(event.key === "ArrowDown" ? 1 : -1);
+    return;
+  }
+  if (event.key === "Escape" && (opcodePopupState || opcodeSnippetSession)) {
+    event.preventDefault();
+    clearOpcodeSnippetSession();
+    closeOpcodePopup({suppress: true});
+    return;
+  }
+  clearOpcodeSnippetSession();
+  if (isTab) {
     event.preventDefault();
     const editor = event.target;
     const viewport = editorViewport();
@@ -2440,6 +2687,22 @@ $("#body").addEventListener("keydown", event => {
     const caret = start + replacement.length;
     applyEditorChange(start, end, replacement, caret, caret, viewport);
   }
+});
+document.addEventListener("selectionchange", handleOpcodeSelectionChange);
+$("#opcode-popup-close").addEventListener("mousedown", event => event.preventDefault());
+$("#opcode-popup-close").onclick = () => {
+  closeOpcodePopup({suppress: true});
+  $("#body").focus();
+};
+$("#opcode-popup-list").addEventListener("mousedown", event => {
+  if (event.target.closest(".opcode-option")) event.preventDefault();
+});
+$("#opcode-popup-list").addEventListener("click", event => {
+  const option = event.target.closest(".opcode-option");
+  if (!option || !opcodePopupState) return;
+  opcodePopupState.selectedIndex = Number(option.dataset.opcodeIndex);
+  completeOpcodeSuggestion();
+  $("#body").focus();
 });
 $("#save").onclick = save;
 $("#duplicate").onclick = duplicateCurrentProject;
@@ -2541,6 +2804,8 @@ document.addEventListener("keydown", event => {
   if (event.key === "Escape") closeChangeContextMenu();
 });
 window.addEventListener("resize", closeChangeContextMenu);
+document.querySelector(".editor-area").addEventListener("scroll", positionOpcodePopup);
+window.addEventListener("resize", positionOpcodePopup);
 $("#memory-symbol-form").onsubmit = event => {
   event.preventDefault();
   addMemoryWatch($("#memory-symbol").value);
@@ -2684,6 +2949,9 @@ $("#cpu-form").onsubmit = async event => {
       headers: {"Content-Type": "application/json"},
       body: JSON.stringify({name: current.name, config})
     });
+    const updatedProject = await api("/api/project?name=" + encodeURIComponent(current.name));
+    current.isa = updatedProject.isa || current.isa;
+    closeOpcodePopup();
     $("#cpu-dialog").close();
     lastNormalLog = "CPU configuration saved. It will be used on the next Run.";
     lastAdvancedLog = lastNormalLog;
