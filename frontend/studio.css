@@ -107,8 +107,8 @@ h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .05em; color: v
 .editor-wrap textarea, .editor-wrap pre { margin: 0; border: 0; padding: 10px 14px 10px 55px; width: 100%; min-height: 100%; font: inherit; line-height: var(--editor-line-height); letter-spacing: 0; word-spacing: 0; tab-size: 4; white-space: pre-wrap; overflow-wrap: normal; overflow: hidden; }
 .editor-wrap textarea { position: relative; resize: none; color: transparent; -webkit-text-fill-color: transparent; background: transparent; caret-color: #172235; z-index: 2; outline: 0; }
 .editor-wrap pre { position: absolute; inset: 0; pointer-events: none; z-index: 1; }
-.editor-wrap pre::before { content: attr(data-lines); position: absolute; left: 0; top: 10px; width: 43px; text-align: right; color: #94a3b8; border-right: 1px solid var(--line); padding-right: 8px; white-space: pre; }
-.source-line { display: block; min-height: var(--editor-line-height); margin-right: -14px; padding-right: 14px; }
+.source-line { position: relative; display: block; min-height: var(--editor-line-height); margin-right: -14px; padding-right: 14px; }
+.source-line::before { content: attr(data-line); position: absolute; left: -55px; top: 0; bottom: 0; width: 52px; box-sizing: border-box; padding-right: 8px; border-right: 1px solid var(--line); color: #94a3b8; text-align: right; white-space: pre; pointer-events: none; }
 .source-line.pipeline-selected { background: #fff3bf; box-shadow: inset 3px 0 #f59f00; }
 .source-line.protected { background: #eef2f7; color: #53657b; box-shadow: inset 3px 0 #94a3b8; }
 .comment { color: #8796a8; }

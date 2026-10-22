@@ -450,7 +450,6 @@ function syncEditor() {
       });
     });
   }
-  $("#highlight").dataset.lines = lines.map((_, index) => index + 1).join("\n");
   const lineHeight = parseFloat(getComputedStyle(document.documentElement)
     .getPropertyValue("--editor-line-height")) || 23;
   $("#body").style.height = Math.max(300, lines.length * lineHeight + 20) + "px";
