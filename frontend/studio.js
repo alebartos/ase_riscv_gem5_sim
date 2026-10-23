@@ -300,7 +300,7 @@ function renderOpcodePopup() {
   const popup = $("#opcode-popup");
   if (!popup || !opcodePopupState) return;
   const {context, matches, selectedIndex} = opcodePopupState;
-  $("#opcode-popup-isa").textContent = `ISA ${(current?.isa?.march || "rv32imaf_zicsr_zifencei").toUpperCase()} · ABI ${current?.isa?.abi || "ilp32"}`;
+  $("#opcode-popup-isa").textContent = `ISA ${(current?.isa?.march || "rv32imaf_zicsr_zifencei").toUpperCase()} · ABI ${current?.isa?.abi || "ilp32f"}`;
   $("#opcode-popup-filter").textContent = `Filter: ${context.prefix}`;
   const list = $("#opcode-popup-list");
   if (!matches.length) {
@@ -772,22 +772,33 @@ function splitAssemblyOperands(text) {
 }
 
 function parseAssemblyLine(rawLine, lineNumber) {
-  let code = String(rawLine).split("#", 1)[0].trim();
+  const sourceCode = String(rawLine).split("#", 1)[0];
+  let code = sourceCode.trim();
+  let codeOffset = sourceCode.search(/\S/);
   const labels = [];
   const labelPattern = /^([A-Za-z_.$][\w.$]*)\s*:\s*/;
   while (code) {
     const label = code.match(labelPattern);
     if (!label) break;
     labels.push(label[1]);
-    code = code.slice(label[0].length).trimStart();
+    code = code.slice(label[0].length);
+    codeOffset += label[0].length;
+    const leadingWhitespace = code.length - code.trimStart().length;
+    code = code.trimStart();
+    codeOffset += leadingWhitespace;
   }
   if (!code || code.startsWith(".")) return {line: lineNumber, labels, instruction: null};
   const match = code.match(/^([A-Za-z][A-Za-z0-9_.]*)(?:\s+(.*))?$/);
   if (!match) return {line: lineNumber, labels, instruction: null, malformed: code};
+  const operandsText = match[2] || "";
   return {
     line: lineNumber,
     labels,
-    instruction: {mnemonic: match[1].toLowerCase(), operandsText: match[2] || ""}
+    instruction: {
+      mnemonic: match[1].toLowerCase(),
+      operandsText,
+      operandsOffset: operandsText ? codeOffset + match[0].length - operandsText.length : null
+    }
   };
 }
 
@@ -848,8 +859,8 @@ function immediateConstraint(mnemonic, value) {
 }
 
 function validateProgramSource(text) {
-  const parsedLines = String(text).split(/\r?\n/)
-    .map((line, index) => parseAssemblyLine(line, index + 1));
+  const sourceLines = String(text).split(/\r?\n/);
+  const parsedLines = sourceLines.map((line, index) => parseAssemblyLine(line, index + 1));
   const labels = new Map();
   const errors = [];
   parsedLines.forEach(parsed => parsed.labels.forEach(label => {
@@ -892,7 +903,7 @@ function validateProgramSource(text) {
       const canonical = canonicalRegister(token);
       if (canonical) return;
       errors.push({severity: "error", line: parsed.line,
-        column: Math.max(1, String(text).split(/\r?\n/)[parsed.line - 1].indexOf(token) + 1),
+        column: Math.max(1, parsed.instruction.operandsOffset + index + 1),
         message: `Invalid register “${token}”. Register numbers must be x0–x31 or f0–f31.`,
         kind: "validation"});
     });
@@ -1585,19 +1596,35 @@ function renderLogOutput(log) {
   if (!output) return;
   const text = String(log || "");
   const diagnostics = parseCompilerDiagnostics(text);
-  const byLine = new Map(diagnostics.filter(entry => entry.outputLine)
-    .map(entry => [entry.outputLine, entry]));
+  const byLine = new Map();
+  diagnostics.filter(entry => entry.outputLine).forEach(entry => {
+    const entries = byLine.get(entry.outputLine) || [];
+    entries.push(entry);
+    byLine.set(entry.outputLine, entries);
+  });
+  const preferredDiagnostic = entries => {
+    const located = entries.filter(entry => entry.line);
+    const candidates = located.length ? located : entries;
+    const rank = {error: 0, warning: 1, note: 2};
+    return candidates.reduce((preferred, entry) => {
+      if (!preferred || (rank[entry.severity] ?? 3) < (rank[preferred.severity] ?? 3)) return entry;
+      return preferred;
+    }, null);
+  };
   output.innerHTML = text.split(/\r?\n/).map((line, index) => {
-    const diagnostic = byLine.get(index + 1);
+    const lineDiagnostics = byLine.get(index + 1) || [];
+    const diagnostic = preferredDiagnostic(lineDiagnostics);
     const content = escapeHtml(line) || "&#8203;";
     if (diagnostic?.line) {
-      return `<button type="button" class="log-diagnostic ${escapeHtml(diagnostic.severity || "error")}" data-log-line="${index + 1}" title="Jump to ${escapeHtml(diagnostic.file || current?.sourceName || "source")} line ${diagnostic.line}">${content}</button>`;
+      const count = lineDiagnostics.length > 1
+        ? ` (${lineDiagnostics.length} diagnostics on this output line)` : "";
+      return `<button type="button" class="log-diagnostic ${escapeHtml(diagnostic.severity || "error")}" data-log-line="${index + 1}" title="Jump to ${escapeHtml(diagnostic.file || current?.sourceName || "source")} line ${diagnostic.line}${count}">${content}</button>`;
     }
     return `<span class="log-line">${content}</span>`;
   }).join("");
   output.querySelectorAll("[data-log-line]").forEach(button => {
     button.onclick = () => {
-      const entry = byLine.get(Number(button.dataset.logLine));
+      const entry = preferredDiagnostic(byLine.get(Number(button.dataset.logLine)) || []);
       if (entry?.line) jumpToSourcePosition(entry.line, entry.column);
     };
   });

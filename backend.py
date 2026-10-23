@@ -406,7 +406,8 @@ def riscv_isa_for_config(configuration):
     if compressed_extension:
         extensions.append("c")
     extensions.extend(("zicsr", "zifencei"))
-    return {"march": march, "abi": "ilp32", "extensions": extensions}
+    abi = "ilp32d" if "d" in floating_extensions else "ilp32f"
+    return {"march": march, "abi": abi, "extensions": extensions}
 
 
 def save_project_config(folder, value):

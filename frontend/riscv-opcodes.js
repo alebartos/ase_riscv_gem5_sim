@@ -1,4 +1,5 @@
 /*
+ * SPDX-FileCopyrightText: 2026 Behnam Farnaghinejad <behnam.farnaghinejad@polito.it>
  * SPDX-License-Identifier: GPL-2.0-only
  *
  * The editor uses this small, dependency-free catalog for completion and
