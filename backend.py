@@ -396,6 +396,20 @@ def project_config(folder):
         fail("The project CPU configuration is invalid.")
 
 
+def riscv_isa_for_config(configuration):
+    """Return the RISC-V ISA used by ASE Studio for one project config."""
+    floating_extensions = ("fd" if configuration["floatingPointPrecision"] == "double"
+                           else "f")
+    compressed_extension = "c" if configuration["compressedInstructions"] else ""
+    march = f"rv32ima{floating_extensions}{compressed_extension}_zicsr_zifencei"
+    extensions = ["i", "m", "a", *floating_extensions]
+    if compressed_extension:
+        extensions.append("c")
+    extensions.extend(("zicsr", "zifencei"))
+    abi = "ilp32d" if "d" in floating_extensions else "ilp32f"
+    return {"march": march, "abi": abi, "extensions": extensions}
+
+
 def save_project_config(folder, value):
     config = validate_config(value)
     (folder / ".ase-studio.json").write_text(json.dumps(config, indent=2) + "\n")
@@ -1085,11 +1099,7 @@ def build(name):
                 "source": source_file(folder).name}
     env = settings_env()
     cpu_config = project_config(folder)
-    floating_extensions = ("fd" if cpu_config["floatingPointPrecision"] == "double"
-                           else "f")
-    compressed_extension = "c" if cpu_config["compressedInstructions"] else ""
-    env["ASE_RISCV_MARCH"] = (
-        f"rv32ima{floating_extensions}{compressed_extension}_zicsr_zifencei")
+    env["ASE_RISCV_MARCH"] = riscv_isa_for_config(cpu_config)["march"]
     env["program"] = artifact_stem(folder)
     clean_rc, clean_output = run_command(["make", "clean"], folder, env)
     rc, output = run_command(["make"], folder, env)
@@ -5709,9 +5719,11 @@ class Handler(SimpleHTTPRequestHandler):
                 folder = project_dir(name)
                 src = source_file(folder)
                 source = clean_source(src.read_text())
+                configuration = project_config(folder)
                 return self.send_json({"name": name, "sourceName": src.name,
                                        "text": source,
-                                       "protectedLines": protected_lines(source)})
+                                       "protectedLines": protected_lines(source),
+                                       "isa": riscv_isa_for_config(configuration)})
             if url.path == "/api/symbols":
                 folder = project_dir(parse_qs(url.query).get("name", [""])[0])
                 symbols = data_symbols(folder)
