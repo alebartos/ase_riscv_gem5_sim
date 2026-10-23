@@ -4,3 +4,4 @@ __pycache__/
 # Keep private pipeline fixtures local; version updater safety coverage.
 !tests/
 tests/*
+!tests/test_predictor_parameters.py

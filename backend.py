@@ -9,6 +9,7 @@ import atexit
 import base64
 import binascii
 import csv
+from copy import deepcopy
 import hashlib
 import io
 import json
@@ -97,6 +98,27 @@ SCAFFOLD_COMMENTS = {
     "# Make _start visible as the point where the program begins.",
     "# The End block stops the program and returns control to the simulator.",
 }
+DEFAULT_PREDICTOR_PARAMETERS = {
+    "local": {"localPredictorSize": 32, "localCtrBits": 2, "BTBEntries": 256},
+    "tournament": {
+        "localPredictorSize": 2048, "localCtrBits": 2,
+        "localHistoryTableSize": 2048, "globalPredictorSize": 8192,
+        "globalCtrBits": 2, "choicePredictorSize": 8192,
+        "choiceCtrBits": 2, "BTBEntries": 256,
+    },
+    "bimode": {
+        "globalPredictorSize": 8192, "globalCtrBits": 2,
+        "choicePredictorSize": 8192, "choiceCtrBits": 2,
+        "BTBEntries": 256,
+    },
+    "tage": {
+        "minHist": 5, "maxHist": 130,
+        "tagTableCounterBits": 3, "tagTableUBits": 2,
+        "tagTableTagWidths": [0, 9, 9, 10, 10, 11, 11, 12],
+        "logTagTableSizes": [13, 9, 9, 9, 9, 9, 9, 9],
+        "BTBEntries": 4096,
+    },
+}
 DEFAULT_CONFIG = {
     "cpu": "in-order", "intAlu": 1, "intMul": 1, "intDiv": 1,
     "floatAlu": 2, "floatMul": 7, "floatDiv": 8,
@@ -114,8 +136,13 @@ DEFAULT_CONFIG = {
     "dispatchWidth": 2, "issueWidth": 2, "writebackWidth": 2,
     "commitWidth": 2, "robEntries": 64, "iqEntries": 128,
     "lqEntries": 32, "sqEntries": 32,
+    "intAluUnits": 1, "intMulUnits": 1, "intDivUnits": 1,
+    "floatAluUnits": 1, "floatMulUnits": 1, "floatDivUnits": 1,
+    "memoryUnits": 1,
     "o3VisibleStages": ["issue", "execute", "memory", "cdb", "commit"],
-    "branchPredictor": "local", "speculativeExecution": True,
+    "branchPredictor": "local",
+    "branchPredictorParameters": DEFAULT_PREDICTOR_PARAMETERS,
+    "speculativeExecution": True,
     "outOfOrderExecution": True, "o3EvaluationLabel": "",
 }
 
@@ -123,7 +150,6 @@ DEFAULT_CONFIG = {
 # needs finite queues to generate the architectural instruction/value trace;
 # these internal sizes never constrain the table's unlimited ROB and RS.
 O3_FIXED_CONFIG = {
-    "fetchWidth": 2, "decodeWidth": 2, "renameWidth": 2,
     "issueWidth": 8,
     "robEntries": 64, "iqEntries": 128, "lqEntries": 32, "sqEntries": 32,
     "speculativeExecution": True,
@@ -140,6 +166,59 @@ DEFAULT_O3_CONFIG = {
 
 def fail(message, status=400):
     raise ValueError((message, status))
+
+
+def validate_predictor_parameters(value):
+    """Keep project predictor settings within this gem5 build's safe limits."""
+    if value is None:
+        value = {}
+    if not isinstance(value, dict) or set(value) - set(DEFAULT_PREDICTOR_PARAMETERS):
+        fail("Invalid branch predictor parameters.")
+    parameters = deepcopy(DEFAULT_PREDICTOR_PARAMETERS)
+    table_sizes = {"localPredictorSize", "localHistoryTableSize",
+                   "globalPredictorSize", "choicePredictorSize", "BTBEntries"}
+    counter_bits = {"localCtrBits", "globalCtrBits", "choiceCtrBits",
+                    "tagTableCounterBits", "tagTableUBits"}
+    for predictor, supplied in value.items():
+        if not isinstance(supplied, dict) or set(supplied) - set(parameters[predictor]):
+            fail(f"Invalid {predictor} predictor parameters.")
+        for key, number in supplied.items():
+            if key in {"tagTableTagWidths", "logTagTableSizes"}:
+                if (not isinstance(number, list) or len(number) != 8
+                        or any(not isinstance(item, int) or isinstance(item, bool)
+                               for item in number)):
+                    fail("TAGE needs eight integer values for each table array (base plus seven tagged tables).")
+                parameters[predictor][key] = number.copy()
+                continue
+            if not isinstance(number, int) or isinstance(number, bool):
+                fail(f"{predictor} {key} must be a whole number.")
+            if key in table_sizes:
+                if not 2 <= number <= 65536 or number & (number - 1):
+                    fail(f"{predictor} {key} must be a power of two from 2 to 65536.")
+            elif key in counter_bits:
+                maximum = 2 if key == "tagTableUBits" else 8
+                if not 1 <= number <= maximum:
+                    fail(f"{predictor} {key} must be between 1 and {maximum} bits.")
+            elif key in {"minHist", "maxHist"}:
+                if not 1 <= number <= 8192:
+                    fail("TAGE history lengths must be between 1 and 8192.")
+            parameters[predictor][key] = number
+    local = parameters["local"]
+    local_entries = local["localPredictorSize"] // local["localCtrBits"]
+    if (local["localPredictorSize"] % local["localCtrBits"]
+            or not local_entries or local_entries & (local_entries - 1)):
+        fail("Local predictor storage divided by counter bits must give a power-of-two number of entries.")
+    tage = parameters["tage"]
+    if tage["maxHist"] <= tage["minHist"]:
+        fail("TAGE maximum history must exceed its minimum history.")
+    tags = tage["tagTableTagWidths"]
+    sizes = tage["logTagTableSizes"]
+    if tags[0] != 0 or any(not 2 <= width <= 16 for width in tags[1:]):
+        fail("TAGE base tag width must be 0; tagged widths must be 2–16 bits.")
+    if any(not max(4, index + 1) <= size <= 16
+           for index, size in enumerate(sizes)):
+        fail("TAGE table log2 sizes must be 4–16 and exceed their tagged-table index.")
+    return parameters
 
 
 def validate_project_name(name: str) -> str:
@@ -330,6 +409,13 @@ def validate_config(value):
         if not isinstance(number, int) or isinstance(number, bool) or not 1 <= number <= 8:
             fail("Multiple-issue pipeline widths must be whole numbers from 1 to 8.")
         config[key] = number
+    for key in ("intAluUnits", "intMulUnits", "intDivUnits",
+                "floatAluUnits", "floatMulUnits", "floatDivUnits",
+                "memoryUnits"):
+        number = value.get(key, config[key])
+        if not isinstance(number, int) or isinstance(number, bool) or not 1 <= number <= 8:
+            fail("Functional-unit counts must be whole numbers from 1 to 8.")
+        config[key] = number
     for key, minimum, maximum in (("robEntries", 16, 512), ("iqEntries", 8, 2048),
                                   ("lqEntries", 4, 256), ("sqEntries", 4, 256)):
         number = value.get(key, config[key])
@@ -348,13 +434,12 @@ def validate_config(value):
     config["o3VisibleStages"] = [stage for stage in (
         "fetch", "decode", "rename", "issue", "execute", "memory", "cdb", "commit"
     ) if stage in visible_stages]
-    if multiple_issue:
-        config["branchPredictor"] = "ideal"
-    else:
-        predictor_name = value.get("branchPredictor", config["branchPredictor"])
-        if predictor_name not in {"ideal", "local", "tournament", "bimode", "tage"}:
-            fail("Select a supported branch predictor.")
-        config["branchPredictor"] = predictor_name
+    predictor_name = value.get("branchPredictor", config["branchPredictor"])
+    if predictor_name not in {"ideal", "local", "tournament", "bimode", "tage"}:
+        fail("Select a supported branch predictor.")
+    config["branchPredictor"] = predictor_name
+    config["branchPredictorParameters"] = validate_predictor_parameters(
+        value.get("branchPredictorParameters"))
     speculation = value.get("speculativeExecution", config["speculativeExecution"])
     if not isinstance(speculation, bool):
         fail("The speculative-execution option must be enabled or disabled.")
@@ -1168,6 +1253,13 @@ def simulate(name):
         "--ase-issue-width", str(cpu_config["issueWidth"]),
         "--ase-writeback-width", str(cpu_config["writebackWidth"]),
         "--ase-commit-width", str(cpu_config["commitWidth"]),
+        "--ase-int-alu-units", str(cpu_config["intAluUnits"]),
+        "--ase-int-mul-units", str(cpu_config["intMulUnits"]),
+        "--ase-int-div-units", str(cpu_config["intDivUnits"]),
+        "--ase-float-alu-units", str(cpu_config["floatAluUnits"]),
+        "--ase-float-mul-units", str(cpu_config["floatMulUnits"]),
+        "--ase-float-div-units", str(cpu_config["floatDivUnits"]),
+        "--ase-memory-units", str(cpu_config["memoryUnits"]),
         "--ase-rob-entries", str(cpu_config["robEntries"]),
         "--ase-iq-entries", str(cpu_config["iqEntries"]),
         "--ase-lq-entries", str(cpu_config["lqEntries"]),
@@ -1178,6 +1270,10 @@ def simulate(name):
         "--ase-branch-predictor", (
             "local" if cpu_config["branchPredictor"] == "ideal"
             else cpu_config["branchPredictor"]),
+        "--ase-branch-predictor-parameters", json.dumps(
+            cpu_config.get("branchPredictorParameters", DEFAULT_PREDICTOR_PARAMETERS)[
+                "local" if cpu_config["branchPredictor"] == "ideal"
+                else cpu_config["branchPredictor"]], separators=(",", ":")),
     ]
     if in_order:
         command = [str(gem5), "--debug-flags=MinorGUI,Exec", f"--outdir={result_dir}", "--verbose", config,
@@ -1476,6 +1572,9 @@ def compact_iterations(rows):
             target["mispredictions"] += 1
         if target.get("sourceLine") is None:
             target["sourceLine"] = row.get("sourceLine")
+    for target in compacted:
+        if target["squashedFetches"] and not target["iterations"]:
+            target["squashed"] = True
     return compacted
 
 
@@ -1790,16 +1889,17 @@ def schedule_lecture_o3_pipeline(data, configuration, start_address=None):
     if data.get("format") != "o3":
         return False
     configuration = {**DEFAULT_O3_CONFIG, **configuration, **O3_FIXED_CONFIG}
-    configuration["branchPredictor"] = "ideal"
 
-    def first_cycle(row):
+    def row_first_cycle(row):
         return min((int(cycle) for cycle in row.get("cycles", {})),
                    default=10**12)
 
+    observed_squashes = [row for row in data.get("dynamicInstructions", [])
+                         if row.get("squashed")]
     all_committed = sorted(
         (row for row in data.get("dynamicInstructions", [])
          if not row.get("squashed")),
-        key=first_cycle,
+        key=row_first_cycle,
     )
     if start_address is not None:
         start_index = next(
@@ -1830,6 +1930,26 @@ def schedule_lecture_o3_pipeline(data, configuration, start_address=None):
         id(row): sorted(int(cycle) for cycle in row.get("cycles", {}))
         for row in all_committed
     }
+
+    # gem5 supplies which speculative instructions were fetched on each wrong
+    # path. Schedule those identities below using the same classroom clock,
+    # dependencies, widths and units as the committed instructions.
+    wrong_candidates = defaultdict(list)
+    miss_branches = [row for row in committed
+                     if row.get("mispredicted")
+                     and row.get("mispredictCycle") is not None
+                     and row.get("sequence") is not None]
+    for wrong in observed_squashes:
+        squash = min((int(cycle) for cycle, markers in wrong.get("cycles", {}).items()
+                      if "X" in markers), default=None)
+        if wrong.get("sequence") is None or squash is None:
+            continue
+        causes = [branch for branch in miss_branches
+                  if branch["sequence"] < wrong["sequence"]
+                  and branch["mispredictCycle"] <= squash]
+        if causes:
+            cause = max(causes, key=lambda branch: branch["sequence"])
+            wrong_candidates[id(cause)].append(wrong)
 
     def instruction_info(instruction):
         text_value = display_instruction(instruction).strip().lower()
@@ -1897,106 +2017,194 @@ def schedule_lecture_o3_pipeline(data, configuration, start_address=None):
     visible_stages = set(configuration.get(
         "o3VisibleStages", DEFAULT_CONFIG["o3VisibleStages"]))
     show_front_end = bool(visible_stages & {"fetch", "decode", "rename"})
-    if show_front_end:
-        stage_uses = {stage: defaultdict(int)
-                      for stage in ("F", "D", "R", "I")}
+    stage_uses = {stage: defaultdict(int)
+                  for stage in ("F", "D", "R", "I")}
 
-        def reserve_front_stage(stage, earliest, width, exclusive=False):
-            cycle = earliest
-            while stage_uses[stage][cycle] >= (1 if exclusive else width):
-                cycle += 1
-            stage_uses[stage][cycle] += 1
-            return cycle
+    def reserve_front_stage(stage, earliest, width, exclusive=False, deadline=None):
+        cycle = earliest
+        while stage_uses[stage][cycle] >= (1 if exclusive else width):
+            cycle += 1
+        if deadline is not None and cycle > deadline:
+            return None
+        stage_uses[stage][cycle] += 1
+        return cycle
 
-        previous_stage = {stage: 1 for stage in ("F", "D", "R", "I")}
-        fetch_floor = issue_floor = 1
-        for row in committed:
-            info = information[id(row)]
-            fetch = reserve_front_stage(
-                "F", max(fetch_floor, previous_stage["F"]),
-                max(1, int(configuration["fetchWidth"])))
-            decode = reserve_front_stage(
-                "D", max(fetch + 1, previous_stage["D"]),
-                max(1, int(configuration["decodeWidth"])))
-            rename = reserve_front_stage(
-                "R", max(decode + 1, previous_stage["R"]),
-                max(1, int(configuration["renameWidth"])))
-            issue = reserve_front_stage(
-                "I", max(rename + 1, issue_floor, previous_stage["I"]),
-                issue_width, exclusive=info["control"])
-            front_end_cycles[id(row)] = {
-                "F": fetch, "D": decode, "R": rename,
-            }
-            issue_cycles[id(row)] = issue
-            previous_stage.update({
-                "F": fetch, "D": decode, "R": rename, "I": issue,
-            })
-            # The predicted successor of a control transfer enters Fetch and
-            # Issue no earlier than the following cycle.
-            if info["control"]:
-                fetch_floor = fetch + 1
-                issue_floor = issue + 1
-    else:
-        issue_cycle, issue_slots = 1, 0
-        for row in committed:
-            info = information[id(row)]
-            # Every control transfer occupies an Issue cycle of its own,
-            # including when a preceding instruction used only one slot.
-            if info["control"] and issue_slots:
-                issue_cycle += 1
-                issue_slots = 0
-            issue_cycles[id(row)] = issue_cycle
-            issue_slots += 1
-            # The predicted successor issues no earlier than the next cycle.
-            if info["control"] or issue_slots >= issue_width:
-                issue_cycle += 1
-                issue_slots = 0
+    previous_stage = {stage: 1 for stage in ("F", "D", "R", "I")}
+    fetch_floor = issue_floor = 1
 
+    def allocate_front_end(info, deadline=None):
+        nonlocal fetch_floor, issue_floor
+        slots = {}
+        previous = None
+        for stage, width in (("F", configuration["fetchWidth"]),
+                             ("D", configuration["decodeWidth"]),
+                             ("R", configuration["renameWidth"]),
+                             ("I", issue_width)):
+            earliest = max(previous_stage[stage],
+                           previous + 1 if previous is not None else fetch_floor,
+                           issue_floor if stage == "I" else 1)
+            slot = reserve_front_stage(
+                stage, earliest, max(1, int(width)),
+                exclusive=stage == "I" and info["control"], deadline=deadline)
+            if slot is None:
+                break
+            slots[stage] = slot
+            previous_stage[stage] = previous = slot
+        if info["control"]:
+            if "F" in slots:
+                fetch_floor = slots["F"] + 1
+            if "I" in slots:
+                issue_floor = slots["I"] + 1
+        return slots
+
+    # Perfect-prediction exams retain their accepted schedule. Other predictors
+    # allocate the frontend as branches resolve, including wrong-path work.
+    real_prediction = configuration.get("branchPredictor") != "ideal"
+    for row in ([] if real_prediction else committed):
+        info = information[id(row)]
+        slots = allocate_front_end(info)
+        # Front-end bandwidth constrains Issue even when its stages are
+        # hidden in the teaching table. Only render stages the user chose.
+        front_end_cycles[id(row)] = (
+            {stage: slots[stage] for stage in ("F", "D", "R")}
+            if show_front_end else {})
+        issue_cycles[id(row)] = slots["I"]
     cdb_width = max(1, int(configuration["writebackWidth"]))
     cdb_uses = defaultdict(int)
-    # Each functional unit has one output port to the shared CDBs.
-    unit_cdb_uses = defaultdict(set)
-    unit_busy = defaultdict(set)
-    memory_busy = set()
+    # Each physical unit may put at most one result on a shared CDB per cycle.
+    unit_counts = {
+        "integer-alu": configuration["intAluUnits"],
+        "integer-multiply": configuration["intMulUnits"],
+        "integer-divide": configuration["intDivUnits"],
+        "float-alu": configuration["floatAluUnits"],
+        "float-multiply": configuration["floatMulUnits"],
+        "float-divide": configuration["floatDivUnits"],
+        "address": configuration["memoryUnits"],
+        "jump": 1,
+    }
+    unit_cdb_uses = defaultdict(lambda: defaultdict(int))
+    unit_busy = defaultdict(lambda: defaultdict(int))
+    memory_busy = defaultdict(int)
     latest_producer = {}
     resolved_branches = []
     timing = {}
 
-    def reserve_execution(info, earliest):
+    def reserve_execution(info, earliest, deadline=None):
         cycle = earliest
         while True:
+            if deadline is not None and cycle > deadline:
+                return None
             occupied = ({cycle} if info["pipelined"]
                         else set(range(cycle, cycle + info["latency"])))
+            if deadline is not None:
+                occupied = {slot for slot in occupied if slot <= deadline}
             # No global EXE-queue/width limit: independent functional units
             # may start together. Each unit still enforces its own capacity.
-            if not (occupied & unit_busy[info["unit"]]):
-                unit_busy[info["unit"]].update(occupied)
+            if all(unit_busy[info["unit"]][slot] < unit_counts[info["unit"]]
+                   for slot in occupied):
+                for slot in occupied:
+                    unit_busy[info["unit"]][slot] += 1
                 return cycle
             cycle += 1
 
-    def reserve_cdb(earliest, unit):
+    def reserve_cdb(earliest, unit, deadline=None):
         cycle = earliest
-        while cdb_uses[cycle] >= cdb_width or cycle in unit_cdb_uses[unit]:
+        while (cdb_uses[cycle] >= cdb_width
+               or unit_cdb_uses[unit][cycle] >= unit_counts[unit]):
             cycle += 1
+        if deadline is not None and cycle > deadline:
+            return None
         cdb_uses[cycle] += 1
-        unit_cdb_uses[unit].add(cycle)
+        unit_cdb_uses[unit][cycle] += 1
         return cycle
 
     speculation = bool(configuration.get("speculativeExecution", True))
     out_of_order_execution = bool(
         configuration.get("outOfOrderExecution", True))
     previous_execution_start = 0
-    schedule_delay = 0
-    recovery_issue_floor = 0
+    commit_width = max(1, int(configuration["commitWidth"]))
+    commit_uses = defaultdict(int)
+    previous_commit = 0
+    wrong_path_by_branch = defaultdict(list)
+    recovery_front_end = []
+    pending_recovery = False
+
+    def schedule_wrong_path(branch, resolution):
+        """Run speculative work until the branch's ROB Commit check."""
+        producers = latest_producer.copy()
+        previous_start = previous_execution_start
+        for wrong in sorted(wrong_candidates[id(branch)],
+                            key=lambda row: row["sequence"]):
+            info = instruction_info(wrong["instruction"])
+            front = allocate_front_end(info, deadline=resolution)
+            if not front:
+                break
+            cycles = {str(cycle): stage + "*" for stage, cycle in front.items()}
+            issue = front.get("I")
+            if issue is not None:
+                # Waiting for operands, a unit or the ROB is a real wait. The
+                # squash edge itself is X, never an invented S*/X completion.
+                for cycle in range(issue + 1, resolution):
+                    cycles[str(cycle)] = "S*"
+                earliest = issue + 1
+                for register in info["executeSources"]:
+                    producer = producers.get(register)
+                    if producer is not None:
+                        earliest = max(earliest, (producer.get("C") or resolution) + 1)
+                if not speculation:
+                    earliest = resolution + 1
+                if not out_of_order_execution:
+                    earliest = max(earliest, previous_start)
+                execute = reserve_execution(info, earliest, deadline=resolution)
+                cdb = None
+                if execute is not None:
+                    previous_start = execute
+                    execute_end = execute + info["latency"] - 1
+                    for cycle in range(execute, min(execute_end, resolution) + 1):
+                        cycles[str(cycle)] = "E*"
+                    result_end = execute_end
+                    if info["load"] and execute_end < resolution:
+                        latency = (configuration["dataReadLatency"]
+                                   if configuration["memoryMode"] == "direct"
+                                   else configuration["cacheLatency"])
+                        memory_start = execute_end + 1
+                        while (memory_start <= resolution and any(
+                                memory_busy[cycle] >= configuration["memoryUnits"]
+                                for cycle in range(memory_start, min(
+                                    memory_start + latency, resolution + 1)))):
+                            memory_start += 1
+                        result_end = memory_start + latency - 1
+                        for cycle in range(memory_start, min(result_end, resolution) + 1):
+                            memory_busy[cycle] += 1
+                            cycles[str(cycle)] = "M*"
+                    if info["destination"] is not None:
+                        cdb = reserve_cdb(result_end + 1, info["unit"],
+                                          deadline=resolution)
+                        if cdb is not None:
+                            cycles[str(cdb)] = "C*"
+                if info["destination"] is not None:
+                    producers[info["destination"]] = {"C": cdb}
+            cycles[str(resolution)] = cycles.get(str(resolution), "") + "X"
+            wrong_path_by_branch[id(branch)].append({
+                **wrong, "cycles": cycles, "mispredicted": False,
+                "squashCause": branch.get("address"),
+            })
+
     for row in committed:
         info = information[id(row)]
-        base_issue = issue_cycles[id(row)]
-        issue = max(base_issue + schedule_delay, recovery_issue_floor)
-        schedule_delay = max(schedule_delay, issue - base_issue)
-        effective_front_end = {
-            stage: cycle + schedule_delay
-            for stage, cycle in front_end_cycles.get(id(row), {}).items()
-        }
+        if real_prediction:
+            front = allocate_front_end(info)
+            if pending_recovery:
+                recovery_front_end.extend(
+                    {"stage": stage, "cycle": front[stage]}
+                    for stage in ("F", "D", "R"))
+                pending_recovery = False
+            issue = front["I"]
+            effective_front_end = ({stage: front[stage] for stage in ("F", "D", "R")}
+                                   if show_front_end else {})
+        else:
+            issue = issue_cycles[id(row)]
+            effective_front_end = front_end_cycles.get(id(row), {})
         earliest = issue + 1
         for register in info["executeSources"]:
             producer = latest_producer.get(register)
@@ -2019,11 +2227,13 @@ def schedule_lecture_o3_pipeline(data, configuration, start_address=None):
                               if configuration["memoryMode"] == "direct"
                               else configuration["cacheLatency"])
             memory_start = execute_end + 1
-            while any(cycle in memory_busy for cycle in range(
-                    memory_start, memory_start + memory_latency)):
+            while any(memory_busy[cycle] >= configuration["memoryUnits"]
+                      for cycle in range(memory_start,
+                                         memory_start + memory_latency)):
                 memory_start += 1
             memory_end = memory_start + memory_latency - 1
-            memory_busy.update(range(memory_start, memory_end + 1))
+            for cycle in range(memory_start, memory_end + 1):
+                memory_busy[cycle] += 1
 
         produces_result = info["destination"] is not None
         cdb = (reserve_cdb((memory_end if info["load"] else execute_end) + 1,
@@ -2038,37 +2248,34 @@ def schedule_lecture_o3_pipeline(data, configuration, start_address=None):
         timing[id(row)] = record
         if produces_result:
             latest_producer[info["destination"]] = record
-        if info["control"]:
-            resolved_branches.append(execute_end)
-            if (configuration.get("branchPredictor") != "ideal"
-                    and row.get("mispredicted")):
-                # A simplified recovery retains the real predictor outcome:
-                # two Issue-level cycles, or Fetch plus D/R/I refill when the
-                # front end is visible. The following correct-path row cannot
-                # issue until recovery is complete.
-                recovery_cycles = 4 if show_front_end else 2
-                row["predictionPenalty"] = recovery_cycles
-                recovery_issue_floor = max(
-                    recovery_issue_floor, execute_end + recovery_cycles)
 
-    commit_width = max(1, int(configuration["commitWidth"]))
-    commit_uses = defaultdict(int)
-    previous_commit = 0
-    for row in committed:
-        current = timing[id(row)]
-        info = information[id(row)]
-        ready = ((current["C"] + 1) if current["C"] is not None
-                 else current["EEnd"] + 1)
+        # Older instructions have already been scheduled, so the branch's
+        # in-order Commit check is known before scheduling its wrong path.
+        # This also preserves the accepted perfect-prediction Commit timing.
+        ready = cdb + 1 if cdb is not None else execute_end + 1
         if info["store"]:
-            producer = current["storeDataProducer"]
+            producer = record["storeDataProducer"]
             if producer is not None and producer.get("C") is not None:
                 ready = max(ready, producer["C"] + 1)
         commit = max(ready, previous_commit)
         while commit_uses[commit] >= commit_width:
             commit += 1
         commit_uses[commit] += 1
-        current["W"] = commit
+        record["W"] = commit
         previous_commit = commit
+
+        if info["control"]:
+            resolved_branches.append(execute_end)
+            if (configuration.get("branchPredictor") != "ideal"
+                    and row.get("mispredicted")):
+                schedule_wrong_path(row, commit)
+                # The outcome is known after EXE, but the book's ROB model
+                # flushes younger work when the branch reaches the Commit
+                # check. Correct-path F starts next cycle, followed by D/R/I.
+                row["predictionPenalty"] = commit - execute_end + 4
+                fetch_floor = max(fetch_floor, commit + 1)
+                issue_floor = max(issue_floor, commit + 1)
+                pending_recovery = True
 
     # Preserve actual architectural values but move their visible updates to
     # lecture Commit (and load/store accesses to MEM/Commit respectively).
@@ -2142,27 +2349,22 @@ def schedule_lecture_o3_pipeline(data, configuration, start_address=None):
     for jump in data.get("jumps", []):
         candidates = branch_rows[jump.get("fromAddress")]
         if candidates:
-            branch = candidates.popleft()
-            relocated_jumps.append({**jump, "cycle": timing[id(branch)]["EEnd"]})
+            # Exec records control transfers at retirement. Match that dynamic
+            # occurrence rather than consuming an earlier untaken iteration.
+            branch = min(candidates, key=lambda candidate: abs(
+                max(original_cycles[id(candidate)], default=0) - jump["cycle"]))
+            candidates.remove(branch)
+            relocated_jumps.append({
+                **jump, "cycle": timing[id(branch)]["W"],
+                "instructionSequence": branch.get("sequence"),
+            })
 
     displayed_rows = []
     for row in committed:
         displayed_rows.append(row)
-        penalty = row.get("predictionPenalty", 0)
-        if not penalty:
-            continue
-        resolution = timing[id(row)]["EEnd"]
-        displayed_rows.append({
-            "instruction": "predicted path (squashed)",
-            "address": None,
-            "cycles": {
-                str(cycle): "X"
-                for cycle in range(resolution, resolution + penalty)
-            },
-            "squashed": True,
-            "predictionRecovery": True,
-            "sourceLine": row.get("sourceLine"),
-        })
+        displayed_rows.extend(sorted(
+            wrong_path_by_branch[id(row)],
+            key=lambda wrong: (row_first_cycle(wrong), wrong["sequence"])))
 
     data["dynamicInstructions"] = displayed_rows
     data["instructions"] = compact_iterations(displayed_rows)
@@ -2170,7 +2372,12 @@ def schedule_lecture_o3_pipeline(data, configuration, start_address=None):
     data["initialRegisters"] = initial_registers
     data["memoryDeltas"] = dict(new_memory)
     data["jumps"] = relocated_jumps
-    data["cycles"] = max(current["W"] for current in timing.values())
+    data["recoveryFrontEnd"] = recovery_front_end
+    data["cycles"] = max(
+        max(current["W"] for current in timing.values()),
+        max((int(cycle) for row in displayed_rows for cycle in row["cycles"]),
+            default=0),
+    )
     data["lectureTimingApplied"] = True
     return True
 
@@ -2213,7 +2420,9 @@ def configure_o3_stage_display(data, configuration):
         retained_cdb = 1 if writes_register else 0
         for cycle in cdb_cycles[retained_cdb:]:
             markers = row["cycles"][str(cycle)]
-            row["cycles"][str(cycle)] = markers.replace("C", "S")
+            row["cycles"][str(cycle)] = (
+                markers.replace("C", "S") if writes_register
+                else re.sub(r"C\*?", "", markers))
 
         # A load first calculates its address in EXE and then occupies MEM
         # until its value can be broadcast. A store updates memory only when
@@ -2233,9 +2442,9 @@ def configure_o3_stage_display(data, configuration):
 
         filtered = {}
         for cycle, markers in row.get("cycles", {}).items():
-            kept = "".join(marker for marker in markers
-                           if marker_stage.get(marker) in visible
-                           or marker in {"S", "X"})
+            kept = "".join(token for token in re.findall(r"[A-Z]\*?", markers)
+                           if marker_stage.get(token[0]) in visible
+                           or token[0] in {"S", "X"})
             if kept:
                 filtered[cycle] = kept
         row["cycles"] = filtered
@@ -2244,6 +2453,15 @@ def configure_o3_stage_display(data, configuration):
     if not occupied:
         return
     offset = min(occupied) - 1
+
+    # Omit hidden refill clocks from the browser's columns. Preserve the full
+    # timeline for playback, CPI, register/memory updates and full CSV results.
+    data["collapsedRecoveryCycles"] = sorted({
+        event["cycle"] - offset
+        for event in data.get("recoveryFrontEnd", [])
+        if marker_stage[event["stage"]] not in visible
+        and event["cycle"] > offset
+    })
 
     def shift_cycle_map(values):
         return {str(int(cycle) - offset): value for cycle, value in values.items()
@@ -2279,11 +2497,19 @@ def parse_o3_debug_trace(lines, source_body=""):
     instructions at the cycle in which the ROB squashes them.
     """
     exec_instructions = {}
+    fetched_instructions = {}
     for line in lines:
         match = EXEC_EVENT.match(line)
         if match:
             _tick, address, instruction, _op_class, _result = match.groups()
             exec_instructions.setdefault(address.lower(), display_instruction(instruction))
+        pipe_fetch = re.match(
+            r"^O3PipeView:fetch:\d+:0x([0-9a-fA-F]+):\d+:(\d+):(.*)$",
+            line,
+        )
+        if pipe_fetch:
+            fetched_instructions[int(pipe_fetch.group(2))] = display_instruction(
+                pipe_fetch.group(3))
 
     rows = {}
     event_ticks = set()
@@ -2291,7 +2517,9 @@ def parse_o3_debug_trace(lines, source_body=""):
     def record(sequence, address, tick, stage):
         address = address.lower()
         row = rows.setdefault(sequence, {
-            "instruction": exec_instructions.get(address, f"instruction @ 0x{address}"),
+            "instruction": fetched_instructions.get(
+                int(sequence), exec_instructions.get(
+                    address, f"instruction @ 0x{address}")),
             "address": address,
             "sequence": int(sequence),
             "ticks": {},
@@ -2337,9 +2565,23 @@ def parse_o3_debug_trace(lines, source_body=""):
             r"\(0x([0-9a-fA-F]+).*?seq num (\d+)\.",
             line,
         )
+        if not squash:
+            # Instructions still in Fetch/Decode/Rename never enter the ROB,
+            # but gem5 reports their individual squash with a sequence number.
+            squash = re.match(
+                r"^\s*(\d+): .*?cpu: Squashing instruction, "
+                r"\[tid:\d+\] \[sn:(\d+)\] PC \(0x([0-9a-fA-F]+)",
+                line,
+            )
+            if squash:
+                tick, sequence, address = squash.groups()
+                squash = (tick, address, sequence)
         if squash:
-            tick, address, sequence = squash.groups()
-            record(sequence, address, int(tick), "X")
+            tick, address, sequence = (squash.groups()
+                                       if hasattr(squash, "groups") else squash)
+            if not any("X" in markers for markers in
+                       rows.get(sequence, {}).get("ticks", {}).values()):
+                record(sequence, address, int(tick), "X")
             rows[sequence]["squashed"] = True
 
     visible_rows = [row for row in rows.values()
@@ -2361,9 +2603,20 @@ def parse_o3_debug_trace(lines, source_body=""):
 
     dynamic_rows = []
     for row in sorted(visible_rows, key=lambda item: min(item["ticks"])):
+        if row.get("squashed"):
+            squash_tick = min(tick for tick, markers in row["ticks"].items()
+                              if "X" in markers)
+            # Debug messages for instructions *skipped* by Decode may arrive
+            # after the frontend has already discarded them. Those are not
+            # actual Decode occupancy and must not appear after squash.
+            row["ticks"] = {tick: markers for tick, markers in row["ticks"].items()
+                            if tick <= squash_tick}
         cycles = {str(((tick - first_tick) // tick_period) + 1): stage
                   for tick, stage in row.pop("ticks").items()}
         row["cycles"] = cycles
+        if row.get("mispredictTick") is not None:
+            row["mispredictCycle"] = (
+                (row["mispredictTick"] - first_tick) // tick_period) + 1
         dynamic_rows.append(row)
     complete_o3_waits(dynamic_rows)
     pc_deltas = {cycle: "0x" + row["address"] for row in dynamic_rows
@@ -2816,14 +3069,15 @@ def branch_predictor_report(result_dir, configuration, teaching_cycles=None):
     if configuration.get("cpu") != "out-of-order":
         return ""
     names = {
-        "ideal": "Ideal (perfect prediction)",
-        "local": "Local two-bit", "tournament": "Tournament",
-        "bimode": "Bi-mode", "tage": "TAGE",
+        "ideal": "Ideal (teaching baseline)",
+        "local": "Local counter (2-bit baseline)",
+        "tournament": "Tournament (local + global)",
+        "bimode": "Bi-mode", "tage": "TAGE (tagged hybrid)",
     }
     if configuration.get("branchPredictor") == "ideal":
         return "\n".join([
             "Branch prediction:",
-            "  Predictor: Ideal (perfect prediction)",
+            "  Predictor: Ideal (teaching baseline)",
         ])
     statistics = gem5_statistics(result_dir / "stats.txt")
     predictions = int(statistics.get("system.cpu.branchPred.condPredicted", 0))
@@ -2835,7 +3089,7 @@ def branch_predictor_report(result_dir, configuration, teaching_cycles=None):
     gem5_cpi = (gem5_cycles / committed) if committed else 0
     lines = [
         "Branch prediction:",
-        f"  Predictor: {names.get(configuration.get('branchPredictor'), 'Local two-bit')}",
+        f"  Predictor: {names.get(configuration.get('branchPredictor'), 'Local counter (2-bit baseline)')}",
         f"  Conditional predictions: {predictions}",
         f"  Correct: {correct} · Incorrect: {incorrect} · Accuracy: {accuracy:.1f}%",
     ]
@@ -2844,7 +3098,11 @@ def branch_predictor_report(result_dir, configuration, teaching_cycles=None):
             f"  Detailed gem5 completion: {gem5_cycles} cycles · CPI {gem5_cpi:.3f}")
     lines.append(
         "  The teaching pipeline uses gem5's real prediction outcomes. "
-        "BP miss labels, X rows, and recovery cycles show their timing effect.")
+        "BP miss labels and recovery cycles show their timing effect. "
+        "Wrong-path instruction identities come from gem5; their starred "
+        "stages use the same teaching scheduler as committed instructions. "
+        "X marks the squash at the branch's Commit check; the outcome "
+        "is known earlier at Execute.")
     lines.append(
         "  The statistics may also count predictions made on speculative "
         "paths that an older misprediction later squashed.")
@@ -4414,10 +4672,15 @@ def pipeline(name):
         if exit_addresses:
             end_address = min(exit_addresses)
     if end_address is not None:
+        # Keep speculative visits to the exit block to illustrate a bad
+        # prediction; the final committed exit sequence stays outside the
+        # teaching stream and must not supply register or memory updates.
         for row_key in ("instructions", "dynamicInstructions"):
             data[row_key] = [row for row in data.get(row_key, [])
                              if row.get("address")
-                             and int(row["address"], 16) < end_address]
+                             and (int(row["address"], 16) < end_address
+                                  or (configured_cpu == "out-of-order"
+                                      and row.get("squashed")))]
         data["pcDeltas"] = {
             cycle: address for cycle, address in data.get("pcDeltas", {}).items()
             if int(address, 16) < end_address
@@ -4495,7 +4758,11 @@ def write_pipeline_csv(data, output, expand_loops=False):
         last_cycle = max(row_cycles, default=0)
         jumps = [jump for jump in data.get("jumps", [])
                  if jump["fromAddress"] == row.get("address")
-                 and (not expand_loops or first_cycle <= jump["cycle"] <= last_cycle)]
+                 and (not expand_loops or (
+                     jump["instructionSequence"] == row["sequence"]
+                     if jump.get("instructionSequence") is not None
+                     and row.get("sequence") is not None
+                     else first_cycle <= jump["cycle"] <= last_cycle))]
         targets = defaultdict(int)
         for jump in jumps:
             targets[jump["toAddress"]] += 1
@@ -4512,13 +4779,22 @@ def write_pipeline_csv(data, output, expand_loops=False):
             f"{cache}$ {result}{f' x{count}' if count > 1 else ''}"
             for (cache, result), count in cache_groups.items()
         )
+        prediction_misses = row.get("mispredictions", 0) or int(
+            bool(row.get("mispredicted")))
+        if prediction_misses:
+            flow_parts.append(
+                f"BP miss{f' x{prediction_misses}' if prediction_misses > 1 else ''}")
+        if data.get("format") == "o3" and row.get("squashed"):
+            flow_parts.append("Squashed")
         flow = "; ".join(flow_parts)
         stage_labels = {"C": "CDB", "W": "C"} if data.get("format") == "o3" else {}
         cycle_cells = []
         for cycle in range(1, data["cycles"] + 1):
             stage = row["cycles"].get(str(cycle), "")
             if stage_labels and stage:
-                stage = "/".join(stage_labels.get(marker, marker) for marker in stage)
+                stage = "/".join(
+                    stage_labels.get(token[0], token[0]) + token[1:]
+                    for token in re.findall(r"[A-Z]\*?", stage))
             cycle_cells.append(stage)
         writer.writerow([f"0x{row['address']}", row["instruction"], flow,
                          *cycle_cells])
