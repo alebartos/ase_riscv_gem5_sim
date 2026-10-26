@@ -34,6 +34,46 @@ let externalSyncBusy = false;
 let memoryWatches = [];
 let cpuConfigurationOpenedAs = null;
 let o3Defaults = {};
+let predictorParameterDraft = {};
+const predictorNames = {
+  local: "Local counter (2-bit baseline)",
+  tournament: "Tournament (local + global)",
+  tage: "TAGE (tagged hybrid)",
+  bimode: "Bi-mode"
+};
+const predictorFields = {
+  local: [
+    ["localPredictorSize", "Counter storage (bits)", 2, 65536, "Power of two; entries = storage ÷ counter bits."],
+    ["localCtrBits", "Counter bits (n)", 1, 8, "Each branch-addressed entry has a saturating counter."],
+    ["BTBEntries", "Branch target buffer entries", 2, 65536, "Power of two."],
+  ],
+  tournament: [
+    ["localPredictorSize", "Local counters (entries)", 2, 65536, "Power of two."],
+    ["localCtrBits", "Local counter bits", 1, 8, ""],
+    ["localHistoryTableSize", "Local history entries", 2, 65536, "Power of two."],
+    ["globalPredictorSize", "Global counters (entries; 2^m)", 2, 65536, "Power of two; m = log₂(entries)."],
+    ["globalCtrBits", "Global counter bits (n)", 1, 8, ""],
+    ["choicePredictorSize", "Selector entries", 2, 65536, "Power of two; also affects global-history length."],
+    ["choiceCtrBits", "Selector counter bits", 1, 8, ""],
+    ["BTBEntries", "Branch target buffer entries", 2, 65536, "Power of two."],
+  ],
+  bimode: [
+    ["globalPredictorSize", "Direction counters per bank (entries)", 2, 65536, "Power of two; history length = log₂(entries)."],
+    ["globalCtrBits", "Direction counter bits", 1, 8, ""],
+    ["choicePredictorSize", "Selector entries", 2, 65536, "Power of two."],
+    ["choiceCtrBits", "Selector counter bits", 1, 8, ""],
+    ["BTBEntries", "Branch target buffer entries", 2, 65536, "Power of two."],
+  ],
+  tage: [
+    ["minHist", "Shortest tagged history (branches)", 1, 8192, ""],
+    ["maxHist", "Longest tagged history (branches)", 1, 8192, "Must exceed the shortest history."],
+    ["tagTableCounterBits", "Prediction counter bits", 1, 8, ""],
+    ["tagTableUBits", "Usefulness bits", 1, 2, "This gem5 implementation supports 1 or 2."],
+    ["tagTableTagWidths", "Tag widths (bits)", null, null, "Eight comma-separated values: 0 for the base, then seven tagged tables."],
+    ["logTagTableSizes", "Log₂ table entries", null, null, "Eight comma-separated values: base, then seven tagged tables."],
+    ["BTBEntries", "Branch target buffer entries", 2, 65536, "Power of two."],
+  ]
+};
 let studioFeatures = {
   developerMode: false,
   memoryConfiguration: false,
@@ -44,6 +84,10 @@ let memoryPopoutWindow = null;
 let pipelinePaintFrame = null;
 let pipelineResizeObserver = null;
 let changeContextMenu = null;
+let opcodePopupState = null;
+let opcodeSnippetSession = null;
+let opcodePopupSuppressed = false;
+let draftSaveTimer = null;
 const memoryWindowChannel = "BroadcastChannel" in window
   ? new BroadcastChannel("ase-studio-memory-window") : null;
 
@@ -139,6 +183,8 @@ function resetEditorHistory() {
 
 function restoreEditorSnapshot(snapshot) {
   if (!snapshot) return;
+  clearOpcodeSnippetSession();
+  closeOpcodePopup();
   const editor = $("#body");
   const viewport = editorViewport();
   applyingEditorHistory = true;
@@ -146,19 +192,26 @@ function restoreEditorSnapshot(snapshot) {
   editor.setSelectionRange(snapshot.start, snapshot.end);
   applyingEditorHistory = false;
   markSourceEdited();
+  scheduleLocalDraft();
+  clearDiagnostics();
   refreshScaffoldProtectionUi();
+  selectedSourceLine = null;
   syncEditor();
   restoreEditorViewport(viewport);
 }
 
 function undoEditor() {
   if (!current || !undoStack.length) return;
+  clearOpcodeSnippetSession();
+  closeOpcodePopup();
   redoStack.push(editorSnapshot());
   restoreEditorSnapshot(undoStack.pop());
 }
 
 function redoEditor() {
   if (!current || !redoStack.length) return;
+  clearOpcodeSnippetSession();
+  closeOpcodePopup();
   undoStack.push(editorSnapshot());
   restoreEditorSnapshot(redoStack.pop());
 }
@@ -235,6 +288,207 @@ function escapeHtml(text) {
   })[character]);
 }
 
+function closeOpcodePopup({suppress = false} = {}) {
+  opcodePopupState = null;
+  if (suppress) opcodePopupSuppressed = true;
+  const popup = $("#opcode-popup");
+  if (popup) popup.hidden = true;
+}
+
+function clearOpcodeSnippetSession() {
+  opcodeSnippetSession = null;
+}
+
+function opcodeContext(editor = $("#body")) {
+  if (!current || !editor || editor.selectionStart !== editor.selectionEnd) return null;
+  const caret = editor.selectionStart;
+  const lineStart = caret > 0 ? editor.value.lastIndexOf("\n", caret - 1) + 1 : 0;
+  const lineEndIndex = editor.value.indexOf("\n", caret);
+  const lineEnd = lineEndIndex < 0 ? editor.value.length : lineEndIndex;
+  const beforeCaret = editor.value.slice(lineStart, caret);
+  const afterCaret = editor.value.slice(caret, lineEnd);
+  const codeBeforeCaret = beforeCaret.split("#", 1)[0];
+  const codeAfterCaret = afterCaret.split("#", 1)[0];
+  if (codeAfterCaret.trim()) return null;
+  const match = codeBeforeCaret.match(/^(\s*)(?:[A-Za-z_.$][\w.$]*:\s*)?([A-Za-z][A-Za-z0-9_.]*)$/);
+  if (!match || match[2].startsWith(".")) return null;
+  const tokenStart = lineStart + codeBeforeCaret.length - match[2].length;
+  const tokenEnd = tokenStart + match[2].length;
+  if (editTouchesProtected(editor.value, tokenStart, tokenEnd)) return null;
+  return {
+    prefix: match[2].toLowerCase(), tokenStart, tokenEnd,
+    lineNumber: editor.value.slice(0, lineStart).split("\n").length,
+    linePrefix: codeBeforeCaret
+  };
+}
+
+function opcodeExtensionEnabled(entry) {
+  if (entry.extension === "Pseudo") return true;
+  const extensions = new Set((current?.isa?.extensions
+    || ["i", "m", "a", "f", "zicsr", "zifencei"])
+    .map(extension => extension.toLowerCase()));
+  return extensions.has(entry.extension.toLowerCase());
+}
+
+function activeOpcodeCandidates(prefix) {
+  return RISCV_OPCODE_CATALOG
+    .filter(entry => opcodeExtensionEnabled(entry)
+      && entry.mnemonic.toLowerCase().startsWith(prefix));
+}
+
+function opcodeExtensionLabel(extension) {
+  return extension === "Pseudo" ? "pseudo" : extension;
+}
+
+function renderOpcodePopup() {
+  const popup = $("#opcode-popup");
+  if (!popup || !opcodePopupState) return;
+  const {context, matches, selectedIndex} = opcodePopupState;
+  $("#opcode-popup-isa").textContent = `ISA ${(current?.isa?.march || "rv32imaf_zicsr_zifencei").toUpperCase()} · ABI ${current?.isa?.abi || "ilp32f"}`;
+  $("#opcode-popup-filter").textContent = `Filter: ${context.prefix}`;
+  const list = $("#opcode-popup-list");
+  if (!matches.length) {
+    list.innerHTML = `<div class="opcode-empty">No enabled instruction matches “${escapeHtml(context.prefix)}”.</div>`;
+  } else {
+    list.innerHTML = matches.map((entry, index) => `
+      <button type="button" class="opcode-option" role="option" data-opcode-index="${index}"
+        aria-selected="${index === selectedIndex ? "true" : "false"}">
+        <code>${escapeHtml(entry.mnemonic)}</code>
+        <span class="opcode-syntax">${escapeHtml(entry.syntax)}</span>
+        <span class="opcode-extension">${escapeHtml(opcodeExtensionLabel(entry.extension))}</span>
+        <span class="opcode-description">${escapeHtml(entry.description || "")}</span>
+      </button>`).join("");
+  }
+  popup.hidden = false;
+  positionOpcodePopup();
+}
+
+function positionOpcodePopup() {
+  const popup = $("#opcode-popup");
+  const editor = $("#body");
+  const wrap = document.querySelector(".editor-wrap");
+  const area = document.querySelector(".editor-area");
+  const context = opcodePopupState?.context;
+  if (!popup || popup.hidden || !editor || !wrap || !area || !context) return;
+  const line = document.querySelector(`#highlight .source-line[data-line="${context.lineNumber}"]`);
+  if (!line) return;
+  const lineRect = line.getBoundingClientRect();
+  const wrapRect = wrap.getBoundingClientRect();
+  const font = getComputedStyle(editor);
+  const canvas = positionOpcodePopup.canvas
+    || (positionOpcodePopup.canvas = document.createElement("canvas"));
+  const context2d = canvas.getContext("2d");
+  context2d.font = font.font;
+  const left = lineRect.left - wrapRect.left
+    + Math.min(context2d.measureText(context.linePrefix).width, Math.max(0, wrap.clientWidth - 120));
+  const lineTop = lineRect.top - wrapRect.top;
+  let top = lineRect.bottom - wrapRect.top + 4;
+  const minLeft = 10;
+  const maxLeft = Math.max(minLeft, wrap.clientWidth - popup.offsetWidth - 10);
+  const visibleTop = area.scrollTop + 8;
+  const visibleBottom = area.scrollTop + area.clientHeight - 8;
+  if (top + popup.offsetHeight > visibleBottom && lineTop - popup.offsetHeight - 4 >= visibleTop) {
+    top = lineTop - popup.offsetHeight - 4;
+  }
+  popup.style.left = `${Math.min(maxLeft, Math.max(minLeft, left))}px`;
+  popup.style.top = `${Math.max(visibleTop, top)}px`;
+}
+
+function updateOpcodePopup() {
+  if (!current || opcodePopupSuppressed) return closeOpcodePopup();
+  const context = opcodeContext();
+  if (!context) return closeOpcodePopup();
+  const matches = activeOpcodeCandidates(context.prefix);
+  const previousMnemonic = opcodePopupState?.matches?.[opcodePopupState.selectedIndex]?.mnemonic;
+  let selectedIndex = matches.findIndex(entry => entry.mnemonic === previousMnemonic);
+  if (selectedIndex < 0) selectedIndex = 0;
+  opcodePopupState = {context, matches, selectedIndex};
+  renderOpcodePopup();
+}
+
+function selectOpcodeSuggestion(delta) {
+  if (!opcodePopupState?.matches.length) return;
+  const count = opcodePopupState.matches.length;
+  opcodePopupState.selectedIndex = (opcodePopupState.selectedIndex + delta + count) % count;
+  renderOpcodePopup();
+}
+
+function instantiateOpcode(entry) {
+  const fields = [];
+  const pattern = /\{(\d+)\}/g;
+  let output = "";
+  let cursor = 0;
+  let match;
+  while ((match = pattern.exec(entry.template))) {
+    output += entry.template.slice(cursor, match.index);
+    const fieldIndex = Number(match[1]);
+    const value = entry.operands[fieldIndex]?.placeholder || "";
+    const start = output.length;
+    output += value;
+    fields.push({
+      start, end: output.length,
+      role: entry.operands[fieldIndex]?.role || "operand"
+    });
+    cursor = match.index + match[0].length;
+  }
+  output += entry.template.slice(cursor);
+  return {text: output, fields};
+}
+
+function completeOpcodeSuggestion() {
+  if (!opcodePopupState) return;
+  const editor = $("#body");
+  const {context, matches, selectedIndex} = opcodePopupState;
+  const entry = matches[selectedIndex];
+  if (!entry || editTouchesProtected(editor.value, context.tokenStart, context.tokenEnd)) return;
+  const snippet = instantiateOpcode(entry);
+  const viewport = editorViewport();
+  const absoluteFields = snippet.fields.map(field => ({
+    start: context.tokenStart + field.start,
+    end: context.tokenStart + field.end,
+    role: field.role
+  }));
+  const first = absoluteFields[0];
+  const caret = context.tokenStart + snippet.text.length;
+  applyEditorChange(context.tokenStart, context.tokenEnd, snippet.text,
+    first?.start ?? caret, first?.end ?? caret, viewport);
+  opcodePopupSuppressed = false;
+  closeOpcodePopup();
+  opcodeSnippetSession = absoluteFields.length
+    ? {fields: absoluteFields, index: 0} : null;
+  if (first) editor.setSelectionRange(first.start, first.end);
+}
+
+function moveOpcodeSnippet(delta) {
+  const session = opcodeSnippetSession;
+  const editor = $("#body");
+  if (!session || !editor) return false;
+  const next = session.index + delta;
+  if (next < 0 || next >= session.fields.length) {
+    const currentField = session.fields[session.index];
+    const caret = delta > 0 ? currentField.end : currentField.start;
+    editor.setSelectionRange(caret, caret);
+    clearOpcodeSnippetSession();
+    return true;
+  }
+  session.index = next;
+  const field = session.fields[next];
+  editor.setSelectionRange(field.start, field.end);
+  return true;
+}
+
+function handleOpcodeSelectionChange() {
+  const editor = $("#body");
+  if (!editor || document.activeElement !== editor) return;
+  if (opcodeSnippetSession) {
+    const field = opcodeSnippetSession.fields[opcodeSnippetSession.index];
+    if (!field || editor.selectionStart !== field.start || editor.selectionEnd !== field.end) {
+      clearOpcodeSnippetSession();
+    }
+  }
+  if (!opcodeSnippetSession) updateOpcodePopup();
+}
+
 function updateDirtyIndicator() {
   document.title = sourceDirty ? "ASE Studio • Unsaved" : "ASE Studio";
   if (!current) return;
@@ -244,6 +498,221 @@ function updateDirtyIndicator() {
 function markSourceEdited() {
   sourceDirty = Boolean(current) && $("#body").value !== savedSource;
   updateDirtyIndicator();
+}
+
+function draftStorageKey(name) {
+  return name ? `ase-studio-draft:${name}` : "";
+}
+
+function setDraftStatus(message = "") {
+  const status = $("#draft-status");
+  if (!status) return;
+  status.textContent = message;
+  status.hidden = !message;
+  status.title = message;
+}
+
+function readLocalDraft(name) {
+  const key = draftStorageKey(name);
+  if (!key) return null;
+  try {
+    const raw = localStorage.getItem(key);
+    if (!raw) return null;
+    const draft = JSON.parse(raw);
+    if (!draft || typeof draft.text !== "string" || typeof draft.timestamp !== "number") return null;
+    return draft;
+  } catch (_error) {
+    return null;
+  }
+}
+
+function clearLocalDraft(name = current?.name) {
+  if (draftSaveTimer !== null) {
+    clearTimeout(draftSaveTimer);
+    draftSaveTimer = null;
+  }
+  const key = draftStorageKey(name);
+  if (key) {
+    try { localStorage.removeItem(key); } catch (_error) { /* Storage may be unavailable. */ }
+  }
+  setDraftStatus();
+}
+
+function writeLocalDraft() {
+  draftSaveTimer = null;
+  if (!current || !sourceDirty) return;
+  const text = $("#body").value;
+  if (text === savedSource) {
+    clearLocalDraft(current.name);
+    return;
+  }
+  try {
+    localStorage.setItem(draftStorageKey(current.name), JSON.stringify({
+      text,
+      timestamp: Date.now(),
+      sourceName: current.sourceName
+    }));
+    setDraftStatus("Local draft saved");
+  } catch (_error) {
+    setDraftStatus("Local draft unavailable");
+  }
+}
+
+function scheduleLocalDraft() {
+  if (!current) return;
+  if (!sourceDirty) {
+    clearLocalDraft(current.name);
+    return;
+  }
+  if (draftSaveTimer !== null) clearTimeout(draftSaveTimer);
+  draftSaveTimer = setTimeout(writeLocalDraft, 250);
+}
+
+function clearDiagnostics() {
+  const container = $("#diagnostics");
+  if (!container) return;
+  container.hidden = true;
+  container.innerHTML = "";
+}
+
+function jumpToSourcePosition(lineNumber, columnNumber = 1) {
+  if (!current) return;
+  const editor = $("#body");
+  const lines = editor.value.split(/\r?\n/);
+  const line = Math.max(1, Math.min(Number(lineNumber) || 1, lines.length));
+  const column = Math.max(1, Number(columnNumber) || 1);
+  let offset = 0;
+  for (let index = 0; index < line - 1; index++) offset += lines[index].length + 1;
+  offset += Math.min(lines[line - 1].length, column - 1);
+  editor.focus();
+  highlightSourceLine(line);
+  editor.setSelectionRange(offset, offset);
+  scrollEditorToLine(line);
+}
+
+function linkerSymbolFromDiagnostic(text) {
+  const match = String(text || "").match(
+    /(?:undefined reference to|multiple definition of|against (?:the )?symbol)\s+[`'\"]([^`'\"]+)[`'\"]/i
+  );
+  return match ? match[1].trim() : "";
+}
+
+function linkerFunctionFromDiagnostic(text) {
+  const quoted = String(text || "").match(/\bin function\s+[`'\"]([^`'\"]+)[`'\"]/i);
+  if (quoted) return quoted[1].trim();
+  const plain = String(text || "").match(/\bin function\s+([A-Za-z_.$][\w.$]*)/i);
+  return plain ? plain[1].trim() : "";
+}
+
+function linkerSourceLocation(sourceText, symbol, functionName) {
+  if (!sourceText) return null;
+  const lines = String(sourceText).split(/\r?\n/);
+  const escapeRegExp = value => String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const functionPattern = functionName
+    ? new RegExp(`^\\s*${escapeRegExp(functionName)}\\s*:`)
+    : null;
+  const symbolPattern = symbol
+    ? new RegExp(`(^|[^A-Za-z0-9_.$])${escapeRegExp(symbol)}(?=$|[^A-Za-z0-9_.$])`, "g")
+    : null;
+  const candidates = [];
+  let functionLine = -1;
+
+  lines.forEach((rawLine, index) => {
+    const code = rawLine.split("#", 1)[0];
+    if (functionPattern && functionLine < 0 && functionPattern.test(code)) functionLine = index;
+    if (!symbolPattern || !code.trim()
+        || /^\s*\.(?:globl|global|extern|weak|hidden|type|size|local|set)\b/i.test(code)
+        || new RegExp(`^\\s*${escapeRegExp(symbol)}\\s*:`).test(code)) return;
+    symbolPattern.lastIndex = 0;
+    let match;
+    while ((match = symbolPattern.exec(code))) {
+      const tokenOffset = match.index + (match[1] ? 1 : 0);
+      candidates.push({line: index + 1, column: tokenOffset + 1});
+      if (match.index === symbolPattern.lastIndex) symbolPattern.lastIndex += 1;
+    }
+  });
+
+  const scopedCandidates = functionLine >= 0
+    ? candidates.filter(candidate => candidate.line >= functionLine + 1)
+    : candidates;
+  const location = scopedCandidates[0] || candidates[0];
+  if (location) return location;
+  if (functionLine >= 0) {
+    const column = Math.max(1, lines[functionLine].search(/\S/) + 1);
+    return {line: functionLine + 1, column};
+  }
+  return null;
+}
+
+function parseCompilerDiagnostics(output) {
+  const sourceName = String(current?.sourceName || "").toLowerCase();
+  const sourceText = typeof document === "undefined"
+    ? "" : document.getElementById("body")?.value || "";
+  const diagnostics = [];
+  let linkerFunction = "";
+  String(output || "").split(/\r?\n/).forEach((line, index) => {
+    const match = line.match(/^(.*?\.(?:s|asm)):(\d+)(?::(\d+))?:\s*(?:(?:fatal\s+)?(error|warning|note)\s*:\s*)?(.*)$/i);
+    if (match) {
+      const file = match[1].trim();
+      const basename = file.split(/[\\/]/).pop().toLowerCase();
+      if (!sourceName || (basename !== sourceName && file.toLowerCase() !== sourceName)) return;
+      const severity = (match[4] || "error").toLowerCase();
+      const message = match[5].trim() || "Assembler diagnostic";
+      diagnostics.push({
+        severity,
+        file: basename,
+        line: Number(match[2]),
+        column: Number(match[3] || 1),
+        message,
+        outputLine: index + 1,
+        kind: "compiler"
+      });
+      return;
+    }
+    const trimmed = line.trim();
+    if (!trimmed || /^make(?:\[.*\])?:/i.test(trimmed)) return;
+    const functionName = linkerFunctionFromDiagnostic(trimmed);
+    if (functionName) linkerFunction = functionName;
+    if (!/(?:undefined reference to|multiple definition of|relocation .*\bagainst\s+(?:the\s+)?symbol|collect2:\s*error:|cannot find\s+-l|(?:ld|as):.*\bfatal error:|(?:ld|as):.*\berror:)/i.test(trimmed)) return;
+    const symbol = linkerSymbolFromDiagnostic(trimmed);
+    const location = symbol ? linkerSourceLocation(sourceText, symbol, linkerFunction) : null;
+    diagnostics.push({severity: "error", file: location ? sourceName : "",
+      line: location?.line || null, column: location?.column || 1,
+      message: trimmed, outputLine: index + 1, kind: "linker",
+      inferred: Boolean(location)});
+  });
+  return diagnostics;
+}
+
+function renderDiagnostics(entries, heading = "Source diagnostics") {
+  const container = $("#diagnostics");
+  if (!container) return;
+  if (!entries.length) {
+    clearDiagnostics();
+    return;
+  }
+  const shown = entries.slice(0, 40);
+  const remaining = entries.length - shown.length;
+  container.hidden = false;
+  container.innerHTML = `<div class="diagnostics-header">${escapeHtml(heading)} · ${entries.length}</div><div class="diagnostics-list">${shown.map((entry, index) => {
+    const location = entry.line
+      ? `${entry.file ? `${entry.file}:` : ""}${entry.line}:${entry.column || 1}`
+      : entry.kind === "linker" ? "linker" : "source";
+    const content = `<span class="diagnostic-location">${escapeHtml(location)}</span><span class="diagnostic-message">${escapeHtml(entry.message)}</span>`;
+    if (!entry.line) return `<div class="diagnostic-item ${escapeHtml(entry.severity || "error")}">${content}</div>`;
+    const title = entry.inferred ? "Jump to the inferred source location" : "Jump to source location";
+    return `<button type="button" class="diagnostic-item ${escapeHtml(entry.severity || "error")}" data-diagnostic-index="${index}" title="${title}">${content}</button>`;
+  }).join("")}${remaining > 0 ? `<div class="diagnostic-message">… and ${remaining} more diagnostics</div>` : ""}</div>`;
+  container.querySelectorAll("[data-diagnostic-index]").forEach(button => {
+    button.onclick = () => {
+      const entry = shown[Number(button.dataset.diagnosticIndex)];
+      if (entry?.line) jumpToSourcePosition(entry.line, entry.column);
+    };
+  });
+}
+
+function setDiagnostics(entries, heading = "Source diagnostics") {
+  renderDiagnostics(entries, heading);
 }
 
 function scaffoldEditsAllowed() {
@@ -311,6 +780,203 @@ function validateSimulationScaffold(text) {
     }
   }
   return issues;
+}
+
+const INTEGER_REGISTER_ALIASES = {
+  zero: "x0", ra: "x1", sp: "x2", gp: "x3", tp: "x4",
+  t0: "x5", t1: "x6", t2: "x7", s0: "x8", fp: "x8", s1: "x9",
+  a0: "x10", a1: "x11", a2: "x12", a3: "x13", a4: "x14", a5: "x15",
+  a6: "x16", a7: "x17", s2: "x18", s3: "x19", s4: "x20", s5: "x21",
+  s6: "x22", s7: "x23", s8: "x24", s9: "x25", s10: "x26", s11: "x27",
+  t3: "x28", t4: "x29", t5: "x30", t6: "x31"
+};
+const FLOAT_REGISTER_ALIASES = {
+  ft0: "f0", ft1: "f1", ft2: "f2", ft3: "f3", ft4: "f4", ft5: "f5",
+  ft6: "f6", ft7: "f7", fs0: "f8", fs1: "f9", fa0: "f10", fa1: "f11",
+  fa2: "f12", fa3: "f13", fa4: "f14", fa5: "f15", fa6: "f16", fa7: "f17",
+  fs2: "f18", fs3: "f19", fs4: "f20", fs5: "f21", fs6: "f22", fs7: "f23",
+  fs8: "f24", fs9: "f25", fs10: "f26", fs11: "f27", ft8: "f28", ft9: "f29",
+  ft10: "f30", ft11: "f31"
+};
+
+function splitAssemblyOperands(text) {
+  const operands = [];
+  let token = "";
+  let depth = 0;
+  for (const character of String(text || "")) {
+    if (character === "(") depth += 1;
+    if (character === ")") depth = Math.max(0, depth - 1);
+    if (character === "," && depth === 0) {
+      operands.push(token.trim());
+      token = "";
+    } else token += character;
+  }
+  if (token.trim() || operands.length) operands.push(token.trim());
+  return operands;
+}
+
+function parseAssemblyLine(rawLine, lineNumber) {
+  const sourceCode = String(rawLine).split("#", 1)[0];
+  let code = sourceCode.trim();
+  let codeOffset = sourceCode.search(/\S/);
+  const labels = [];
+  const labelPattern = /^([A-Za-z_.$][\w.$]*)\s*:\s*/;
+  while (code) {
+    const label = code.match(labelPattern);
+    if (!label) break;
+    labels.push(label[1]);
+    code = code.slice(label[0].length);
+    codeOffset += label[0].length;
+    const leadingWhitespace = code.length - code.trimStart().length;
+    code = code.trimStart();
+    codeOffset += leadingWhitespace;
+  }
+  if (!code || code.startsWith(".")) return {line: lineNumber, labels, instruction: null};
+  const match = code.match(/^([A-Za-z][A-Za-z0-9_.]*)(?:\s+(.*))?$/);
+  if (!match) return {line: lineNumber, labels, instruction: null, malformed: code};
+  const operandsText = match[2] || "";
+  return {
+    line: lineNumber,
+    labels,
+    instruction: {
+      mnemonic: match[1].toLowerCase(),
+      operandsText,
+      operandsOffset: operandsText ? codeOffset + match[0].length - operandsText.length : null
+    }
+  };
+}
+
+function canonicalRegister(token) {
+  const value = String(token || "").trim().toLowerCase();
+  if (INTEGER_REGISTER_ALIASES[value]) return INTEGER_REGISTER_ALIASES[value];
+  if (FLOAT_REGISTER_ALIASES[value]) return FLOAT_REGISTER_ALIASES[value];
+  const integer = value.match(/^x(\d+)$/);
+  if (integer && Number(integer[1]) < 32) return `x${Number(integer[1])}`;
+  const floating = value.match(/^f(\d+)$/);
+  if (floating && Number(floating[1]) < 32) return `f${Number(floating[1])}`;
+  return null;
+}
+
+function registerTokens(text) {
+  const pattern = /\b(?:x\d+|f\d+|zero|ra|sp|gp|tp|fp|[ast]\d+|f[tsa]\d+)\b/gi;
+  return [...String(text || "").matchAll(pattern)].map(match => ({token: match[0], index: match.index}));
+}
+
+function instructionTemplateOperandCount(entry) {
+  const sample = String(entry.template || "").replace(/\{\d+\}/g, "x1");
+  const operandText = sample.replace(/^[^\s]+\s*/, "");
+  return operandText ? splitAssemblyOperands(operandText).length : 0;
+}
+
+function numericTokens(text) {
+  return splitAssemblyOperands(text).flatMap(operand => operand
+    .split(/[\s()]+/).map(token => token.trim()).filter(token =>
+      /^[-+]?(?:0x[0-9a-f]+|0b[01]+|0o[0-7]+|\d+)$/i.test(token)));
+}
+
+function numericValue(token) {
+  try {
+    const value = String(token).trim();
+    const sign = value.startsWith("-") ? -1 : 1;
+    const unsigned = value.replace(/^[+-]/, "");
+    return sign * Number(BigInt(unsigned));
+  } catch (_error) {
+    return null;
+  }
+}
+
+function immediateConstraint(mnemonic, value) {
+  if (value === null || mnemonic.startsWith("c.")) return null;
+  if (/^(?:slli|srli|srai)$/.test(mnemonic)) return {min: 0, max: 31, label: "shift amount"};
+  if (/^csr(?:rw|rs|rc)i$/.test(mnemonic)) return {min: 0, max: 31, label: "CSR immediate"};
+  if (/^(?:beq|bne|blt|bge|bltu|bgeu)$/.test(mnemonic)) {
+    return {min: -4096, max: 4094, alignment: 2, label: "branch offset"};
+  }
+  if (/^(?:jal)$/.test(mnemonic)) {
+    return {min: -1048576, max: 1048574, alignment: 2, label: "jump offset"};
+  }
+  if (/^(?:lui|auipc)$/.test(mnemonic)) return {min: -524288, max: 1048575, label: "upper immediate"};
+  if (/^(?:addi|slti|sltiu|xori|ori|andi|jalr|lb|lh|lw|lbu|lhu|sb|sh|sw|flw|fld|fsw|fsd)$/.test(mnemonic)) {
+    return {min: -2048, max: 2047, label: "immediate"};
+  }
+  return null;
+}
+
+function validateProgramSource(text) {
+  const sourceLines = String(text).split(/\r?\n/);
+  const parsedLines = sourceLines.map((line, index) => parseAssemblyLine(line, index + 1));
+  const labels = new Map();
+  const errors = [];
+  parsedLines.forEach(parsed => parsed.labels.forEach(label => {
+    if (labels.has(label)) {
+      errors.push({severity: "error", line: parsed.line, column: 1,
+        message: `Duplicate label “${label}”.`, kind: "validation"});
+    } else labels.set(label, parsed.line);
+  }));
+
+  parsedLines.forEach(parsed => {
+    if (parsed.malformed) {
+      errors.push({severity: "error", line: parsed.line, column: 1,
+        message: "Could not parse this assembly statement.", kind: "validation"});
+      return;
+    }
+    if (!parsed.instruction) return;
+    const {mnemonic, operandsText} = parsed.instruction;
+    const allMatches = RISCV_OPCODE_CATALOG.filter(entry => entry.mnemonic.toLowerCase() === mnemonic);
+    const enabledMatches = activeOpcodeCandidates(mnemonic).filter(entry =>
+      entry.mnemonic.toLowerCase() === mnemonic);
+    if (!enabledMatches.length) {
+      const reason = allMatches.length
+        ? `Opcode “${mnemonic}” is not enabled by the active ISA.`
+        : `Unknown opcode “${mnemonic}”.`;
+      errors.push({severity: "error", line: parsed.line, column: 1, message: reason, kind: "validation"});
+      return;
+    }
+    const entry = enabledMatches[0];
+    const operands = splitAssemblyOperands(operandsText);
+    const expected = instructionTemplateOperandCount(entry);
+    const acceptsSymbolBaseForm = /^(?:l[bhwd]|fl[wd]|s[bhwd]|fs[wd])$/.test(mnemonic)
+      && operands.length === 3 && canonicalRegister(operands[2]);
+    if (operands.length !== expected && !acceptsSymbolBaseForm) {
+      errors.push({severity: "error", line: parsed.line, column: 1,
+        message: `${mnemonic} expects ${expected}${acceptsSymbolBaseForm ? " or 3" : ""} operand${expected === 1 ? "" : "s"}; found ${operands.length}.`,
+        kind: "validation"});
+    }
+
+    registerTokens(operandsText).forEach(({token, index}) => {
+      const canonical = canonicalRegister(token);
+      if (canonical) return;
+      errors.push({severity: "error", line: parsed.line,
+        column: Math.max(1, parsed.instruction.operandsOffset + index + 1),
+        message: `Invalid register “${token}”. Register numbers must be x0–x31 or f0–f31.`,
+        kind: "validation"});
+    });
+
+    const numbers = numericTokens(operandsText);
+    const range = immediateConstraint(mnemonic, numericValue(numbers[numbers.length - 1]));
+    if (range && numbers.length) {
+      const value = numericValue(numbers[numbers.length - 1]);
+      if (value < range.min || value > range.max) {
+        errors.push({severity: "error", line: parsed.line, column: 1,
+          message: `${range.label} ${value} is outside ${range.min}…${range.max}.`, kind: "validation"});
+      } else if (range.alignment && value % range.alignment !== 0) {
+        errors.push({severity: "error", line: parsed.line, column: 1,
+          message: `${range.label} must be aligned to ${range.alignment} bytes.`, kind: "validation"});
+      }
+    }
+
+    if (entry.operands.some(operand => operand.kind === "label") && operands.length) {
+      const target = operands[operands.length - 1].trim().replace(/[()]/g, "");
+      const targetMatch = target.match(/^([A-Za-z_.$][\w.$]*)/);
+      if (targetMatch && !canonicalRegister(targetMatch[1])
+          && !/^[-+]?(?:0x[0-9a-f]+|0b[01]+|0o[0-7]+|\d+)$/i.test(targetMatch[1])
+          && !labels.has(targetMatch[1])) {
+        errors.push({severity: "error", line: parsed.line, column: 1,
+          message: `Label “${targetMatch[1]}” is not defined in this source.`, kind: "validation"});
+      }
+    }
+  });
+  return errors;
 }
 
 function refreshScaffoldProtectionUi() {
@@ -454,7 +1120,6 @@ function syncEditor() {
       });
     });
   }
-  $("#highlight").dataset.lines = lines.map((_, index) => index + 1).join("\n");
   const lineHeight = parseFloat(getComputedStyle(document.documentElement)
     .getPropertyValue("--editor-line-height")) || 23;
   $("#body").style.height = Math.max(300, lines.length * lineHeight + 20) + "px";
@@ -462,6 +1127,7 @@ function syncEditor() {
     editorArea.scrollTop = savedScrollTop;
     editorArea.scrollLeft = savedScrollLeft;
   }
+  if (opcodePopupState) positionOpcodePopup();
 }
 
 function scrollEditorToLine(lineNumber) {
@@ -479,6 +1145,12 @@ function highlightSourceLine(lineNumber) {
   syncEditor();
   if (!selectedSourceLine) return;
   scrollEditorToLine(selectedSourceLine);
+}
+
+function clearSourceLineHighlight() {
+  if (selectedSourceLine === null) return;
+  selectedSourceLine = null;
+  syncEditor();
 }
 
 async function loadProjects() {
@@ -504,7 +1176,10 @@ async function resolveUnsavedProject(action) {
     alternateValue: "discard",
     cancelLabel: "Cancel"
   });
-  if (choice === "discard") return true;
+  if (choice === "discard") {
+    clearLocalDraft(current.name);
+    return true;
+  }
   if (choice !== "save") return false;
   try {
     await save();
@@ -526,10 +1201,35 @@ async function openProject(name, {skipUnsavedCheck = false} = {}) {
     api("/api/project?name=" + encodedName),
     api("/api/symbols?name=" + encodedName).catch(() => ({symbols: []}))
   ]);
+  const localDraft = readLocalDraft(name);
+  let recoveredDraft = null;
+  if (localDraft && localDraft.text !== opened.text) {
+    const timestamp = new Date(localDraft.timestamp).toLocaleString();
+    const choice = await actionDialog({
+      title: "Recover local draft?",
+      message: `ASE Studio found a local draft for “${name}” saved ${timestamp}. Recover it instead of the saved source?`,
+      confirmLabel: "Recover",
+      confirmValue: "recover",
+      alternateLabel: "Discard draft",
+      alternateValue: "discard",
+      cancelLabel: "Cancel"
+    });
+    if (choice === null) {
+      await loadProjects();
+      return false;
+    }
+    if (choice === "recover") recoveredDraft = localDraft;
+    else clearLocalDraft(name);
+  } else if (localDraft) {
+    clearLocalDraft(name);
+  }
   opened.dataSymbols = symbolData.symbols || [];
   opened.initialMemory = symbolData.initialMemory || {};
   opened.memoryMap = symbolData.memoryMap || [];
   current = opened;
+  clearOpcodeSnippetSession();
+  closeOpcodePopup();
+  opcodePopupSuppressed = false;
   loadMemoryWatches();
   selectedSourceLine = null;
   selectedRow = null;
@@ -541,12 +1241,15 @@ async function openProject(name, {skipUnsavedCheck = false} = {}) {
   searchMatchIndex = -1;
   $("#project-title").textContent = current.name;
   $("#source-name").textContent = current.sourceName;
-  $("#body").value = current.text;
+  $("#body").value = recoveredDraft ? recoveredDraft.text : current.text;
   resetScaffoldProtection();
   resetEditorHistory();
   savedSource = current.text;
-  sourceDirty = false;
+  sourceDirty = Boolean(recoveredDraft);
   updateDirtyIndicator();
+  setDraftStatus(recoveredDraft
+    ? `Recovered draft · ${new Date(recoveredDraft.timestamp).toLocaleTimeString()}` : "");
+  clearDiagnostics();
   $("#save").disabled = false;
   $("#duplicate").disabled = false;
   $("#open-with").disabled = false;
@@ -570,6 +1273,10 @@ async function openProject(name, {skipUnsavedCheck = false} = {}) {
   await loadProjects();
   lastNormalLog = "";
   lastAdvancedLog = lastNormalLog;
+  if (recoveredDraft) {
+    lastNormalLog = `Recovered a local draft for ${current.sourceName}. Save it when you are ready.`;
+    lastAdvancedLog = lastNormalLog;
+  }
   updateLog();
   showTab("output");
   return true;
@@ -587,6 +1294,8 @@ async function save() {
   savedSource = $("#body").value;
   sourceDirty = false;
   updateDirtyIndicator();
+  clearLocalDraft(current.name);
+  clearSourceLineHighlight();
   lastNormalLog = "Saved " + current.sourceName + ".";
   lastAdvancedLog = lastNormalLog;
   updateLog();
@@ -625,6 +1334,7 @@ async function renameCurrentProject() {
   try {
     const oldWatchKey = memoryWatchStorageKey(oldName);
     const savedWatches = oldWatchKey ? localStorage.getItem(oldWatchKey) : null;
+    const savedDraft = readLocalDraft(oldName);
     const result = await api("/api/projects", {
       method: "PATCH",
       headers: {"Content-Type": "application/json"},
@@ -634,6 +1344,10 @@ async function renameCurrentProject() {
     if (savedWatches !== null) {
       localStorage.setItem(memoryWatchStorageKey(result.name), savedWatches);
       localStorage.removeItem(oldWatchKey);
+    }
+    if (savedDraft) {
+      localStorage.setItem(draftStorageKey(result.name), JSON.stringify(savedDraft));
+      localStorage.removeItem(draftStorageKey(oldName));
     }
     updateDirtyIndicator();
     await loadProjects();
@@ -1258,6 +1972,12 @@ async function prepareSubmission(mode = "submit") {
     }
     lastNormalLog = result.output;
     lastAdvancedLog = result.advancedOutput || result.output;
+    if (currentWasSelected && current?.name === submittedProjectName) {
+      const diagnostics = parseCompilerDiagnostics(lastAdvancedLog);
+      setDiagnostics(diagnostics, diagnostics.some(item => item.severity === "error")
+        ? "Compiler diagnostics" : "Compiler messages");
+      if (!sourceDirty) clearLocalDraft(current.name);
+    }
     updateLog();
     let uploaded = false;
     if (result.ok && result.archive && manualUpload) {
@@ -1320,8 +2040,47 @@ async function prepareSubmission(mode = "submit") {
   }
 }
 
+function renderLogOutput(log) {
+  const output = $("#output");
+  if (!output) return;
+  const text = String(log || "");
+  const diagnostics = parseCompilerDiagnostics(text);
+  const byLine = new Map();
+  diagnostics.filter(entry => entry.outputLine).forEach(entry => {
+    const entries = byLine.get(entry.outputLine) || [];
+    entries.push(entry);
+    byLine.set(entry.outputLine, entries);
+  });
+  const preferredDiagnostic = entries => {
+    const located = entries.filter(entry => entry.line);
+    const candidates = located.length ? located : entries;
+    const rank = {error: 0, warning: 1, note: 2};
+    return candidates.reduce((preferred, entry) => {
+      if (!preferred || (rank[entry.severity] ?? 3) < (rank[preferred.severity] ?? 3)) return entry;
+      return preferred;
+    }, null);
+  };
+  output.innerHTML = text.split(/\r?\n/).map((line, index) => {
+    const lineDiagnostics = byLine.get(index + 1) || [];
+    const diagnostic = preferredDiagnostic(lineDiagnostics);
+    const content = escapeHtml(line) || "&#8203;";
+    if (diagnostic?.line) {
+      const count = lineDiagnostics.length > 1
+        ? ` (${lineDiagnostics.length} diagnostics on this output line)` : "";
+      return `<button type="button" class="log-diagnostic ${escapeHtml(diagnostic.severity || "error")}" data-log-line="${index + 1}" title="Jump to ${escapeHtml(diagnostic.file || current?.sourceName || "source")} line ${diagnostic.line}${count}">${content}</button>`;
+    }
+    return `<span class="log-line">${content}</span>`;
+  }).join("");
+  output.querySelectorAll("[data-log-line]").forEach(button => {
+    button.onclick = () => {
+      const entry = preferredDiagnostic(byLine.get(Number(button.dataset.logLine)) || []);
+      if (entry?.line) jumpToSourcePosition(entry.line, entry.column);
+    };
+  });
+}
+
 function updateLog() {
-  $("#output").textContent = $("#advanced-logs").checked ? lastAdvancedLog : lastNormalLog;
+  renderLogOutput($("#advanced-logs").checked ? lastAdvancedLog : lastNormalLog);
 }
 
 function showTab(tab) {
@@ -1347,17 +2106,14 @@ function resetPipelineViewport() {
 async function run(stepAfterRun = false) {
   if (!current) return;
   const source = $("#body").value;
+  const sourceIssues = validateProgramSource(source);
   const scaffoldIssues = validateSimulationScaffold(source);
-  if (scaffoldIssues.length) {
-    const hint = scaffoldProtectionEnabled
-      ? "Turn off Protect labels to edit protected lines."
-      : "Correct the required labels and exit block, then run again.";
-    lastNormalLog = `Cannot start simulation:\n${scaffoldIssues.map(issue => `• ${issue}`).join("\n")}\n\n${hint}`;
-    lastAdvancedLog = lastNormalLog;
-    updateLog();
-    showTab("output");
-    return;
-  }
+  const preRunIssues = [
+    ...sourceIssues,
+    ...scaffoldIssues.map(message => ({severity: "error", message, kind: "scaffold"}))
+  ];
+  clearDiagnostics();
+  clearSourceLineHighlight();
   if (!stepAfterRun) {
     stepMode = false;
     $("#step").textContent = "Run Step";
@@ -1386,8 +2142,18 @@ async function run(stepAfterRun = false) {
     savedSource = $("#body").value;
     sourceDirty = false;
     updateDirtyIndicator();
+    clearLocalDraft(current.name);
     lastNormalLog = result.output;
     lastAdvancedLog = result.advancedOutput || result.output;
+    const compilerDiagnostics = parseCompilerDiagnostics(lastAdvancedLog);
+    if (compilerDiagnostics.length) {
+      setDiagnostics(compilerDiagnostics, compilerDiagnostics.some(item => item.severity === "error")
+        ? "Compiler diagnostics" : "Compiler messages");
+    } else if (!result.ok && preRunIssues.length) {
+      setDiagnostics(preRunIssues.map(issue => ({...issue, severity: "warning"})), "Pre-run hints");
+    } else {
+      clearDiagnostics();
+    }
     updateLog();
     if (result.ok) {
       const trace = await api("/api/pipeline?name=" + encodeURIComponent(current.name));
@@ -1524,15 +2290,18 @@ function renderRegisters() {
   }
   const integerAbi = ["zero", "ra", "sp", "gp", "tp", "t0", "t1", "t2", "s0/fp", "s1", "a0", "a1", "a2", "a3", "a4", "a5", "a6", "a7", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10", "s11", "t3", "t4", "t5", "t6"];
   const floatAbi = ["ft0", "ft1", "ft2", "ft3", "ft4", "ft5", "ft6", "ft7", "fs0", "fs1", "fa0", "fa1", "fa2", "fa3", "fa4", "fa5", "fa6", "fa7", "fs2", "fs3", "fs4", "fs5", "fs6", "fs7", "fs8", "fs9", "fs10", "fs11", "ft8", "ft9", "ft10", "ft11"];
-  const renderColumn = (prefix, aliases, format, width) => aliases.map((alias, index) => {
+  const integerRoles = ["constant zero", "return address", "stack pointer", "global pointer", "thread pointer", "temporary", "temporary", "temporary", "saved register / frame pointer", "saved register", "argument / return value", "argument / return value", "argument / return value", "argument / return value", "argument / return value", "argument / return value", "argument / return value", "argument / return value", "saved register", "saved register", "saved register", "saved register", "saved register", "saved register", "saved register", "saved register", "saved register", "saved register", "temporary", "temporary", "temporary", "temporary"];
+  const floatRoles = ["temporary FP register", "temporary FP register", "temporary FP register", "temporary FP register", "temporary FP register", "temporary FP register", "temporary FP register", "temporary FP register", "saved FP register", "saved FP register", "FP argument / return value", "FP argument / return value", "FP argument / return value", "FP argument / return value", "FP argument / return value", "FP argument / return value", "FP argument / return value", "FP argument / return value", "saved FP register", "saved FP register", "saved FP register", "saved FP register", "saved FP register", "saved FP register", "saved FP register", "saved FP register", "saved FP register", "saved FP register", "temporary FP register", "temporary FP register", "temporary FP register", "temporary FP register"];
+  const renderColumn = (prefix, aliases, roles, format, width) => aliases.map((alias, index) => {
     const name = `${prefix}${index}`;
-    return `<div class="register-value${changed.has(name) ? " changed" : ""}" data-register-change="${name}"><strong>${name}</strong><span>${alias}</span><code>${formatWordValue(state[name] || 0, format, width)}</code></div>`;
+    const label = `${name} / ${alias.replace("/", " / ")} — ${roles[index] || "register"}`;
+    return `<div class="register-value${changed.has(name) ? " changed" : ""}" data-register-change="${name}" title="${escapeHtml(label)}" aria-label="${escapeHtml(label)}"><strong>${name}</strong><span>${escapeHtml(alias)}</span><code>${formatWordValue(state[name] || 0, format, width)}</code></div>`;
   }).join("");
   $("#pipeline-pc").textContent = `PC ${pc}`;
   $("#pipeline-pc").classList.toggle("changed", pcChanged);
   const floatWidth = pipelineData.configuration?.floatingPointPrecision === "double" ? 64 : 32;
-  integerContainer.innerHTML = renderColumn("x", integerAbi, $("#integer-register-format").value, 32);
-  floatContainer.innerHTML = renderColumn("f", floatAbi, $("#float-register-format").value, floatWidth);
+  integerContainer.innerHTML = renderColumn("x", integerAbi, integerRoles, $("#integer-register-format").value, 32);
+  floatContainer.innerHTML = renderColumn("f", floatAbi, floatRoles, $("#float-register-format").value, floatWidth);
 }
 
 async function runStep() {
@@ -1568,14 +2337,16 @@ function positionPipelineCycle(cycle) {
     + Number.parseFloat(
       getComputedStyle(document.documentElement).getPropertyValue("--flow-width"));
   const cellWidth = Number($("#cell-width").value);
+  const displayCycles = pipelineDisplayCycles();
+  const cycleIndex = displayCycles.findIndex(value => value >= cycle);
   // The three frozen columns occupy positions 1–3. Leave one preceding
   // cycle visible so the requested cycle appears at table column 5.
-  const pipelineWidth = frozenWidth + pipelineData.cycles * cellWidth;
+  const pipelineWidth = frozenWidth + displayCycles.length * cellWidth;
   const horizontalTail = Math.max(
     0, scroll.clientWidth - frozenWidth - 2 * cellWidth);
   grid.style.width = `${pipelineWidth + horizontalTail}px`;
   scroll.scrollLeft = Math.max(
-    0, (cycle - 2) * cellWidth);
+    0, (cycleIndex - 1) * cellWidth);
 
   const eventRow = displayedPipelineRows().findIndex(row =>
     row.cycles?.[String(cycle)] !== undefined);
@@ -1643,11 +2414,13 @@ function renderPipelineDiagram() {
   const o3 = config.cpu === "out-of-order";
   const visibleO3Stages = new Set(config.o3VisibleStages || ["issue", "execute", "memory", "cdb", "commit"]);
   const o3Stages = [
-    ["fetch", "Fetch", "F"], ["decode", "Decode", "D"],
-    ["rename", "Rename", "R"], ["issue", "Issue", "I"],
+    ["fetch", `Fetch × ${config.fetchWidth || 2}`, "F"],
+    ["decode", `Decode × ${config.decodeWidth || 2}`, "D"],
+    ["rename", `Rename × ${config.renameWidth || 2}`, "R"],
+    ["issue", `Issue × ${config.dispatchWidth || 2}`, "I"],
     ["execute", "EXE", "E"], ["memory", "MEM", "M"],
     ["cdb", `CDB × ${config.writebackWidth || 1}`, "C"],
-    ["commit", "Commit", "W"]
+    ["commit", `Commit × ${config.commitWidth || 2}`, "W"]
   ];
   const stages = o3
     ? o3Stages.filter(([key]) => visibleO3Stages.has(key)).map(([_key, label, code]) => [label, code])
@@ -1658,11 +2431,13 @@ function renderPipelineDiagram() {
     ? `L1 I ${config.iCacheSize} · D ${config.dCacheSize}<br>Hit ${config.cacheLatency} cycles · RAM ${config.memoryLatency} cycles`
     : `Direct memory · I ${config.instructionMemoryLatency} · Read ${config.dataReadLatency} · Write ${config.dataWriteLatency} cycles`;
   const predictorName = {
-    ideal: "Ideal (perfect prediction)", local: "Local two-bit",
-    tournament: "Tournament", bimode: "Bi-mode", tage: "TAGE"
-  }[config.branchPredictor] || "Ideal (perfect prediction)";
+    ideal: "Ideal (teaching baseline)",
+    local: "Local counter (2-bit baseline)",
+    tournament: "Tournament (local + global)",
+    bimode: "Bi-mode", tage: "TAGE (tagged hybrid)"
+  }[config.branchPredictor] || "Ideal (teaching baseline)";
   const details = (o3
-    ? `Out-of-order execution · speculation on<br>Predictor: ${predictorName}<br>Issue ${config.dispatchWidth} · branches/jumps issue alone<br>CDB ${config.writebackWidth} · Commit ${config.commitWidth}<br>Address unit: 1 cycle · Jump unit: 1 cycle<br>ROB · RS/IQ · LQ · SQ: unlimited`
+    ? `Out-of-order execution · speculation on<br>Predictor: ${predictorName}<br>Fetch ${config.fetchWidth} · Decode ${config.decodeWidth} · Rename ${config.renameWidth}<br>Issue ${config.dispatchWidth} · branches/jumps issue alone<br>CDB ${config.writebackWidth} · Commit ${config.commitWidth}<br>EXE: Int ALU ${config.intAluUnits || 1} · Mul ${config.intMulUnits || 1} · Div ${config.intDivUnits || 1}<br>FP ALU ${config.floatAluUnits || 1} · Mul ${config.floatMulUnits || 1} · Div ${config.floatDivUnits || 1}<br>Shared load/store units: ${config.memoryUnits || 1}<br>ROB · RS/IQ · LQ · SQ: unlimited`
     : `Forwarding: ${config.forwarding ? "on" : "off"}<br>Out-of-order execution: ${config.outOfOrderExecution !== false ? "on" : "off"}`)
     + `<br>Floating point: ${config.floatingPointPrecision === "double" ? "double (64-bit)" : "single (32-bit)"}`
     + `<br>Compressed instructions: ${config.compressedInstructions ? "on" : "off"}`
@@ -2114,11 +2889,14 @@ function pipelineRowBounds(row) {
 }
 
 function jumpsForPipelineRow(row, lastVisibleCycle, expanded = expandedLoopView()) {
+  if (row.squashed) return [];
   let jumps = (pipelineData.jumps || []).filter(jump =>
     jump.fromAddress === row.address && jump.cycle <= lastVisibleCycle);
   if (expanded) {
     const bounds = pipelineRowBounds(row);
-    jumps = jumps.filter(jump => bounds.first <= jump.cycle && jump.cycle <= bounds.last);
+    jumps = jumps.filter(jump => jump.instructionSequence != null && row.sequence != null
+      ? jump.instructionSequence === row.sequence
+      : bounds.first <= jump.cycle && jump.cycle <= bounds.last);
   }
   const grouped = new Map();
   jumps.forEach(jump => {
@@ -2161,6 +2939,29 @@ function jumpTargetRow(rows, address, afterCycle = 0) {
   return fallback;
 }
 
+function pipelineStageTokens(stage) {
+  return stage.match(/[A-Z]\*?/g) || [];
+}
+
+function pipelineStageLabel(stage, o3) {
+  const tokens = pipelineStageTokens(stage);
+  if (o3) {
+    return tokens.map(token =>
+      ({C: "CDB", W: "C"}[token[0]] || token[0]) + token.slice(1)).join("/");
+  }
+  return tokens.length > 1 ? tokens.join("/") : stage;
+}
+
+function pipelineDisplayCycles(data = pipelineData) {
+  if (!data) return [];
+  const hidden = new Set(data.collapsedRecoveryCycles || []);
+  const cycles = [];
+  for (let cycle = 1; cycle <= data.cycles; cycle++) {
+    if (!hidden.has(cycle)) cycles.push(cycle);
+  }
+  return cycles;
+}
+
 function renderPipeline() {
   if (pipelinePaintFrame !== null) {
     cancelAnimationFrame(pipelinePaintFrame);
@@ -2182,6 +2983,8 @@ function renderPipeline() {
     return;
   }
   const displayRows = displayedPipelineRows();
+  const displayCycles = pipelineDisplayCycles(data);
+  const columnCount = displayCycles.length;
   const dynamicRows = (data.dynamicInstructions?.length ? data.dynamicInstructions : data.instructions)
     .filter(row => !row.squashed);
   const cellWidth = Number($("#cell-width").value);
@@ -2190,7 +2993,7 @@ function renderPipeline() {
   const instructionWidth = window.innerWidth <= 700 ? 150 : 182;
   const flowWidth = window.innerWidth <= 700 ? 132 : 140;
   const frozenWidth = addressWidth + instructionWidth + flowWidth;
-  const totalWidth = addressWidth + instructionWidth + flowWidth + data.cycles * cellWidth;
+  const totalWidth = addressWidth + instructionWidth + flowWidth + columnCount * cellWidth;
   const grid = $("#pipeline-grid");
   const scroll = $("#pipeline-scroll");
   const savedLeft = scroll.scrollLeft;
@@ -2227,18 +3030,18 @@ function renderPipeline() {
     const firstVisible = Math.max(
       1, Math.floor(scroll.scrollLeft / cellWidth) + 1);
     const lastVisible = Math.min(
-      data.cycles,
+      columnCount,
       Math.ceil((scroll.scrollLeft + cycleViewportWidth) / cellWidth));
     return {
       first: Math.max(1, firstVisible - cycleOverscan),
-      last: Math.min(data.cycles, lastVisible + cycleOverscan)
+      last: Math.min(columnCount, lastVisible + cycleOverscan)
     };
   }
 
   function virtualColumns(firstCycle, lastCycle) {
     const beforeWidth = (firstCycle - 1) * cellWidth;
     const cycleCount = Math.max(0, lastCycle - firstCycle + 1);
-    const afterWidth = Math.max(0, data.cycles - lastCycle) * cellWidth;
+    const afterWidth = Math.max(0, columnCount - lastCycle) * cellWidth;
     return `${addressWidth}px ${instructionWidth}px ${flowWidth}px ${beforeWidth}px repeat(${cycleCount}, ${cellWidth}px) ${afterWidth}px`;
   }
 
@@ -2247,7 +3050,8 @@ function renderPipeline() {
     html += '<div class="cell inst head corner">Instruction</div>';
     html += '<div class="cell flow-cell head corner" title="Control-flow transfers, prediction misses, and cache misses">Control / cache</div>';
     html += '<div class="pipeline-cycle-spacer" aria-hidden="true"></div>';
-    for (let cycle = firstCycle; cycle <= lastCycle; cycle++) {
+    for (let column = firstCycle; column <= lastCycle; column++) {
+      const cycle = displayCycles[column - 1];
       html += `<div class="cell head ${selectedColumn === cycle ? "column-selected" : ""}${cycle > visibleCycle ? " future" : ""}" data-col="${cycle}">${cycle}</div>`;
     }
     html += '<div class="pipeline-cycle-spacer" aria-hidden="true"></div>';
@@ -2260,7 +3064,7 @@ function renderPipeline() {
 
     for (let rowIndex = first; rowIndex < last; rowIndex++) {
       const row = displayRows[rowIndex];
-      html += `<div class="pipeline-row ${selectedRow === rowIndex ? "row-selected" : ""}" style="top:${rowIndex * rowHeight}px;grid-template-columns:${columns};width:${totalWidth}px">`;
+      html += `<div class="pipeline-row ${selectedRow === rowIndex ? "row-selected" : ""}${row.squashed ? " wrong-path" : ""}" style="top:${rowIndex * rowHeight}px;grid-template-columns:${columns};width:${totalWidth}px">`;
       const iterationText = row.iterations > 1 ? ` · ${row.iterations} iterations` : "";
       const address = row.address ? `0x${escapeHtml(row.address)}` : "—";
       html += `<div class="cell address-cell" data-row="${rowIndex}" title="Program counter">${address}</div>`;
@@ -2284,16 +3088,20 @@ function renderPipeline() {
       const predictionEvent = predictionMisses
         ? `<span class="branch-miss">BP miss${predictionMisses > 1 ? ` ×${predictionMisses}` : ""}</span>`
         : "";
-      html += `<div class="cell flow-cell" data-row="${rowIndex}">${jumpLinks}${predictionEvent}${cacheEvents}</div>`;
+      const squashEvent = row.squashed
+        ? `<span class="squash-label" title="Wrong-path instruction discarded after a branch misprediction">Squashed</span>`
+        : "";
+      html += `<div class="cell flow-cell" data-row="${rowIndex}">${jumpLinks}${predictionEvent}${cacheEvents}${squashEvent}</div>`;
       html += '<div class="pipeline-cycle-spacer" aria-hidden="true"></div>';
-      for (let cycle = firstCycle; cycle <= lastCycle; cycle++) {
+      for (let column = firstCycle; column <= lastCycle; column++) {
+        const cycle = displayCycles[column - 1];
         const stage = row.cycles[cycle] || "";
-        const label = pipelineData.format === "o3"
-          ? stage.split("").map(marker => ({C: "CDB", W: "C"}[marker] || marker)).join("/")
-          : stage.length > 1 && stage !== "S" ? stage.split("").join("/") : stage;
-        const stageClass = stage ? "stage-" + stage.slice(-1) : "";
+        const label = pipelineStageLabel(stage, pipelineData.format === "o3");
+        const tokens = pipelineStageTokens(stage);
+        const stageClass = tokens.length ? "stage-" + tokens.at(-1)[0] : "";
+        const squashedClass = stage.includes("*") ? " squashed-stage" : "";
         const columnClass = selectedColumn === cycle ? " column-selected" : "";
-        html += `<div class="cell ${stageClass}${columnClass}${cycle > visibleCycle ? " future" : ""}" data-row="${rowIndex}" data-col="${cycle}" data-stage="${stage}">${label}</div>`;
+        html += `<div class="cell ${stageClass}${squashedClass}${columnClass}${cycle > visibleCycle ? " future" : ""}" data-row="${rowIndex}" data-col="${cycle}" data-stage="${stage}">${label}</div>`;
       }
       html += '<div class="pipeline-cycle-spacer" aria-hidden="true"></div>';
       html += "</div>";
@@ -2353,8 +3161,10 @@ function renderPipeline() {
         S: pipelineData.format === "o3" ? "Wait in reservation station / ROB" : "Pipeline stall / wait",
         X: "Squashed after incorrect speculation"
       };
-      const stageName = stage.split("")
-        .map(marker => stageNames[marker] || marker).join(" / ");
+      const stageName = pipelineStageTokens(stage)
+        .map(token => (stageNames[token[0]] || token[0])
+          + (token.endsWith("*") ? " (wrong path; later squashed)" : ""))
+        .join(" / ");
       $("#detail").textContent = `Instruction: ${row.instruction} | Cycle: ${cell.dataset.col} | Stage: ${stageName} | Iterations: ${row.iterations}`;
     } else {
       $("#detail").textContent = `Clock cycle ${cell.dataset.col}`;
@@ -2415,6 +3225,8 @@ function adjustCellWidth(delta) {
 function exportVisiblePipeline() {
   if (!pipelineData || !current) return;
   const lastCycle = playbackCycle === null ? pipelineData.cycles : playbackCycle;
+  const displayCycles = pipelineDisplayCycles(pipelineData)
+    .filter(cycle => cycle <= lastCycle);
   const quote = value => `"${String(value ?? "").replaceAll('"', '""')}"`;
   const dynamicRows = (pipelineData.dynamicInstructions?.length
     ? pipelineData.dynamicInstructions : pipelineData.instructions)
@@ -2426,7 +3238,9 @@ function exportVisiblePipeline() {
     total + Number(row.mispredictions || (row.mispredicted ? 1 : 0)), 0);
   const cpi = instructionCount ? (pipelineData.cycles / instructionCount).toFixed(3) : "0";
   const headers = ["PC Address", "Instruction", "Control flow / cache"];
-  for (let cycle = 1; cycle <= lastCycle; cycle++) headers.push(`Cycle ${cycle}`);
+  for (const cycle of displayCycles) {
+    headers.push(`Cycle ${cycle}`);
+  }
   const rows = displayedPipelineRows().map(row => {
     const flow = [
       ...jumpsForPipelineRow(row, lastCycle).map(jump =>
@@ -2435,14 +3249,12 @@ function exportVisiblePipeline() {
         `${event.cache}$ ${event.result}${event.count > 1 ? ` x${event.count}` : ""}`),
       ...(Number(row.mispredictions || (row.mispredicted ? 1 : 0))
         ? [`BP miss${Number(row.mispredictions || 1) > 1 ? ` x${Number(row.mispredictions)}` : ""}`]
-        : [])
+        : []),
+      ...(pipelineData.format === "o3" && row.squashed ? ["Squashed"] : [])
     ].join("; ");
     const values = [row.address ? `0x${row.address}` : "", row.instruction, flow];
-    for (let cycle = 1; cycle <= lastCycle; cycle++) {
-      const stage = row.cycles[String(cycle)] || "";
-      values.push(pipelineData.format === "o3"
-        ? stage.split("").map(marker => ({C: "CDB", W: "C"}[marker] || marker)).join("/")
-        : stage);
+    for (const cycle of displayCycles) {
+      values.push(pipelineStageLabel(row.cycles[cycle] || "", pipelineData.format === "o3"));
     }
     return values;
   });
@@ -2471,22 +3283,13 @@ function updateForwardingControl() {
     && $("#cpu-model").value === "out-of-order";
   const integerPanel = $("#integer-unit-settings");
   const floatingPanel = $("#floating-unit-settings");
-  const integerAluRow = $("#int-alu").closest(".unit-row");
-  const unitFields = (outOfOrder ? floatingPanel : integerPanel).querySelector(".unit-fields");
-  unitFields.insertBefore(integerAluRow, unitFields.querySelector(".unit-heading").nextElementSibling);
-  integerPanel.hidden = outOfOrder;
+  integerPanel.hidden = false;
   floatingPanel.closest(".units-grid").classList.toggle("superscalar", outOfOrder);
+  integerPanel.querySelector("legend").textContent = outOfOrder
+    ? "Integer and load/store units · clock cycles" : "Integer unit · clock cycles";
   floatingPanel.querySelector("legend").textContent = outOfOrder
-    ? "Functional units · clock cycles" : "Floating-point unit · clock cycles";
-  integerAluRow.firstElementChild.textContent = outOfOrder ? "Integer ALU" : "ALU";
-  for (const [id, singleLabel, combinedLabel] of [
-    ["float-alu", "ALU", "FP arithmetic"],
-    ["float-mul", "Multiply", "FP multiply"],
-    ["float-div", "Divide", "FP divide"]
-  ]) {
-    $("#" + id).closest(".unit-row").firstElementChild.textContent = outOfOrder
-      ? combinedLabel : singleLabel;
-  }
+    ? "Floating-point units · clock cycles" : "Floating-point unit · clock cycles";
+  $("#o3-memory-units-field").hidden = !outOfOrder;
   $("#forwarding").disabled = outOfOrder;
   if (outOfOrder) $("#forwarding").checked = true;
   $("#forwarding-note").textContent = outOfOrder ? "(results use CDB/ROB forwarding)" : "";
@@ -2494,11 +3297,6 @@ function updateForwardingControl() {
   $("#memory-management").hidden = !studioFeatures.memoryConfiguration;
   $("#out-of-order-execution").closest("label").hidden = outOfOrder;
   $("#out-of-order-execution").disabled = outOfOrder;
-  ["int-mul", "int-div"].forEach(id => {
-    const row = $("#" + id).closest(".unit-row");
-    row.hidden = outOfOrder;
-    row.querySelectorAll("input").forEach(input => { input.disabled = outOfOrder; });
-  });
   if (outOfOrder) {
     $("#out-of-order-execution").checked = true;
     $("#speculative-execution").checked = true;
@@ -2517,6 +3315,68 @@ function updateMemoryControls() {
     .forEach(selector => { $(selector).disabled = !available || !direct; });
   ["#i-cache-size", "#d-cache-size", "#cache-line", "#cache-latency", "#memory-latency"]
     .forEach(selector => { $(selector).disabled = !available || !cache; });
+}
+
+function updatePredictorControls() {
+  $("#o3-predictor-parameters").hidden = $("#cpu-model").value !== "out-of-order"
+    || $("#o3-branch-predictor").value === "ideal";
+}
+
+function openPredictorParameters() {
+  const predictor = $("#o3-branch-predictor").value;
+  if (!predictorFields[predictor]) return;
+  const parameters = predictorParameterDraft[predictor]
+    || o3Defaults.branchPredictorParameters?.[predictor] || {};
+  $("#predictor-title").textContent = predictorNames[predictor] + " parameters";
+  $("#predictor-fields").innerHTML = predictorFields[predictor].map(
+    ([key, label, minimum, maximum, help]) => {
+      const value = parameters[key];
+      const displayed = Array.isArray(value) ? value.join(", ") : value ?? "";
+      const kind = minimum === null ? "text" : "number";
+      const range = minimum === null ? "" : ` min="${minimum}" max="${maximum}" step="1"`;
+      return `<label class="${minimum === null ? "wide" : ""}">${escapeHtml(label)}<input name="${key}" type="${kind}" value="${escapeHtml(displayed)}"${range} required>${help ? `<small>${escapeHtml(help)}</small>` : ""}</label>`;
+    }).join("");
+  $("#predictor-dialog").showModal();
+}
+
+async function savePredictorParameters(event) {
+  event.preventDefault();
+  const predictor = $("#o3-branch-predictor").value;
+  const parameters = {};
+  for (const [key] of predictorFields[predictor]) {
+    const input = $("#predictor-form").elements.namedItem(key);
+    if (key === "tagTableTagWidths" || key === "logTagTableSizes") {
+      const parts = input.value.trim().split(/[\s,]+/);
+      parameters[key] = parts.map(Number);
+      if (parts.length !== 8 || parameters[key].some(number => !Number.isInteger(number))) {
+        await showActionMessage("Branch predictor parameters", `${key} needs eight comma-separated whole numbers.`);
+        return;
+      }
+    } else {
+      parameters[key] = Number(input.value);
+      if (!Number.isInteger(parameters[key])) {
+        await showActionMessage("Branch predictor parameters", `${key} must be a whole number.`);
+        return;
+      }
+    }
+  }
+  const powerOfTwo = number => number > 0 && Number.isInteger(Math.log2(number));
+  for (const key of ["localPredictorSize", "localHistoryTableSize", "globalPredictorSize", "choicePredictorSize", "BTBEntries"]) {
+    if (key in parameters && !powerOfTwo(parameters[key])) {
+      await showActionMessage("Branch predictor parameters", `${key} must be a power of two.`);
+      return;
+    }
+  }
+  if (predictor === "local" && !powerOfTwo(parameters.localPredictorSize / parameters.localCtrBits)) {
+    await showActionMessage("Branch predictor parameters", "Local storage divided by counter bits must give a power-of-two number of entries.");
+    return;
+  }
+  if (predictor === "tage" && parameters.maxHist <= parameters.minHist) {
+    await showActionMessage("Branch predictor parameters", "TAGE maximum history must exceed its minimum history.");
+    return;
+  }
+  predictorParameterDraft[predictor] = parameters;
+  $("#predictor-dialog").close();
 }
 
 async function openCpuConfiguration() {
@@ -2556,10 +3416,21 @@ async function openCpuConfiguration() {
     $("#issue-width").value = config.issueWidth;
     $("#writeback-width").value = config.writebackWidth;
     $("#commit-width").value = config.commitWidth;
+    $("#int-alu-units").value = config.intAluUnits || 1;
+    $("#int-mul-units").value = config.intMulUnits || 1;
+    $("#int-div-units").value = config.intDivUnits || 1;
+    $("#float-alu-units").value = config.floatAluUnits || 1;
+    $("#float-mul-units").value = config.floatMulUnits || 1;
+    $("#float-div-units").value = config.floatDivUnits || 1;
+    $("#memory-units").value = config.memoryUnits || 1;
     $("#rob-entries").value = config.robEntries;
     $("#iq-entries").value = config.iqEntries;
     $("#lq-entries").value = config.lqEntries;
     $("#sq-entries").value = config.sqEntries;
+    $("#o3-branch-predictor").value = config.branchPredictor || "ideal";
+    predictorParameterDraft = JSON.parse(JSON.stringify(
+      config.branchPredictorParameters || o3Defaults.branchPredictorParameters || {}));
+    updatePredictorControls();
     $("#o3-evaluation-label").value = config.o3EvaluationLabel || "";
     $("#out-of-order-execution").checked = config.outOfOrderExecution !== false;
     $("#speculative-execution").checked = config.speculativeExecution !== false;
@@ -2677,7 +3548,14 @@ async function openEnvironmentSettings() {
 }
 
 function clearCurrentProject() {
+  if (draftSaveTimer !== null) {
+    clearTimeout(draftSaveTimer);
+    draftSaveTimer = null;
+  }
   current = null;
+  clearOpcodeSnippetSession();
+  closeOpcodePopup();
+  opcodePopupSuppressed = false;
   scaffoldProtectionEnabled = true;
   scaffoldEditAuthorized = false;
   updateScaffoldProtectionUi();
@@ -2686,6 +3564,8 @@ function clearCurrentProject() {
   savedSource = "";
   sourceDirty = false;
   updateDirtyIndicator();
+  setDraftStatus();
+  clearDiagnostics();
   $("#project-title").textContent = "Open a project";
   $("#source-name").textContent = "Assembly Editor";
   $("#body").value = "";
@@ -2731,6 +3611,7 @@ async function deleteCurrentProject() {
       body: JSON.stringify({name, confirmation})
     });
     localStorage.removeItem(memoryWatchStorageKey(name));
+    clearLocalDraft(name);
     clearCurrentProject();
     lastNormalLog = `Deleted project ${name}. Generated results were kept.`;
     lastAdvancedLog = lastNormalLog;
@@ -2751,7 +3632,10 @@ function applyEditorChange(start, end, replacement, selectionStart, selectionEnd
   pendingEditorViewport = null;
   editor.value = editor.value.slice(0, start) + replacement + editor.value.slice(end);
   markSourceEdited();
+  scheduleLocalDraft();
+  clearDiagnostics();
   refreshScaffoldProtectionUi();
+  selectedSourceLine = null;
   syncEditor();
   editor.setSelectionRange(selectionStart, selectionEnd);
   restoreEditorViewport(viewport);
@@ -2770,6 +3654,8 @@ function editTouchesProtected(text, start, end) {
 
 $("#body").addEventListener("beforeinput", event => {
   if (!current) return;
+  clearOpcodeSnippetSession();
+  opcodePopupSuppressed = false;
   pendingEditorViewport = editorViewport();
   if (event.inputType === "historyUndo" || event.inputType === "historyRedo") {
     event.preventDefault();
@@ -2804,12 +3690,43 @@ $("#body").addEventListener("input", () => {
   pendingEditorSnapshot = null;
   pendingEditorViewport = null;
   markSourceEdited();
+  scheduleLocalDraft();
+  clearDiagnostics();
   refreshScaffoldProtectionUi();
+  selectedSourceLine = null;
   syncEditor();
   restoreEditorViewport(viewport);
+  updateOpcodePopup();
+});
+$("#body").addEventListener("blur", () => {
+  clearOpcodeSnippetSession();
+  closeOpcodePopup();
 });
 $("#body").addEventListener("keydown", event => {
-  if (event.key === "Tab" || event.key === "ISO_Left_Tab" || event.code === "Tab") {
+  const isTab = event.key === "Tab" || event.key === "ISO_Left_Tab" || event.code === "Tab";
+  if (isTab && opcodeSnippetSession) {
+    event.preventDefault();
+    moveOpcodeSnippet(event.shiftKey ? -1 : 1);
+    return;
+  }
+  if (isTab && !event.shiftKey && opcodePopupState?.matches.length) {
+    event.preventDefault();
+    completeOpcodeSuggestion();
+    return;
+  }
+  if (opcodePopupState && (event.key === "ArrowDown" || event.key === "ArrowUp")) {
+    event.preventDefault();
+    selectOpcodeSuggestion(event.key === "ArrowDown" ? 1 : -1);
+    return;
+  }
+  if (event.key === "Escape" && (opcodePopupState || opcodeSnippetSession)) {
+    event.preventDefault();
+    clearOpcodeSnippetSession();
+    closeOpcodePopup({suppress: true});
+    return;
+  }
+  clearOpcodeSnippetSession();
+  if (isTab) {
     event.preventDefault();
     const editor = event.target;
     const viewport = editorViewport();
@@ -2850,6 +3767,22 @@ $("#body").addEventListener("keydown", event => {
     const caret = start + replacement.length;
     applyEditorChange(start, end, replacement, caret, caret, viewport);
   }
+});
+document.addEventListener("selectionchange", handleOpcodeSelectionChange);
+$("#opcode-popup-close").addEventListener("mousedown", event => event.preventDefault());
+$("#opcode-popup-close").onclick = () => {
+  closeOpcodePopup({suppress: true});
+  $("#body").focus();
+};
+$("#opcode-popup-list").addEventListener("mousedown", event => {
+  if (event.target.closest(".opcode-option")) event.preventDefault();
+});
+$("#opcode-popup-list").addEventListener("click", event => {
+  const option = event.target.closest(".opcode-option");
+  if (!option || !opcodePopupState) return;
+  opcodePopupState.selectedIndex = Number(option.dataset.opcodeIndex);
+  completeOpcodeSuggestion();
+  $("#body").focus();
 });
 $("#save").onclick = save;
 $("#duplicate").onclick = duplicateCurrentProject;
@@ -2951,6 +3884,8 @@ document.addEventListener("keydown", event => {
   if (event.key === "Escape") closeChangeContextMenu();
 });
 window.addEventListener("resize", closeChangeContextMenu);
+document.querySelector(".editor-area").addEventListener("scroll", positionOpcodePopup);
+window.addEventListener("resize", positionOpcodePopup);
 $("#memory-symbol-form").onsubmit = event => {
   event.preventDefault();
   addMemoryWatch($("#memory-symbol").value);
@@ -2982,8 +3917,14 @@ $("#cpu-model").onchange = () => {
     const defaultInputs = {
       intAlu: "int-alu", intMul: "int-mul", intDiv: "int-div",
       floatAlu: "float-alu", floatMul: "float-mul", floatDiv: "float-div",
-      dispatchWidth: "dispatch-width", issueWidth: "issue-width",
-      writebackWidth: "writeback-width", commitWidth: "commit-width"
+      fetchWidth: "fetch-width", decodeWidth: "decode-width",
+      renameWidth: "rename-width", dispatchWidth: "dispatch-width",
+      issueWidth: "issue-width",
+      writebackWidth: "writeback-width", commitWidth: "commit-width",
+      intAluUnits: "int-alu-units", intMulUnits: "int-mul-units",
+      intDivUnits: "int-div-units", floatAluUnits: "float-alu-units",
+      floatMulUnits: "float-mul-units", floatDivUnits: "float-div-units",
+      memoryUnits: "memory-units"
     };
     for (const [key, id] of Object.entries(defaultInputs)) {
       if (o3Defaults[key] !== undefined) $("#" + id).value = o3Defaults[key];
@@ -2993,6 +3934,7 @@ $("#cpu-model").onchange = () => {
       if (o3Defaults[key] !== undefined) $("#" + unit + "-pipelined").checked = o3Defaults[key];
     }
     const defaultStages = new Set(["issue", "execute", "memory", "cdb", "commit"]);
+    $("#o3-branch-predictor").value = o3Defaults.branchPredictor || "ideal";
     document.querySelectorAll("[data-o3-stage]").forEach(input => {
       input.checked = defaultStages.has(input.dataset.o3Stage);
     });
@@ -3000,7 +3942,12 @@ $("#cpu-model").onchange = () => {
   }
   updateForwardingControl();
   updateMemoryControls();
+  updatePredictorControls();
 };
+$("#o3-branch-predictor").onchange = updatePredictorControls;
+$("#o3-predictor-parameters").onclick = openPredictorParameters;
+$("#cancel-predictor").onclick = () => $("#predictor-dialog").close();
+$("#predictor-form").onsubmit = savePredictorParameters;
 $("#memory-mode").onchange = updateMemoryControls;
 $("#cancel-submission").onclick = () => $("#submission-dialog").close();
 $("#submission-dialog").addEventListener("cancel", event => {
@@ -3120,11 +4067,20 @@ $("#cpu-form").onsubmit = async event => {
     issueWidth: Number($("#issue-width").value),
     writebackWidth: Number($("#writeback-width").value),
     commitWidth: Number($("#commit-width").value),
+    intAluUnits: Number($("#int-alu-units").value),
+    intMulUnits: Number($("#int-mul-units").value),
+    intDivUnits: Number($("#int-div-units").value),
+    floatAluUnits: Number($("#float-alu-units").value),
+    floatMulUnits: Number($("#float-mul-units").value),
+    floatDivUnits: Number($("#float-div-units").value),
+    memoryUnits: Number($("#memory-units").value),
     robEntries: Number($("#rob-entries").value),
     iqEntries: Number($("#iq-entries").value),
     lqEntries: Number($("#lq-entries").value),
     sqEntries: Number($("#sq-entries").value),
-    branchPredictor: $("#cpu-model").value === "out-of-order" ? "ideal" : "local",
+    branchPredictor: $("#cpu-model").value === "out-of-order"
+      ? $("#o3-branch-predictor").value : "local",
+    branchPredictorParameters: predictorParameterDraft,
     speculativeExecution: $("#speculative-execution").checked,
     outOfOrderExecution: $("#out-of-order-execution").checked,
     o3EvaluationLabel: $("#o3-evaluation-label").value.trim(),
@@ -3137,6 +4093,9 @@ $("#cpu-form").onsubmit = async event => {
       headers: {"Content-Type": "application/json"},
       body: JSON.stringify({name: current.name, config})
     });
+    const updatedProject = await api("/api/project?name=" + encodeURIComponent(current.name));
+    current.isa = updatedProject.isa || current.isa;
+    closeOpcodePopup();
     $("#cpu-dialog").close();
     lastNormalLog = "CPU configuration saved. It will be used on the next Run.";
     lastAdvancedLog = lastNormalLog;
@@ -3326,6 +4285,7 @@ document.addEventListener("keydown", event => {
   }
 }, true);
 window.aseHasUnsavedChanges = () => sourceDirty;
+window.addEventListener("beforeunload", writeLocalDraft);
 
 const splitter = $("#splitter");
 splitter.addEventListener("pointerdown", event => {
