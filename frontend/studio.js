@@ -34,6 +34,46 @@ let externalSyncBusy = false;
 let memoryWatches = [];
 let cpuConfigurationOpenedAs = null;
 let o3Defaults = {};
+let predictorParameterDraft = {};
+const predictorNames = {
+  local: "Local counter (2-bit baseline)",
+  tournament: "Tournament (local + global)",
+  tage: "TAGE (tagged hybrid)",
+  bimode: "Bi-mode"
+};
+const predictorFields = {
+  local: [
+    ["localPredictorSize", "Counter storage (bits)", 2, 65536, "Power of two; entries = storage ÷ counter bits."],
+    ["localCtrBits", "Counter bits (n)", 1, 8, "Each branch-addressed entry has a saturating counter."],
+    ["BTBEntries", "Branch target buffer entries", 2, 65536, "Power of two."],
+  ],
+  tournament: [
+    ["localPredictorSize", "Local counters (entries)", 2, 65536, "Power of two."],
+    ["localCtrBits", "Local counter bits", 1, 8, ""],
+    ["localHistoryTableSize", "Local history entries", 2, 65536, "Power of two."],
+    ["globalPredictorSize", "Global counters (entries; 2^m)", 2, 65536, "Power of two; m = log₂(entries)."],
+    ["globalCtrBits", "Global counter bits (n)", 1, 8, ""],
+    ["choicePredictorSize", "Selector entries", 2, 65536, "Power of two; also affects global-history length."],
+    ["choiceCtrBits", "Selector counter bits", 1, 8, ""],
+    ["BTBEntries", "Branch target buffer entries", 2, 65536, "Power of two."],
+  ],
+  bimode: [
+    ["globalPredictorSize", "Direction counters per bank (entries)", 2, 65536, "Power of two; history length = log₂(entries)."],
+    ["globalCtrBits", "Direction counter bits", 1, 8, ""],
+    ["choicePredictorSize", "Selector entries", 2, 65536, "Power of two."],
+    ["choiceCtrBits", "Selector counter bits", 1, 8, ""],
+    ["BTBEntries", "Branch target buffer entries", 2, 65536, "Power of two."],
+  ],
+  tage: [
+    ["minHist", "Shortest tagged history (branches)", 1, 8192, ""],
+    ["maxHist", "Longest tagged history (branches)", 1, 8192, "Must exceed the shortest history."],
+    ["tagTableCounterBits", "Prediction counter bits", 1, 8, ""],
+    ["tagTableUBits", "Usefulness bits", 1, 2, "This gem5 implementation supports 1 or 2."],
+    ["tagTableTagWidths", "Tag widths (bits)", null, null, "Eight comma-separated values: 0 for the base, then seven tagged tables."],
+    ["logTagTableSizes", "Log₂ table entries", null, null, "Eight comma-separated values: base, then seven tagged tables."],
+    ["BTBEntries", "Branch target buffer entries", 2, 65536, "Power of two."],
+  ]
+};
 let studioFeatures = {
   developerMode: false,
   memoryConfiguration: false,
@@ -1888,14 +1928,16 @@ function positionPipelineCycle(cycle) {
     + Number.parseFloat(
       getComputedStyle(document.documentElement).getPropertyValue("--flow-width"));
   const cellWidth = Number($("#cell-width").value);
+  const displayCycles = pipelineDisplayCycles();
+  const cycleIndex = displayCycles.findIndex(value => value >= cycle);
   // The three frozen columns occupy positions 1–3. Leave one preceding
   // cycle visible so the requested cycle appears at table column 5.
-  const pipelineWidth = frozenWidth + pipelineData.cycles * cellWidth;
+  const pipelineWidth = frozenWidth + displayCycles.length * cellWidth;
   const horizontalTail = Math.max(
     0, scroll.clientWidth - frozenWidth - 2 * cellWidth);
   grid.style.width = `${pipelineWidth + horizontalTail}px`;
   scroll.scrollLeft = Math.max(
-    0, (cycle - 2) * cellWidth);
+    0, (cycleIndex - 1) * cellWidth);
 
   const eventRow = displayedPipelineRows().findIndex(row =>
     row.cycles?.[String(cycle)] !== undefined);
@@ -1963,11 +2005,13 @@ function renderPipelineDiagram() {
   const o3 = config.cpu === "out-of-order";
   const visibleO3Stages = new Set(config.o3VisibleStages || ["issue", "execute", "memory", "cdb", "commit"]);
   const o3Stages = [
-    ["fetch", "Fetch", "F"], ["decode", "Decode", "D"],
-    ["rename", "Rename", "R"], ["issue", "Issue", "I"],
+    ["fetch", `Fetch × ${config.fetchWidth || 2}`, "F"],
+    ["decode", `Decode × ${config.decodeWidth || 2}`, "D"],
+    ["rename", `Rename × ${config.renameWidth || 2}`, "R"],
+    ["issue", `Issue × ${config.dispatchWidth || 2}`, "I"],
     ["execute", "EXE", "E"], ["memory", "MEM", "M"],
     ["cdb", `CDB × ${config.writebackWidth || 1}`, "C"],
-    ["commit", "Commit", "W"]
+    ["commit", `Commit × ${config.commitWidth || 2}`, "W"]
   ];
   const stages = o3
     ? o3Stages.filter(([key]) => visibleO3Stages.has(key)).map(([_key, label, code]) => [label, code])
@@ -1978,11 +2022,13 @@ function renderPipelineDiagram() {
     ? `L1 I ${config.iCacheSize} · D ${config.dCacheSize}<br>Hit ${config.cacheLatency} cycles · RAM ${config.memoryLatency} cycles`
     : `Direct memory · I ${config.instructionMemoryLatency} · Read ${config.dataReadLatency} · Write ${config.dataWriteLatency} cycles`;
   const predictorName = {
-    ideal: "Ideal (perfect prediction)", local: "Local two-bit",
-    tournament: "Tournament", bimode: "Bi-mode", tage: "TAGE"
-  }[config.branchPredictor] || "Ideal (perfect prediction)";
+    ideal: "Ideal (teaching baseline)",
+    local: "Local counter (2-bit baseline)",
+    tournament: "Tournament (local + global)",
+    bimode: "Bi-mode", tage: "TAGE (tagged hybrid)"
+  }[config.branchPredictor] || "Ideal (teaching baseline)";
   const details = (o3
-    ? `Out-of-order execution · speculation on<br>Predictor: ${predictorName}<br>Issue ${config.dispatchWidth} · branches/jumps issue alone<br>CDB ${config.writebackWidth} · Commit ${config.commitWidth}<br>Address unit: 1 cycle · Jump unit: 1 cycle<br>ROB · RS/IQ · LQ · SQ: unlimited`
+    ? `Out-of-order execution · speculation on<br>Predictor: ${predictorName}<br>Fetch ${config.fetchWidth} · Decode ${config.decodeWidth} · Rename ${config.renameWidth}<br>Issue ${config.dispatchWidth} · branches/jumps issue alone<br>CDB ${config.writebackWidth} · Commit ${config.commitWidth}<br>EXE: Int ALU ${config.intAluUnits || 1} · Mul ${config.intMulUnits || 1} · Div ${config.intDivUnits || 1}<br>FP ALU ${config.floatAluUnits || 1} · Mul ${config.floatMulUnits || 1} · Div ${config.floatDivUnits || 1}<br>Shared load/store units: ${config.memoryUnits || 1}<br>ROB · RS/IQ · LQ · SQ: unlimited`
     : `Forwarding: ${config.forwarding ? "on" : "off"}<br>Out-of-order execution: ${config.outOfOrderExecution !== false ? "on" : "off"}`)
     + `<br>Floating point: ${config.floatingPointPrecision === "double" ? "double (64-bit)" : "single (32-bit)"}`
     + `<br>Compressed instructions: ${config.compressedInstructions ? "on" : "off"}`
@@ -2434,11 +2480,14 @@ function pipelineRowBounds(row) {
 }
 
 function jumpsForPipelineRow(row, lastVisibleCycle, expanded = expandedLoopView()) {
+  if (row.squashed) return [];
   let jumps = (pipelineData.jumps || []).filter(jump =>
     jump.fromAddress === row.address && jump.cycle <= lastVisibleCycle);
   if (expanded) {
     const bounds = pipelineRowBounds(row);
-    jumps = jumps.filter(jump => bounds.first <= jump.cycle && jump.cycle <= bounds.last);
+    jumps = jumps.filter(jump => jump.instructionSequence != null && row.sequence != null
+      ? jump.instructionSequence === row.sequence
+      : bounds.first <= jump.cycle && jump.cycle <= bounds.last);
   }
   const grouped = new Map();
   jumps.forEach(jump => {
@@ -2481,6 +2530,29 @@ function jumpTargetRow(rows, address, afterCycle = 0) {
   return fallback;
 }
 
+function pipelineStageTokens(stage) {
+  return stage.match(/[A-Z]\*?/g) || [];
+}
+
+function pipelineStageLabel(stage, o3) {
+  const tokens = pipelineStageTokens(stage);
+  if (o3) {
+    return tokens.map(token =>
+      ({C: "CDB", W: "C"}[token[0]] || token[0]) + token.slice(1)).join("/");
+  }
+  return tokens.length > 1 ? tokens.join("/") : stage;
+}
+
+function pipelineDisplayCycles(data = pipelineData) {
+  if (!data) return [];
+  const hidden = new Set(data.collapsedRecoveryCycles || []);
+  const cycles = [];
+  for (let cycle = 1; cycle <= data.cycles; cycle++) {
+    if (!hidden.has(cycle)) cycles.push(cycle);
+  }
+  return cycles;
+}
+
 function renderPipeline() {
   if (pipelinePaintFrame !== null) {
     cancelAnimationFrame(pipelinePaintFrame);
@@ -2502,6 +2574,8 @@ function renderPipeline() {
     return;
   }
   const displayRows = displayedPipelineRows();
+  const displayCycles = pipelineDisplayCycles(data);
+  const columnCount = displayCycles.length;
   const dynamicRows = (data.dynamicInstructions?.length ? data.dynamicInstructions : data.instructions)
     .filter(row => !row.squashed);
   const cellWidth = Number($("#cell-width").value);
@@ -2510,7 +2584,7 @@ function renderPipeline() {
   const instructionWidth = window.innerWidth <= 700 ? 150 : 182;
   const flowWidth = window.innerWidth <= 700 ? 132 : 140;
   const frozenWidth = addressWidth + instructionWidth + flowWidth;
-  const totalWidth = addressWidth + instructionWidth + flowWidth + data.cycles * cellWidth;
+  const totalWidth = addressWidth + instructionWidth + flowWidth + columnCount * cellWidth;
   const grid = $("#pipeline-grid");
   const scroll = $("#pipeline-scroll");
   const savedLeft = scroll.scrollLeft;
@@ -2547,18 +2621,18 @@ function renderPipeline() {
     const firstVisible = Math.max(
       1, Math.floor(scroll.scrollLeft / cellWidth) + 1);
     const lastVisible = Math.min(
-      data.cycles,
+      columnCount,
       Math.ceil((scroll.scrollLeft + cycleViewportWidth) / cellWidth));
     return {
       first: Math.max(1, firstVisible - cycleOverscan),
-      last: Math.min(data.cycles, lastVisible + cycleOverscan)
+      last: Math.min(columnCount, lastVisible + cycleOverscan)
     };
   }
 
   function virtualColumns(firstCycle, lastCycle) {
     const beforeWidth = (firstCycle - 1) * cellWidth;
     const cycleCount = Math.max(0, lastCycle - firstCycle + 1);
-    const afterWidth = Math.max(0, data.cycles - lastCycle) * cellWidth;
+    const afterWidth = Math.max(0, columnCount - lastCycle) * cellWidth;
     return `${addressWidth}px ${instructionWidth}px ${flowWidth}px ${beforeWidth}px repeat(${cycleCount}, ${cellWidth}px) ${afterWidth}px`;
   }
 
@@ -2567,7 +2641,8 @@ function renderPipeline() {
     html += '<div class="cell inst head corner">Instruction</div>';
     html += '<div class="cell flow-cell head corner" title="Control-flow transfers, prediction misses, and cache misses">Control / cache</div>';
     html += '<div class="pipeline-cycle-spacer" aria-hidden="true"></div>';
-    for (let cycle = firstCycle; cycle <= lastCycle; cycle++) {
+    for (let column = firstCycle; column <= lastCycle; column++) {
+      const cycle = displayCycles[column - 1];
       html += `<div class="cell head ${selectedColumn === cycle ? "column-selected" : ""}${cycle > visibleCycle ? " future" : ""}" data-col="${cycle}">${cycle}</div>`;
     }
     html += '<div class="pipeline-cycle-spacer" aria-hidden="true"></div>';
@@ -2580,7 +2655,7 @@ function renderPipeline() {
 
     for (let rowIndex = first; rowIndex < last; rowIndex++) {
       const row = displayRows[rowIndex];
-      html += `<div class="pipeline-row ${selectedRow === rowIndex ? "row-selected" : ""}" style="top:${rowIndex * rowHeight}px;grid-template-columns:${columns};width:${totalWidth}px">`;
+      html += `<div class="pipeline-row ${selectedRow === rowIndex ? "row-selected" : ""}${row.squashed ? " wrong-path" : ""}" style="top:${rowIndex * rowHeight}px;grid-template-columns:${columns};width:${totalWidth}px">`;
       const iterationText = row.iterations > 1 ? ` · ${row.iterations} iterations` : "";
       const address = row.address ? `0x${escapeHtml(row.address)}` : "—";
       html += `<div class="cell address-cell" data-row="${rowIndex}" title="Program counter">${address}</div>`;
@@ -2604,16 +2679,20 @@ function renderPipeline() {
       const predictionEvent = predictionMisses
         ? `<span class="branch-miss">BP miss${predictionMisses > 1 ? ` ×${predictionMisses}` : ""}</span>`
         : "";
-      html += `<div class="cell flow-cell" data-row="${rowIndex}">${jumpLinks}${predictionEvent}${cacheEvents}</div>`;
+      const squashEvent = row.squashed
+        ? `<span class="squash-label" title="Wrong-path instruction discarded after a branch misprediction">Squashed</span>`
+        : "";
+      html += `<div class="cell flow-cell" data-row="${rowIndex}">${jumpLinks}${predictionEvent}${cacheEvents}${squashEvent}</div>`;
       html += '<div class="pipeline-cycle-spacer" aria-hidden="true"></div>';
-      for (let cycle = firstCycle; cycle <= lastCycle; cycle++) {
+      for (let column = firstCycle; column <= lastCycle; column++) {
+        const cycle = displayCycles[column - 1];
         const stage = row.cycles[cycle] || "";
-        const label = pipelineData.format === "o3"
-          ? stage.split("").map(marker => ({C: "CDB", W: "C"}[marker] || marker)).join("/")
-          : stage.length > 1 && stage !== "S" ? stage.split("").join("/") : stage;
-        const stageClass = stage ? "stage-" + stage.slice(-1) : "";
+        const label = pipelineStageLabel(stage, pipelineData.format === "o3");
+        const tokens = pipelineStageTokens(stage);
+        const stageClass = tokens.length ? "stage-" + tokens.at(-1)[0] : "";
+        const squashedClass = stage.includes("*") ? " squashed-stage" : "";
         const columnClass = selectedColumn === cycle ? " column-selected" : "";
-        html += `<div class="cell ${stageClass}${columnClass}${cycle > visibleCycle ? " future" : ""}" data-row="${rowIndex}" data-col="${cycle}" data-stage="${stage}">${label}</div>`;
+        html += `<div class="cell ${stageClass}${squashedClass}${columnClass}${cycle > visibleCycle ? " future" : ""}" data-row="${rowIndex}" data-col="${cycle}" data-stage="${stage}">${label}</div>`;
       }
       html += '<div class="pipeline-cycle-spacer" aria-hidden="true"></div>';
       html += "</div>";
@@ -2673,8 +2752,10 @@ function renderPipeline() {
         S: pipelineData.format === "o3" ? "Wait in reservation station / ROB" : "Pipeline stall / wait",
         X: "Squashed after incorrect speculation"
       };
-      const stageName = stage.split("")
-        .map(marker => stageNames[marker] || marker).join(" / ");
+      const stageName = pipelineStageTokens(stage)
+        .map(token => (stageNames[token[0]] || token[0])
+          + (token.endsWith("*") ? " (wrong path; later squashed)" : ""))
+        .join(" / ");
       $("#detail").textContent = `Instruction: ${row.instruction} | Cycle: ${cell.dataset.col} | Stage: ${stageName} | Iterations: ${row.iterations}`;
     } else {
       $("#detail").textContent = `Clock cycle ${cell.dataset.col}`;
@@ -2735,6 +2816,8 @@ function adjustCellWidth(delta) {
 function exportVisiblePipeline() {
   if (!pipelineData || !current) return;
   const lastCycle = playbackCycle === null ? pipelineData.cycles : playbackCycle;
+  const displayCycles = pipelineDisplayCycles(pipelineData)
+    .filter(cycle => cycle <= lastCycle);
   const quote = value => `"${String(value ?? "").replaceAll('"', '""')}"`;
   const dynamicRows = (pipelineData.dynamicInstructions?.length
     ? pipelineData.dynamicInstructions : pipelineData.instructions)
@@ -2746,7 +2829,9 @@ function exportVisiblePipeline() {
     total + Number(row.mispredictions || (row.mispredicted ? 1 : 0)), 0);
   const cpi = instructionCount ? (pipelineData.cycles / instructionCount).toFixed(3) : "0";
   const headers = ["PC Address", "Instruction", "Control flow / cache"];
-  for (let cycle = 1; cycle <= lastCycle; cycle++) headers.push(`Cycle ${cycle}`);
+  for (const cycle of displayCycles) {
+    headers.push(`Cycle ${cycle}`);
+  }
   const rows = displayedPipelineRows().map(row => {
     const flow = [
       ...jumpsForPipelineRow(row, lastCycle).map(jump =>
@@ -2755,14 +2840,12 @@ function exportVisiblePipeline() {
         `${event.cache}$ ${event.result}${event.count > 1 ? ` x${event.count}` : ""}`),
       ...(Number(row.mispredictions || (row.mispredicted ? 1 : 0))
         ? [`BP miss${Number(row.mispredictions || 1) > 1 ? ` x${Number(row.mispredictions)}` : ""}`]
-        : [])
+        : []),
+      ...(pipelineData.format === "o3" && row.squashed ? ["Squashed"] : [])
     ].join("; ");
     const values = [row.address ? `0x${row.address}` : "", row.instruction, flow];
-    for (let cycle = 1; cycle <= lastCycle; cycle++) {
-      const stage = row.cycles[String(cycle)] || "";
-      values.push(pipelineData.format === "o3"
-        ? stage.split("").map(marker => ({C: "CDB", W: "C"}[marker] || marker)).join("/")
-        : stage);
+    for (const cycle of displayCycles) {
+      values.push(pipelineStageLabel(row.cycles[cycle] || "", pipelineData.format === "o3"));
     }
     return values;
   });
@@ -2791,22 +2874,13 @@ function updateForwardingControl() {
     && $("#cpu-model").value === "out-of-order";
   const integerPanel = $("#integer-unit-settings");
   const floatingPanel = $("#floating-unit-settings");
-  const integerAluRow = $("#int-alu").closest(".unit-row");
-  const unitFields = (outOfOrder ? floatingPanel : integerPanel).querySelector(".unit-fields");
-  unitFields.insertBefore(integerAluRow, unitFields.querySelector(".unit-heading").nextElementSibling);
-  integerPanel.hidden = outOfOrder;
+  integerPanel.hidden = false;
   floatingPanel.closest(".units-grid").classList.toggle("superscalar", outOfOrder);
+  integerPanel.querySelector("legend").textContent = outOfOrder
+    ? "Integer and load/store units · clock cycles" : "Integer unit · clock cycles";
   floatingPanel.querySelector("legend").textContent = outOfOrder
-    ? "Functional units · clock cycles" : "Floating-point unit · clock cycles";
-  integerAluRow.firstElementChild.textContent = outOfOrder ? "Integer ALU" : "ALU";
-  for (const [id, singleLabel, combinedLabel] of [
-    ["float-alu", "ALU", "FP arithmetic"],
-    ["float-mul", "Multiply", "FP multiply"],
-    ["float-div", "Divide", "FP divide"]
-  ]) {
-    $("#" + id).closest(".unit-row").firstElementChild.textContent = outOfOrder
-      ? combinedLabel : singleLabel;
-  }
+    ? "Floating-point units · clock cycles" : "Floating-point unit · clock cycles";
+  $("#o3-memory-units-field").hidden = !outOfOrder;
   $("#forwarding").disabled = outOfOrder;
   if (outOfOrder) $("#forwarding").checked = true;
   $("#forwarding-note").textContent = outOfOrder ? "(results use CDB/ROB forwarding)" : "";
@@ -2814,11 +2888,6 @@ function updateForwardingControl() {
   $("#memory-management").hidden = !studioFeatures.memoryConfiguration;
   $("#out-of-order-execution").closest("label").hidden = outOfOrder;
   $("#out-of-order-execution").disabled = outOfOrder;
-  ["int-mul", "int-div"].forEach(id => {
-    const row = $("#" + id).closest(".unit-row");
-    row.hidden = outOfOrder;
-    row.querySelectorAll("input").forEach(input => { input.disabled = outOfOrder; });
-  });
   if (outOfOrder) {
     $("#out-of-order-execution").checked = true;
     $("#speculative-execution").checked = true;
@@ -2837,6 +2906,68 @@ function updateMemoryControls() {
     .forEach(selector => { $(selector).disabled = !available || !direct; });
   ["#i-cache-size", "#d-cache-size", "#cache-line", "#cache-latency", "#memory-latency"]
     .forEach(selector => { $(selector).disabled = !available || !cache; });
+}
+
+function updatePredictorControls() {
+  $("#o3-predictor-parameters").hidden = $("#cpu-model").value !== "out-of-order"
+    || $("#o3-branch-predictor").value === "ideal";
+}
+
+function openPredictorParameters() {
+  const predictor = $("#o3-branch-predictor").value;
+  if (!predictorFields[predictor]) return;
+  const parameters = predictorParameterDraft[predictor]
+    || o3Defaults.branchPredictorParameters?.[predictor] || {};
+  $("#predictor-title").textContent = predictorNames[predictor] + " parameters";
+  $("#predictor-fields").innerHTML = predictorFields[predictor].map(
+    ([key, label, minimum, maximum, help]) => {
+      const value = parameters[key];
+      const displayed = Array.isArray(value) ? value.join(", ") : value ?? "";
+      const kind = minimum === null ? "text" : "number";
+      const range = minimum === null ? "" : ` min="${minimum}" max="${maximum}" step="1"`;
+      return `<label class="${minimum === null ? "wide" : ""}">${escapeHtml(label)}<input name="${key}" type="${kind}" value="${escapeHtml(displayed)}"${range} required>${help ? `<small>${escapeHtml(help)}</small>` : ""}</label>`;
+    }).join("");
+  $("#predictor-dialog").showModal();
+}
+
+async function savePredictorParameters(event) {
+  event.preventDefault();
+  const predictor = $("#o3-branch-predictor").value;
+  const parameters = {};
+  for (const [key] of predictorFields[predictor]) {
+    const input = $("#predictor-form").elements.namedItem(key);
+    if (key === "tagTableTagWidths" || key === "logTagTableSizes") {
+      const parts = input.value.trim().split(/[\s,]+/);
+      parameters[key] = parts.map(Number);
+      if (parts.length !== 8 || parameters[key].some(number => !Number.isInteger(number))) {
+        await showActionMessage("Branch predictor parameters", `${key} needs eight comma-separated whole numbers.`);
+        return;
+      }
+    } else {
+      parameters[key] = Number(input.value);
+      if (!Number.isInteger(parameters[key])) {
+        await showActionMessage("Branch predictor parameters", `${key} must be a whole number.`);
+        return;
+      }
+    }
+  }
+  const powerOfTwo = number => number > 0 && Number.isInteger(Math.log2(number));
+  for (const key of ["localPredictorSize", "localHistoryTableSize", "globalPredictorSize", "choicePredictorSize", "BTBEntries"]) {
+    if (key in parameters && !powerOfTwo(parameters[key])) {
+      await showActionMessage("Branch predictor parameters", `${key} must be a power of two.`);
+      return;
+    }
+  }
+  if (predictor === "local" && !powerOfTwo(parameters.localPredictorSize / parameters.localCtrBits)) {
+    await showActionMessage("Branch predictor parameters", "Local storage divided by counter bits must give a power-of-two number of entries.");
+    return;
+  }
+  if (predictor === "tage" && parameters.maxHist <= parameters.minHist) {
+    await showActionMessage("Branch predictor parameters", "TAGE maximum history must exceed its minimum history.");
+    return;
+  }
+  predictorParameterDraft[predictor] = parameters;
+  $("#predictor-dialog").close();
 }
 
 async function openCpuConfiguration() {
@@ -2876,10 +3007,21 @@ async function openCpuConfiguration() {
     $("#issue-width").value = config.issueWidth;
     $("#writeback-width").value = config.writebackWidth;
     $("#commit-width").value = config.commitWidth;
+    $("#int-alu-units").value = config.intAluUnits || 1;
+    $("#int-mul-units").value = config.intMulUnits || 1;
+    $("#int-div-units").value = config.intDivUnits || 1;
+    $("#float-alu-units").value = config.floatAluUnits || 1;
+    $("#float-mul-units").value = config.floatMulUnits || 1;
+    $("#float-div-units").value = config.floatDivUnits || 1;
+    $("#memory-units").value = config.memoryUnits || 1;
     $("#rob-entries").value = config.robEntries;
     $("#iq-entries").value = config.iqEntries;
     $("#lq-entries").value = config.lqEntries;
     $("#sq-entries").value = config.sqEntries;
+    $("#o3-branch-predictor").value = config.branchPredictor || "ideal";
+    predictorParameterDraft = JSON.parse(JSON.stringify(
+      config.branchPredictorParameters || o3Defaults.branchPredictorParameters || {}));
+    updatePredictorControls();
     $("#o3-evaluation-label").value = config.o3EvaluationLabel || "";
     $("#out-of-order-execution").checked = config.outOfOrderExecution !== false;
     $("#speculative-execution").checked = config.speculativeExecution !== false;
@@ -3366,8 +3508,14 @@ $("#cpu-model").onchange = () => {
     const defaultInputs = {
       intAlu: "int-alu", intMul: "int-mul", intDiv: "int-div",
       floatAlu: "float-alu", floatMul: "float-mul", floatDiv: "float-div",
-      dispatchWidth: "dispatch-width", issueWidth: "issue-width",
-      writebackWidth: "writeback-width", commitWidth: "commit-width"
+      fetchWidth: "fetch-width", decodeWidth: "decode-width",
+      renameWidth: "rename-width", dispatchWidth: "dispatch-width",
+      issueWidth: "issue-width",
+      writebackWidth: "writeback-width", commitWidth: "commit-width",
+      intAluUnits: "int-alu-units", intMulUnits: "int-mul-units",
+      intDivUnits: "int-div-units", floatAluUnits: "float-alu-units",
+      floatMulUnits: "float-mul-units", floatDivUnits: "float-div-units",
+      memoryUnits: "memory-units"
     };
     for (const [key, id] of Object.entries(defaultInputs)) {
       if (o3Defaults[key] !== undefined) $("#" + id).value = o3Defaults[key];
@@ -3377,6 +3525,7 @@ $("#cpu-model").onchange = () => {
       if (o3Defaults[key] !== undefined) $("#" + unit + "-pipelined").checked = o3Defaults[key];
     }
     const defaultStages = new Set(["issue", "execute", "memory", "cdb", "commit"]);
+    $("#o3-branch-predictor").value = o3Defaults.branchPredictor || "ideal";
     document.querySelectorAll("[data-o3-stage]").forEach(input => {
       input.checked = defaultStages.has(input.dataset.o3Stage);
     });
@@ -3384,7 +3533,12 @@ $("#cpu-model").onchange = () => {
   }
   updateForwardingControl();
   updateMemoryControls();
+  updatePredictorControls();
 };
+$("#o3-branch-predictor").onchange = updatePredictorControls;
+$("#o3-predictor-parameters").onclick = openPredictorParameters;
+$("#cancel-predictor").onclick = () => $("#predictor-dialog").close();
+$("#predictor-form").onsubmit = savePredictorParameters;
 $("#memory-mode").onchange = updateMemoryControls;
 $("#cancel-submission").onclick = () => $("#submission-dialog").close();
 $("#submission-dialog").addEventListener("cancel", event => {
@@ -3461,11 +3615,20 @@ $("#cpu-form").onsubmit = async event => {
     issueWidth: Number($("#issue-width").value),
     writebackWidth: Number($("#writeback-width").value),
     commitWidth: Number($("#commit-width").value),
+    intAluUnits: Number($("#int-alu-units").value),
+    intMulUnits: Number($("#int-mul-units").value),
+    intDivUnits: Number($("#int-div-units").value),
+    floatAluUnits: Number($("#float-alu-units").value),
+    floatMulUnits: Number($("#float-mul-units").value),
+    floatDivUnits: Number($("#float-div-units").value),
+    memoryUnits: Number($("#memory-units").value),
     robEntries: Number($("#rob-entries").value),
     iqEntries: Number($("#iq-entries").value),
     lqEntries: Number($("#lq-entries").value),
     sqEntries: Number($("#sq-entries").value),
-    branchPredictor: $("#cpu-model").value === "out-of-order" ? "ideal" : "local",
+    branchPredictor: $("#cpu-model").value === "out-of-order"
+      ? $("#o3-branch-predictor").value : "local",
+    branchPredictorParameters: predictorParameterDraft,
     speculativeExecution: $("#speculative-execution").checked,
     outOfOrderExecution: $("#out-of-order-execution").checked,
     o3EvaluationLabel: $("#o3-evaluation-label").value.trim(),
