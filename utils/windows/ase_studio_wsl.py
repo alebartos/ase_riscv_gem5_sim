@@ -357,17 +357,28 @@ def space_free(path: Path) -> Path:
 # The backend opens editors and folders with Linux tools (xdg-open, GTK) on
 # native Linux; inside WSL those need to hand off to actual Windows programs.
 def win_path(path: Path) -> str:
-    result = subprocess.run(["wslpath", "-w", str(path)], capture_output=True, text=True)
+    # Resolved first: through the space-free ~/.ase-studio links the file
+    # would map to \\wsl.localhost\... instead of its C:\ path.
+    result = subprocess.run(["wslpath", "-w", str(Path(path).resolve())],
+                            capture_output=True, text=True)
     if result.returncode:
         raise OSError(result.stderr.strip() or "wslpath failed")
     return result.stdout.strip()
 
 
+def launch_windows(*command: str) -> None:
+    """Start a Windows program without waiting for it (like macOS `open`):
+    waiting for notepad.exe would hold the request until the editor closes."""
+    subprocess.Popen(list(command), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL, start_new_session=True)
+
+
 def open_with_editor(name):
     source = backend.source_file(backend.project_dir(name))
-    result = subprocess.run(["notepad.exe", win_path(source)], capture_output=True, text=True)
-    if result.returncode:
-        backend.fail(f"The file could not be opened: {result.stderr.strip()}", 500)
+    try:
+        launch_windows("notepad.exe", win_path(source))
+    except OSError as error:
+        backend.fail(f"The file could not be opened: {error}", 500)
     return {"ok": True, "output": f"Opened {source.name} in Notepad."}
 
 
@@ -381,9 +392,12 @@ def reveal_submission_folder(archive_path):
         backend.fail("Invalid submission archive path.")
     if not archive.is_file() or archive.suffix.lower() != ".zip":
         backend.fail("The submission ZIP could not be found.", 404)
-    # explorer.exe /select often exits 1 even on success (a WSL interop
-    # quirk), so its return code is not checked.
-    subprocess.run(["explorer.exe", f"/select,{win_path(archive)}"], capture_output=True)
+    # explorer.exe /select often exits 1 even on success, so its exit code
+    # is not checked.
+    try:
+        launch_windows("explorer.exe", f"/select,{win_path(archive)}")
+    except OSError as error:
+        backend.fail(f"The submission folder could not be opened: {error}", 500)
     return {"ok": True, "output": f"Opened {archive.parent} in Explorer."}
 
 

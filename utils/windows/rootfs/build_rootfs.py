@@ -97,7 +97,10 @@ def prepare_studio(repo: str, branch: str, local_dir: str | None) -> None:
             sys.exit(f"No remote of this clone points to {repo}: add it or use --studio-dir")
         commit = output("git", "-C", REPO, "rev-parse", "FETCH_HEAD").strip()
     log(f"ASE Studio from {repo}@{branch} ({commit[:7]})")
-    archive = subprocess.run(["git", "-C", str(source), "archive", "--format=tar", commit],
+    # git archive applies core.autocrlf: on a Windows build machine it would
+    # otherwise hand the Linux rootfs CRLF sources.
+    archive = subprocess.run(["git", "-c", "core.autocrlf=false", "-C", str(source),
+                              "archive", "--format=tar", commit],
                              check=True, capture_output=True).stdout
     if STUDIO_SRC.exists():
         shutil.rmtree(STUDIO_SRC)

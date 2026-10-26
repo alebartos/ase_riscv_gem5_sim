@@ -193,16 +193,47 @@ Prima stesura completa di tutti i pezzi, scritta in `utils/windows/`:
   `.github/workflows/windows-app.yml` (due job: rootfs su Linux, launcher +
   installer + smoke test WSL1 su Windows, bozza di release).
 
-Commit `e6203a5` (branch `windows-app`), pushato.
+Launcher e installer compilati e testati su questa macchina (SDK .NET 8,
+Inno Setup 6): installazione pulita, primo avvio con import WSL, finestra
+WebView2, istanza singola, sostituzione della distro se il rootfs cambia,
+installazione automatica di WebView2, disinstallazione. Pubblicato nella
+release `v1.5.0` (insieme al `.dmg`) e `gem5-linux-x86_64`.
+
+### Attenzione: terminatori di riga (CRLF)
+
+Git per Windows usa `core.autocrlf=true`: il checkout converte i file in
+CRLF e il Dockerfile li copia così nel rootfs. Con CRLF `source
+setup_default` fallisce (`$'\r': command not found`), `GEM5_SIMULATION_SCRIPT`
+non viene mai impostata e **ogni simulazione dà errore 500**
+(`{"error": "'GEM5_SIMULATION_SCRIPT'"}`). Il primo installer 1.5.0 aveva
+questo problema. Ora:
+- `.gitattributes` forza LF per i file letti da bash/make e per `utils/`;
+- il Dockerfile toglie comunque i CR dal modello di progetto e dai file in
+  `/opt/ase`; `build_rootfs.py` estrae ASE Studio con
+  `core.autocrlf=false`;
+- `start.sh` a ogni avvio toglie i CR da `setup_default*` e dai
+  Makefile/`*.mk`/`*.sh` del workspace (sistema i workspace già creati
+  dall'installer difettoso e i file salvati in CRLF da editor Windows).
+
+Verificato: progetto `example` e caso WaR (`fdiv.s` → 3.0) simulati
+correttamente.
+
+### "Open with" e "Mostra nella cartella"
+
+Nel primo 1.5.0 non funzionavano: `start.sh` reimpostava il `PATH` solo con
+le cartelle Linux, togliendo quelle di Windows aggiunte da WSL, quindi
+`notepad.exe`/`explorer.exe` non venivano trovati (`[Errno 2] No such file
+or directory: 'notepad.exe'`). Inoltre l'adattatore aspettava la chiusura
+del Blocco note prima di rispondere. Ora `start.sh` aggiunge in coda le
+cartelle di sistema di Windows e `ase_studio_wsl.py` avvia i programmi
+Windows senza attenderli (come `open` su macOS).
 
 Non ancora fatto / da verificare:
 - Icona dell'app (`AppIcon.ico` per il launcher, converso da
   `utils/macOS/AppIcon.icns`).
-- Compilazione reale del launcher C# e test della finestra/WebView2 (serve
-  l'SDK .NET, non presente su questa macchina; lo farà la CI).
-- `iscc` (Inno Setup) non installato su questa macchina: lo script non è
-  stato ancora compilato localmente — lo fa la CI (`choco install innosetup`).
 - Test del flusso di update in-app (`ase_studio_wsl.py`: scaricare un gem5 o
-  un ASE Studio più recenti da GitHub release/branch) e del launcher C# vero
-  e proprio (finestra, popup, download, chiusura) — richiedono il binario
-  compilato.
+  un ASE Studio più recenti da GitHub release/branch).
+- Un backend rimasto attivo dopo una chiusura forzata del launcher (es.
+  `taskkill /F`) resta in ascolto sulla porta 8765 finché la distro non si
+  ferma; il riavvio successivo si collega a quello invece di avviarne uno
+  nuovo.

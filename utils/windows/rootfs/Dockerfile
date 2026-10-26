@@ -113,7 +113,14 @@ COPY utils/macOS/gem5_selftest.py /opt/ase/gem5_selftest.py
 COPY utils/windows/rootfs/versions.json /opt/ase/versions.json
 COPY utils/windows/rootfs/wsl.conf /etc/wsl.conf
 
-RUN chmod +x /opt/ase/start.sh \
+# A Windows checkout (core.autocrlf=true) can hand these over with CRLF,
+# which bash ("source setup_default"), make and /etc/wsl.conf don't
+# tolerate. .gitattributes prevents it; this keeps an older checkout from
+# shipping a rootfs where every simulation fails.
+RUN find /opt/ase/project -type f -exec sed -i 's/\r$//' {} + \
+    && sed -i 's/\r$//' /opt/ase/start.sh /opt/ase/ase_studio_wsl.py \
+         /opt/ase/gem5_selftest.py /opt/ase/versions.json /etc/wsl.conf \
+    && chmod +x /opt/ase/start.sh \
     && find /opt/ase/project/gem5 /opt/ase/gem5/configs -name "*.sh" -exec chmod +x {} \; \
     && rm -rf /opt/ase/ase_studio/.git /opt/ase/ase_studio/__pycache__ \
     && chown -R ase:ase /opt/ase

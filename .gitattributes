@@ -1,0 +1,13 @@
+# Files run by bash/make inside the Windows app's WSL2 rootfs. Their blobs
+# are LF; this keeps a Windows checkout (core.autocrlf=true, the Git for
+# Windows default) from turning them into CRLF, which the rootfs build
+# would then COPY verbatim and bash would choke on ("source setup_default"
+# fails, so GEM5_SIMULATION_SCRIPT is never set and every run errors out).
+setup_default* text eol=lf
+*.sh           text eol=lf
+*.mk           text eol=lf
+Makefile       text eol=lf
+programs/**    text eol=lf
+# The app tooling (rootfs wsl.conf, gem5 patches, start.sh, adapters...).
+utils/**       text=auto eol=lf
+.github/**     text eol=lf

@@ -29,7 +29,11 @@ exec > >(tee "$LOG") 2>&1
 LINK_DIR="$HOME/.ase-studio"
 mkdir -p "$LINK_DIR" && ln -sfn "$RES" "$LINK_DIR/app"
 export ASE_STUDIO_TOOLS="$LINK_DIR/app"
-export PATH="$RES/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+# Plus the Windows system directories (last, so they never shadow a Linux
+# tool): "Open with" and "Show in folder" run notepad.exe and explorer.exe.
+WINDOWS_DIRS="$(tr ':' '\n' <<<"$PATH" | grep -iE '^/mnt/[a-z]/windows(/system32)?$' | paste -sd: - || true)"
+WINDOWS_DIRS="${WINDOWS_DIRS:-/mnt/c/Windows/System32:/mnt/c/Windows}"
+export PATH="$RES/bin:/usr/bin:/bin:/usr/sbin:/sbin:$WINDOWS_DIRS"
 export RISCV_TOOLCHAIN_PATH="/usr/bin"
 export GEM5_INSTALLATION_PATH="$RES/gem5/build/"
 export GEM5_SRC="$RES/gem5/"
@@ -40,6 +44,16 @@ mkdir -p "$WS" && cp -Rn "$RES/project/." "$WS/" 2>/dev/null
 cd "$WS" || exit 1
 export ASE_STUDIO_HOST_ROOT="$WS"
 ln -sfn "$WS" "$LINK_DIR/workspace" && export ASE_STUDIO_WORKSPACE_LINK="$LINK_DIR/workspace"
+
+# bash ("source setup_default") and make reject CRLF, which Windows editors
+# can introduce and which 1.5.0 workspaces got from a CRLF project template
+# (never overwritten above). Only files that actually contain a CR are
+# rewritten.
+{ find "$WS" -maxdepth 1 -type f -name 'setup_default*' || true
+  find "$WS/programs" -type f \( -name Makefile -o -name '*.mk' -o -name '*.sh' \) || true
+} 2>/dev/null | while IFS= read -r file; do
+  if grep -q $'\r' "$file"; then sed -i 's/\r$//' "$file"; fi
+done
 
 # ---- 3. updated ASE Studio (if present and working), otherwise the bundled one
 export ASE_STUDIO_DIR="$RES/ase_studio"
