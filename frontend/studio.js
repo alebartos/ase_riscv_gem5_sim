@@ -2565,6 +2565,7 @@ function renderPipeline() {
   const data = pipelineData;
   if (!data) {
     $("#pipeline-grid").innerHTML = "";
+    updatePipelineScrollButtons();
     $("#pipeline-diagram").innerHTML = "";
     $("#pipeline-pc").textContent = "PC —";
     $("#pipeline-summary").textContent = "No pipeline trace loaded.";
@@ -2604,8 +2605,10 @@ function renderPipeline() {
   const predictionSummary = predictionMisses ? ` · ${predictionMisses} BP misses` : "";
   $("#pipeline-summary").textContent = `${instructionCount} instructions · ${codeBytes} bytes pipeline code${predictionSummary} · CPI ${cpi}`;
   updateCycleNavigation();
-  grid.style.width = totalWidth + "px";
-  grid.innerHTML = `<div class="pipeline-header" style="width:${totalWidth}px"></div><div class="pipeline-rows" style="height:${displayRows.length * rowHeight}px;width:${totalWidth}px"></div>`;
+  // Leave one cell of scrollable breathing room without adding fake cycles
+  // or instructions to the table, playback, statistics, or CSV exports.
+  grid.style.width = (totalWidth + cellWidth) + "px";
+  grid.innerHTML = `<div class="pipeline-header" style="width:${totalWidth}px"></div><div class="pipeline-rows" style="height:${(displayRows.length + 1) * rowHeight}px;width:${totalWidth}px"></div>`;
   const header = grid.querySelector(".pipeline-header");
   const rows = grid.querySelector(".pipeline-rows");
   const cycleOverscan = 8;
@@ -2802,6 +2805,7 @@ function renderPipeline() {
   // renderPipeline can run while its tab is hidden. Recalculate once the
   // browser has laid out the newly visible pipeline viewport.
   schedulePaint(true);
+  updatePipelineScrollButtons();
   renderRegisters();
   renderPipelineDiagram();
   renderMemory();
@@ -3853,10 +3857,226 @@ registerResizer.addEventListener("pointerup", event => {
   registerResizer.classList.remove("dragging");
 });
 
+function pipelineScrollbarMetrics(viewport, extent, position, trackLength) {
+  const limit = Math.max(0, extent - viewport);
+  const length = Math.min(trackLength, Math.max(24,
+    extent > 0 ? trackLength * viewport / extent : trackLength));
+  const travel = Math.max(0, trackLength - length);
+  const offset = limit ? travel * Math.max(0, Math.min(limit, position)) / limit : 0;
+  return {limit, length, travel, offset};
+}
+
+function pipelineScrollbarsNeeded(width, height, contentWidth, contentHeight, size) {
+  let horizontal = false;
+  let vertical = false;
+  // An overflowing axis reduces the other axis's available space. Start with
+  // the full frame each time so a resize cannot leave unnecessary bars behind.
+  for (let pass = 0; pass < 3; pass++) {
+    horizontal = contentWidth > width - (vertical ? size : 0) + 1;
+    vertical = contentHeight > height - (horizontal ? size : 0) + 1;
+  }
+  return {horizontal: width > 0 && horizontal, vertical: height > 0 && vertical};
+}
+
+function installPipelineScrollControls(scroll, buttons, getStep, tracks = []) {
+  const frame = scroll.parentElement;
+  const scrollbarSize = 18;
+  const integrated = tracks.length === 2;
+  if (integrated) frame.classList.add("scrollbars-ready");
+  const axes = {
+    horizontal: ["scrollLeft", "scrollWidth", "clientWidth", "clientX", "left", "width", "left", "right"],
+    vertical: ["scrollTop", "scrollHeight", "clientHeight", "clientY", "top", "height", "up", "down"]
+  };
+  const directions = {
+    left: ["scrollLeft", "scrollWidth", "clientWidth", -1],
+    right: ["scrollLeft", "scrollWidth", "clientWidth", 1],
+    up: ["scrollTop", "scrollHeight", "clientHeight", -1],
+    down: ["scrollTop", "scrollHeight", "clientHeight", 1]
+  };
+  function update() {
+    if (integrated) {
+      const needed = pipelineScrollbarsNeeded(frame.clientWidth, frame.clientHeight,
+        scroll.scrollWidth, scroll.scrollHeight, scrollbarSize);
+      frame.style.setProperty("--pipeline-scrollbar-x", needed.horizontal ? scrollbarSize + "px" : "0px");
+      frame.style.setProperty("--pipeline-scrollbar-y", needed.vertical ? scrollbarSize + "px" : "0px");
+      for (const track of tracks) {
+        track.parentElement.hidden = !needed[track.dataset.pipelineScrollAxis];
+      }
+    }
+    for (const button of buttons) {
+      const [position, extent, viewport, sign] = directions[button.dataset.pipelineScroll];
+      const limit = Math.max(0, scroll[extent] - scroll[viewport]);
+      button.disabled = scroll[viewport] === 0 || (sign < 0
+        ? scroll[position] <= 0 : scroll[position] >= limit - 1);
+    }
+    for (const track of tracks) {
+      const [position, extent, viewport, , offset, length] = axes[track.dataset.pipelineScrollAxis];
+      const metrics = pipelineScrollbarMetrics(scroll[viewport], scroll[extent],
+        scroll[position], track[viewport]);
+      const thumb = track.firstElementChild;
+      thumb.style[length] = metrics.length + "px";
+      thumb.style[offset] = metrics.offset + "px";
+      thumb.setAttribute("aria-valuemax", String(Math.round(metrics.limit)));
+      thumb.setAttribute("aria-valuenow", String(Math.round(
+        Math.max(0, Math.min(metrics.limit, scroll[position])))));
+    }
+  }
+  for (const button of buttons) {
+    const direction = button.dataset.pipelineScroll;
+    let repeatTimer = null;
+    let activePointer = null;
+    let repeated = false;
+    function move() {
+      if (button.disabled) return;
+      const [position, extent, viewport, sign] = directions[direction];
+      const limit = Math.max(0, scroll[extent] - scroll[viewport]);
+      scroll[position] = Math.max(0, Math.min(limit,
+        scroll[position] + sign * getStep(direction)));
+      update();
+    }
+    function stop() {
+      clearTimeout(repeatTimer);
+      repeatTimer = null;
+      if (activePointer !== null && button.hasPointerCapture(activePointer)) {
+        button.releasePointerCapture(activePointer);
+      }
+      activePointer = null;
+    }
+    function repeat() {
+      repeated = true;
+      move();
+      if (!button.disabled) repeatTimer = setTimeout(repeat, 70);
+    }
+    button.addEventListener("click", event => {
+      // Pointer holds already scrolled; keyboard and ordinary clicks move once.
+      if (!repeated || event.detail === 0) move();
+      repeated = false;
+    });
+    button.addEventListener("pointerdown", event => {
+      if (event.button !== 0 || button.disabled) return;
+      stop();
+      repeated = false;
+      activePointer = event.pointerId;
+      button.setPointerCapture(activePointer);
+      repeatTimer = setTimeout(repeat, 350);
+    });
+    button.addEventListener("pointerup", stop);
+    button.addEventListener("pointercancel", stop);
+    button.addEventListener("lostpointercapture", stop);
+    window.addEventListener("blur", stop);
+    document.addEventListener("visibilitychange", () => {
+      if (document.hidden) stop();
+    });
+  }
+  for (const track of tracks) {
+    const [position, extent, viewport, coordinate, offset, , backward, forward] = axes[track.dataset.pipelineScrollAxis];
+    const thumb = track.firstElementChild;
+    let drag = null;
+    function moveTo(value) {
+      scroll[position] = Math.max(0, Math.min(scroll[extent] - scroll[viewport], value));
+      update();
+    }
+    function stopDrag() {
+      const pointerId = drag?.pointerId;
+      drag = null;
+      thumb.classList.remove("dragging");
+      if (pointerId !== undefined && track.hasPointerCapture(pointerId)) {
+        track.releasePointerCapture(pointerId);
+      }
+    }
+    track.addEventListener("pointerdown", event => {
+      if (event.button !== 0) return;
+      event.preventDefault();
+      thumb.focus({preventScroll: true});
+      if (event.target === thumb) {
+        drag = {pointerId: event.pointerId, coordinate: event[coordinate], position: scroll[position]};
+        track.setPointerCapture(event.pointerId);
+        thumb.classList.add("dragging");
+      } else {
+        const metrics = pipelineScrollbarMetrics(scroll[viewport], scroll[extent],
+          scroll[position], track[viewport]);
+        const before = event[coordinate] - track.getBoundingClientRect()[offset] < metrics.offset;
+        moveTo(scroll[position] + (before ? -1 : 1) * scroll[viewport]);
+      }
+    });
+    track.addEventListener("pointermove", event => {
+      if (!drag || drag.pointerId !== event.pointerId) return;
+      const metrics = pipelineScrollbarMetrics(scroll[viewport], scroll[extent],
+        scroll[position], track[viewport]);
+      if (metrics.travel) moveTo(drag.position
+        + (event[coordinate] - drag.coordinate) * metrics.limit / metrics.travel);
+    });
+    track.addEventListener("pointerup", stopDrag);
+    track.addEventListener("pointercancel", stopDrag);
+    track.addEventListener("lostpointercapture", stopDrag);
+    window.addEventListener("blur", stopDrag);
+    document.addEventListener("visibilitychange", () => {
+      if (document.hidden) stopDrag();
+    });
+    thumb.addEventListener("keydown", event => {
+      const keys = track.dataset.pipelineScrollAxis === "horizontal"
+        ? {ArrowLeft: -getStep(backward), ArrowRight: getStep(forward)}
+        : {ArrowUp: -getStep(backward), ArrowDown: getStep(forward)};
+      keys.PageUp = -scroll[viewport];
+      keys.PageDown = scroll[viewport];
+      let target;
+      if (event.key === "Home") target = 0;
+      else if (event.key === "End") target = scroll[extent] - scroll[viewport];
+      else if (Object.hasOwn(keys, event.key)) target = scroll[position] + keys[event.key];
+      else return;
+      event.preventDefault();
+      moveTo(target);
+    });
+    // Scroll-wheel events over the replacement track still reach the viewport.
+    track.parentElement.addEventListener("wheel", event => {
+      const scale = event.deltaMode === 1 ? 27
+        : event.deltaMode === 2 ? scroll[viewport] : 1;
+      const delta = track.dataset.pipelineScrollAxis === "horizontal"
+        ? event.deltaX || event.deltaY : event.deltaY;
+      if (!delta) return;
+      event.preventDefault();
+      moveTo(scroll[position] + delta * scale);
+    }, {passive: false});
+  }
+  scroll.addEventListener("scroll", update, {passive: true});
+  if ("ResizeObserver" in window) {
+    let resizePending = false;
+    const observer = new ResizeObserver(() => {
+      // Changing scrollbar visibility changes the observed viewport size.
+      // Defer that layout change to avoid a ResizeObserver delivery loop.
+      if (resizePending) return;
+      resizePending = true;
+      window.requestAnimationFrame(() => {
+        resizePending = false;
+        update();
+      });
+    });
+    observer.observe(scroll);
+    observer.observe(scroll.firstElementChild);
+    if (integrated) observer.observe(frame);
+  }
+  update();
+  return update;
+}
+
+function pipelinePointerOnScrollbar(scroll, event) {
+  const bounds = scroll.getBoundingClientRect();
+  const x = event.clientX - bounds.left;
+  const y = event.clientY - bounds.top;
+  return x < scroll.clientLeft || x >= scroll.clientLeft + scroll.clientWidth
+    || y < scroll.clientTop || y >= scroll.clientTop + scroll.clientHeight;
+}
+
 const pipelineScroll = $("#pipeline-scroll");
+const updatePipelineScrollButtons = installPipelineScrollControls(
+  pipelineScroll, document.querySelectorAll("[data-pipeline-scroll]"),
+  direction => direction === "left" || direction === "right"
+    ? Number($("#cell-width").value) : 27,
+  document.querySelectorAll("[data-pipeline-scroll-axis]"));
 let pipelinePan = null;
 pipelineScroll.addEventListener("pointerdown", event => {
   if (event.button !== 0 && event.button !== 1) return;
+  if (pipelinePointerOnScrollbar(pipelineScroll, event)) return;
   if (event.button === 0 && event.target.closest(".jump-arrow")) return;
   if (event.button === 1) event.preventDefault();
   pipelinePan = {
