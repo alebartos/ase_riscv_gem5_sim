@@ -5,3 +5,4 @@ __pycache__/
 !tests/
 tests/*
 !tests/test_predictor_parameters.py
+!tests/test_pipeline_scroll.js
