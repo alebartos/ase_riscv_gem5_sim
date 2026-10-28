@@ -175,12 +175,12 @@ O3_FIXED_CONFIG = {
     "robEntries": 64, "iqEntries": 128, "lqEntries": 32, "sqEntries": 32,
     "speculativeExecution": True,
     "outOfOrderExecution": True, "forwarding": True,
-    "intMul": 1, "intDiv": 1,
-    "intMulPipelined": True, "intDivPipelined": True,
 }
 DEFAULT_O3_CONFIG = {
     **DEFAULT_CONFIG, **O3_FIXED_CONFIG,
     "cpu": "out-of-order", "floatMul": 6, "floatDiv": 6,
+    "intMul": 1, "intDiv": 1,
+    "intMulPipelined": True, "intDivPipelined": True,
     "branchPredictor": "ideal",
 }
 
