@@ -438,6 +438,29 @@ def main() -> int:
                         result[key] = warning + result[key]
             return result
         backend.simulate = simulate
+    # gem5 writes its trace one line at a time, about 12 KB per cycle for the
+    # superscalar CPU. On /mnt/c (the Windows disk, reached through 9P) that
+    # made superscalar runs very slow, so results live on the distribution's
+    # own disk. Only the full pipeline CSV, which the student opens, is
+    # copied to the Windows workspace.
+    windows_results = backend.RESULTS
+    backend.RESULTS = SUPPORT / "results"
+    if hasattr(backend, "pipeline_for_display"):
+        for_display = backend.pipeline_for_display
+
+        def pipeline_for_display(name):
+            data = for_display(name)
+            if isinstance(data, dict) and data.get("tooLarge") and data.get("csvPath"):
+                source = Path(data["csvPath"])
+                target = windows_results / name / source.name
+                try:
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copyfile(source, target)
+                    data["csvPath"] = win_path(target)
+                except OSError:
+                    pass
+            return data
+        backend.pipeline_for_display = pipeline_for_display
     backend.require_startup_repositories = lambda: None
     backend.update_status = update_status
     backend.pull_update = pull_update
