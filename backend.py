@@ -11,6 +11,7 @@ import binascii
 import csv
 from copy import deepcopy
 import hashlib
+import heapq
 import io
 import json
 import os
@@ -1911,6 +1912,272 @@ def complete_o3_waits(rows):
                     str(cycle), "C" if cycle == complete + 1 else "S")
 
 
+def schedule_o3_ready_records(committed, configuration, instruction_info,
+                              wrong_candidates):
+    """Arbitrate ready work at each teaching clock, never book future EXE slots.
+
+    Dynamic instructions and prediction outcomes come from gem5. Renamed
+    producer tags preserve RAW dependencies across overlapping iterations;
+    FU/CDB arbitration is oldest-ready, while Issue and Commit stay in order.
+    """
+    stage_uses = {stage: defaultdict(int) for stage in ("F", "D", "R", "I")}
+    previous_stage = {stage: 1 for stage in stage_uses}
+    fetch_floor = issue_floor = 1
+    show_front_end = bool(set(configuration["o3VisibleStages"])
+                          & {"fetch", "decode", "rename"})
+    real_prediction = configuration["branchPredictor"] != "ideal"
+    unit_counts = {
+        "integer-alu": configuration["intAluUnits"],
+        "integer-multiply": configuration["intMulUnits"],
+        "integer-divide": configuration["intDivUnits"],
+        "float-alu": configuration["floatAluUnits"],
+        "float-multiply": configuration["floatMulUnits"],
+        "float-divide": configuration["floatDivUnits"],
+        "address": configuration["memoryUnits"], "jump": 1,
+    }
+    available_units = {unit: [(0, None)] * count
+                       for unit, count in unit_counts.items()}
+    memory_ports = [(0, None)] * configuration["memoryUnits"]
+    ready_units = {unit: [] for unit in unit_counts}
+    ready_memory, ready_results, events = [], [], []
+    event_serial = 0
+    waiters = defaultdict(list)
+    producers = {}
+    snapshots = {}
+    records = []
+    timing = {}
+    wrong_records = defaultdict(list)
+    wrong_path_by_branch = defaultdict(list)
+    recovery_front_end = []
+
+    def event(cycle, kind, record):
+        nonlocal event_serial
+        event_serial += 1
+        heapq.heappush(events, (cycle, event_serial, kind, record))
+
+    def make_record(row, age, rename, wrong=False):
+        info = instruction_info(row["instruction"])
+        dependencies = {id(rename[register]): rename[register]
+                        for register in info["executeSources"] if register in rename}
+        record = {
+            **info, "row": row, "age": age, "wrong": wrong,
+            "dependencies": tuple(dependencies.values()),
+            "storeDataProducer": rename.get(info["storeData"]),
+            "issued": False, "queued": False, "cancelled": False,
+            "I": None, "E": None, "EEnd": None,
+            "M": None, "MEnd": None, "C": None, "W": None,
+        }
+        for producer in dependencies.values():
+            waiters[id(producer)].append(record)
+        if info["destination"] is not None:
+            rename[info["destination"]] = record
+        return record
+
+    # Bind source versions in dynamic program order, BEFORE any execution.
+    # Reusing f4 in another iteration must not create false WAR/WAW hazards.
+    for index, row in enumerate(committed):
+        record = make_record(row, (index, 0), producers)
+        records.append(record)
+        timing[id(row)] = record
+        if row.get("mispredicted"):
+            snapshots[id(row)] = producers.copy()
+
+    def allocate_front_end(record):
+        nonlocal fetch_floor, issue_floor
+        slots = {}
+        previous = None
+        for stage, width in (("F", configuration["fetchWidth"]),
+                             ("D", configuration["decodeWidth"]),
+                             ("R", configuration["renameWidth"]),
+                             ("I", configuration["dispatchWidth"])):
+            cycle = max(previous_stage[stage],
+                        previous + 1 if previous is not None else fetch_floor,
+                        issue_floor if stage == "I" else 1)
+            capacity = 1 if stage == "I" and record["control"] else width
+            while stage_uses[stage][cycle] >= capacity:
+                cycle += 1
+            stage_uses[stage][cycle] += 1
+            slots[stage] = cycle
+            previous_stage[stage] = previous = cycle
+        if record["control"]:
+            fetch_floor = slots["F"] + 1
+            issue_floor = slots["I"] + 1
+        record["front"] = slots
+        record["frontEnd"] = ({stage: slots[stage] for stage in ("F", "D", "R")}
+                               if show_front_end else {})
+        record["I"] = slots["I"]
+        event(record["I"], "issue", record)
+
+    next_instruction = 0
+    recovery_pending = False
+
+    def allocate_correct_stream():
+        nonlocal next_instruction, recovery_pending
+        while next_instruction < len(records):
+            record = records[next_instruction]
+            next_instruction += 1
+            allocate_front_end(record)
+            if recovery_pending:
+                recovery_front_end.extend(
+                    {"stage": stage, "cycle": record["front"][stage]}
+                    for stage in ("F", "D", "R"))
+                recovery_pending = False
+            if real_prediction and record["row"].get("mispredicted"):
+                rename = snapshots[id(record["row"])].copy()
+                for index, row in enumerate(sorted(
+                        wrong_candidates[id(record["row"])],
+                        key=lambda item: item["sequence"]), 1):
+                    wrong = make_record(row, (record["age"][0], index), rename, True)
+                    allocate_front_end(wrong)
+                    wrong_records[id(record["row"])].append(wrong)
+                # Resume the architectural path only after this branch commits.
+                break
+
+    def request_execution(record, clock):
+        if (not record["issued"] or record["queued"] or record["cancelled"]
+                or any(producer["C"] is None for producer in record["dependencies"])):
+            return
+        ready = max([clock, record["I"] + 1,
+                     *(producer["C"] + 1 for producer in record["dependencies"])])
+        record["queued"] = True
+        event(ready, "ready", record)
+
+    def squash(branch, clock):
+        nonlocal fetch_floor, issue_floor, recovery_pending
+        for wrong in wrong_records[id(branch["row"])]:
+            wrong["cancelled"] = True
+            front = wrong["front"]
+            # Discard future reservations, including instructions not fetched.
+            for stage, cycle in front.items():
+                if cycle > clock:
+                    stage_uses[stage][cycle] -= 1
+            if front["F"] > clock:
+                continue
+            cycles = {str(cycle): "S*" for cycle in range(front["I"], clock + 1)}
+            for stage, cycle in front.items():
+                if cycle <= clock:
+                    cycles[str(cycle)] = stage + "*"
+            for first, last, stage in ((wrong["E"], wrong["EEnd"], "E*"),
+                                       (wrong["M"], wrong["MEnd"], "M*")):
+                if first is not None:
+                    for cycle in range(first, min(last, clock) + 1):
+                        cycles[str(cycle)] = stage
+            if wrong["C"] is not None:
+                cycles[str(wrong["C"])] = "C*"
+            marker = cycles.get(str(clock), "")
+            cycles[str(clock)] = ("" if marker == "S*" else marker) + "X"
+            wrong_path_by_branch[id(branch["row"])].append({
+                **wrong["row"], "cycles": cycles, "mispredicted": False,
+                "squashCause": branch["row"]["address"],
+            })
+        for pool in [*available_units.values(), memory_ports]:
+            for index, (available, owner) in enumerate(pool):
+                if owner is not None and owner["cancelled"]:
+                    pool[index] = (min(available, clock + 1), None)
+        for stage in previous_stage:
+            previous_stage[stage] = max(
+                (cycle for cycle, used in stage_uses[stage].items()
+                 if cycle <= clock and used), default=1)
+        branch["row"]["predictionPenalty"] = clock - branch["EEnd"] + 4
+        fetch_floor = issue_floor = clock + 1
+        recovery_pending = True
+        allocate_correct_stream()
+
+    allocate_correct_stream()
+    clock = events[0][0]
+    head = 0
+    while head < len(records):
+        # Completions/Issue precede arbitration. A CDB value becomes usable
+        # by dependent EXE on the FOLLOWING clock, not on the broadcast edge.
+        while events and events[0][0] <= clock:
+            _cycle, _serial, kind, record = heapq.heappop(events)
+            if record["cancelled"]:
+                continue
+            if kind == "issue":
+                record["issued"] = True
+                request_execution(record, clock)
+            elif kind == "ready":
+                heapq.heappush(ready_units[record["unit"]], (record["age"], record))
+            elif kind == "executed" and record["load"]:
+                heapq.heappush(ready_memory, (record["age"], record))
+            elif kind in {"executed", "loaded"} and record["destination"] is not None:
+                heapq.heappush(ready_results, (record["age"], record))
+
+        broadcasts = 0
+        used_ports = set()
+        deferred_results = []
+        while ready_results and broadcasts < configuration["writebackWidth"]:
+            age, record = heapq.heappop(ready_results)
+            if record["cancelled"]:
+                continue
+            port = (record["unit"], record["unitIndex"])
+            if port in used_ports:
+                deferred_results.append((age, record))
+                continue
+            used_ports.add(port)
+            broadcasts += 1
+            record["C"] = clock
+            for consumer in waiters[id(record)]:
+                request_execution(consumer, clock)
+        for item in deferred_results:
+            heapq.heappush(ready_results, item)
+
+        commits = 0
+        while head < len(records) and commits < configuration["commitWidth"]:
+            record = records[head]
+            if record["EEnd"] is None:
+                break
+            if record["destination"] is not None:
+                ready = record["C"] + 1 if record["C"] is not None else None
+            elif record["load"]:
+                ready = record["MEnd"] + 1 if record["MEnd"] is not None else None
+            else:
+                ready = record["EEnd"] + 1
+            producer = record["storeDataProducer"]
+            if record["store"] and producer is not None:
+                ready = max(ready, producer["C"] + 1) if producer["C"] is not None else None
+            if ready is None or ready > clock:
+                break
+            record["W"] = clock
+            head += 1
+            commits += 1
+            if real_prediction and record["row"].get("mispredicted"):
+                squash(record, clock)
+
+        for index, (available, _owner) in enumerate(memory_ports):
+            if available > clock:
+                continue
+            while ready_memory and ready_memory[0][1]["cancelled"]:
+                heapq.heappop(ready_memory)
+            if not ready_memory:
+                break
+            _age, record = heapq.heappop(ready_memory)
+            latency = (configuration["dataReadLatency"] if configuration["memoryMode"] == "direct"
+                       else configuration["cacheLatency"])
+            record["M"], record["MEnd"] = clock, clock + latency - 1
+            memory_ports[index] = (clock + latency, record)
+            event(clock + latency, "loaded", record)
+
+        # Only ready, already-issued instructions may acquire a free FU now.
+        # An older dependent instruction cannot reserve a future time window.
+        for unit, pool in available_units.items():
+            queue = ready_units[unit]
+            for index, (available, _owner) in enumerate(pool):
+                if available > clock:
+                    continue
+                while queue and queue[0][1]["cancelled"]:
+                    heapq.heappop(queue)
+                if not queue:
+                    break
+                _age, record = heapq.heappop(queue)
+                record["E"], record["EEnd"] = clock, clock + record["latency"] - 1
+                record["unitIndex"] = index
+                pool[index] = (clock + (1 if record["pipelined"] else record["latency"]), record)
+                event(clock + record["latency"], "executed", record)
+        clock += 1
+    return timing, wrong_path_by_branch, recovery_front_end
+
+
 def schedule_lecture_o3_pipeline(data, configuration, start_address=None):
     """Build the multiple-issue Tomasulo/ROB table used in the lectures.
 
@@ -1929,11 +2196,13 @@ def schedule_lecture_o3_pipeline(data, configuration, start_address=None):
 
     observed_squashes = [row for row in data.get("dynamicInstructions", [])
                          if row.get("squashed")]
-    all_committed = sorted(
-        (row for row in data.get("dynamicInstructions", [])
-         if not row.get("squashed")),
-        key=row_first_cycle,
-    )
+    all_committed = [row for row in data.get("dynamicInstructions", [])
+                     if not row.get("squashed")]
+    # Log sequence numbers define program order, not execution completion.
+    # Older O3PipeView traces without them retain their Fetch ordering.
+    all_committed.sort(key=(lambda row: row["sequence"])
+                       if all(isinstance(row.get("sequence"), int)
+                              for row in all_committed) else row_first_cycle)
     if start_address is not None:
         start_index = next(
             (index for index, row in enumerate(all_committed)
@@ -1993,15 +2262,17 @@ def schedule_lecture_o3_pipeline(data, configuration, start_address=None):
             r"\b(" + "|".join(map(re.escape, REGISTER_ALIASES)) + r")\b",
             lambda match: REGISTER_ALIASES[match.group(1)], operands,
         )
-        registers = [register for register in re.findall(r"\b[xf]\d+\b", operands)
-                     if register != "x0"]
+        registers = re.findall(r"\b[xf]\d+\b", operands)
         load = bool(re.fullmatch(r"(?:l(?:b|bu|h|hu|w|wu|d)|fl[wdq])", opcode))
         store = bool(re.fullmatch(r"(?:s[bhwdq]|fs[wdq])", opcode))
         control = bool(re.fullmatch(
             r"(?:b(?:eq|ne|lt|ge|ltu|geu|eqz|nez|ltz|gez|lez|gtz)|j|jr|jal|jalr|ret)", opcode))
         no_destination = store or opcode.startswith("b") or opcode in {"j", "jr", "ret"}
         destination = registers[0] if registers and not no_destination else None
-        sources = registers if no_destination else registers[1:]
+        if destination == "x0":
+            destination = None
+        sources = [register for register in (registers if no_destination else registers[1:])
+                   if register != "x0"]
         store_data = registers[0] if store and registers else None
         execute_sources = registers[1:] if store else sources
 
@@ -2044,271 +2315,8 @@ def schedule_lecture_o3_pipeline(data, configuration, start_address=None):
     for row in committed:
         information[id(row)] = instruction_info(row["instruction"])
 
-    issue_width = max(1, int(configuration["dispatchWidth"]))
-    issue_cycles = {}
-    front_end_cycles = {}
-    visible_stages = set(configuration.get(
-        "o3VisibleStages", DEFAULT_CONFIG["o3VisibleStages"]))
-    show_front_end = bool(visible_stages & {"fetch", "decode", "rename"})
-    stage_uses = {stage: defaultdict(int)
-                  for stage in ("F", "D", "R", "I")}
-
-    def reserve_front_stage(stage, earliest, width, exclusive=False, deadline=None):
-        cycle = earliest
-        while stage_uses[stage][cycle] >= (1 if exclusive else width):
-            cycle += 1
-        if deadline is not None and cycle > deadline:
-            return None
-        stage_uses[stage][cycle] += 1
-        return cycle
-
-    previous_stage = {stage: 1 for stage in ("F", "D", "R", "I")}
-    fetch_floor = issue_floor = 1
-
-    def allocate_front_end(info, deadline=None):
-        nonlocal fetch_floor, issue_floor
-        slots = {}
-        previous = None
-        for stage, width in (("F", configuration["fetchWidth"]),
-                             ("D", configuration["decodeWidth"]),
-                             ("R", configuration["renameWidth"]),
-                             ("I", issue_width)):
-            earliest = max(previous_stage[stage],
-                           previous + 1 if previous is not None else fetch_floor,
-                           issue_floor if stage == "I" else 1)
-            slot = reserve_front_stage(
-                stage, earliest, max(1, int(width)),
-                exclusive=stage == "I" and info["control"], deadline=deadline)
-            if slot is None:
-                break
-            slots[stage] = slot
-            previous_stage[stage] = previous = slot
-        if info["control"]:
-            if "F" in slots:
-                fetch_floor = slots["F"] + 1
-            if "I" in slots:
-                issue_floor = slots["I"] + 1
-        return slots
-
-    # Perfect-prediction exams retain their accepted schedule. Other predictors
-    # allocate the frontend as branches resolve, including wrong-path work.
-    real_prediction = configuration.get("branchPredictor") != "ideal"
-    for row in ([] if real_prediction else committed):
-        info = information[id(row)]
-        slots = allocate_front_end(info)
-        # Front-end bandwidth constrains Issue even when its stages are
-        # hidden in the teaching table. Only render stages the user chose.
-        front_end_cycles[id(row)] = (
-            {stage: slots[stage] for stage in ("F", "D", "R")}
-            if show_front_end else {})
-        issue_cycles[id(row)] = slots["I"]
-    cdb_width = max(1, int(configuration["writebackWidth"]))
-    cdb_uses = defaultdict(int)
-    # Each physical unit may put at most one result on a shared CDB per cycle.
-    unit_counts = {
-        "integer-alu": configuration["intAluUnits"],
-        "integer-multiply": configuration["intMulUnits"],
-        "integer-divide": configuration["intDivUnits"],
-        "float-alu": configuration["floatAluUnits"],
-        "float-multiply": configuration["floatMulUnits"],
-        "float-divide": configuration["floatDivUnits"],
-        "address": configuration["memoryUnits"],
-        "jump": 1,
-    }
-    unit_cdb_uses = defaultdict(lambda: defaultdict(int))
-    unit_busy = defaultdict(lambda: defaultdict(int))
-    memory_busy = defaultdict(int)
-    latest_producer = {}
-    resolved_branches = []
-    timing = {}
-
-    def reserve_execution(info, earliest, deadline=None):
-        cycle = earliest
-        while True:
-            if deadline is not None and cycle > deadline:
-                return None
-            occupied = ({cycle} if info["pipelined"]
-                        else set(range(cycle, cycle + info["latency"])))
-            if deadline is not None:
-                occupied = {slot for slot in occupied if slot <= deadline}
-            # No global EXE-queue/width limit: independent functional units
-            # may start together. Each unit still enforces its own capacity.
-            if all(unit_busy[info["unit"]][slot] < unit_counts[info["unit"]]
-                   for slot in occupied):
-                for slot in occupied:
-                    unit_busy[info["unit"]][slot] += 1
-                return cycle
-            cycle += 1
-
-    def reserve_cdb(earliest, unit, deadline=None):
-        cycle = earliest
-        while (cdb_uses[cycle] >= cdb_width
-               or unit_cdb_uses[unit][cycle] >= unit_counts[unit]):
-            cycle += 1
-        if deadline is not None and cycle > deadline:
-            return None
-        cdb_uses[cycle] += 1
-        unit_cdb_uses[unit][cycle] += 1
-        return cycle
-
-    speculation = bool(configuration.get("speculativeExecution", True))
-    out_of_order_execution = bool(
-        configuration.get("outOfOrderExecution", True))
-    previous_execution_start = 0
-    commit_width = max(1, int(configuration["commitWidth"]))
-    commit_uses = defaultdict(int)
-    previous_commit = 0
-    wrong_path_by_branch = defaultdict(list)
-    recovery_front_end = []
-    pending_recovery = False
-
-    def schedule_wrong_path(branch, resolution):
-        """Run speculative work until the branch's ROB Commit check."""
-        producers = latest_producer.copy()
-        previous_start = previous_execution_start
-        for wrong in sorted(wrong_candidates[id(branch)],
-                            key=lambda row: row["sequence"]):
-            info = instruction_info(wrong["instruction"])
-            front = allocate_front_end(info, deadline=resolution)
-            if not front:
-                break
-            cycles = {str(cycle): stage + "*" for stage, cycle in front.items()}
-            issue = front.get("I")
-            if issue is not None:
-                # Waiting for operands, a unit or the ROB is a real wait. The
-                # squash edge itself is X, never an invented S*/X completion.
-                for cycle in range(issue + 1, resolution):
-                    cycles[str(cycle)] = "S*"
-                earliest = issue + 1
-                for register in info["executeSources"]:
-                    producer = producers.get(register)
-                    if producer is not None:
-                        earliest = max(earliest, (producer.get("C") or resolution) + 1)
-                if not speculation:
-                    earliest = resolution + 1
-                if not out_of_order_execution:
-                    earliest = max(earliest, previous_start)
-                execute = reserve_execution(info, earliest, deadline=resolution)
-                cdb = None
-                if execute is not None:
-                    previous_start = execute
-                    execute_end = execute + info["latency"] - 1
-                    for cycle in range(execute, min(execute_end, resolution) + 1):
-                        cycles[str(cycle)] = "E*"
-                    result_end = execute_end
-                    if info["load"] and execute_end < resolution:
-                        latency = (configuration["dataReadLatency"]
-                                   if configuration["memoryMode"] == "direct"
-                                   else configuration["cacheLatency"])
-                        memory_start = execute_end + 1
-                        while (memory_start <= resolution and any(
-                                memory_busy[cycle] >= configuration["memoryUnits"]
-                                for cycle in range(memory_start, min(
-                                    memory_start + latency, resolution + 1)))):
-                            memory_start += 1
-                        result_end = memory_start + latency - 1
-                        for cycle in range(memory_start, min(result_end, resolution) + 1):
-                            memory_busy[cycle] += 1
-                            cycles[str(cycle)] = "M*"
-                    if info["destination"] is not None:
-                        cdb = reserve_cdb(result_end + 1, info["unit"],
-                                          deadline=resolution)
-                        if cdb is not None:
-                            cycles[str(cdb)] = "C*"
-                if info["destination"] is not None:
-                    producers[info["destination"]] = {"C": cdb}
-            cycles[str(resolution)] = cycles.get(str(resolution), "") + "X"
-            wrong_path_by_branch[id(branch)].append({
-                **wrong, "cycles": cycles, "mispredicted": False,
-                "squashCause": branch.get("address"),
-            })
-
-    for row in committed:
-        info = information[id(row)]
-        if real_prediction:
-            front = allocate_front_end(info)
-            if pending_recovery:
-                recovery_front_end.extend(
-                    {"stage": stage, "cycle": front[stage]}
-                    for stage in ("F", "D", "R"))
-                pending_recovery = False
-            issue = front["I"]
-            effective_front_end = ({stage: front[stage] for stage in ("F", "D", "R")}
-                                   if show_front_end else {})
-        else:
-            issue = issue_cycles[id(row)]
-            effective_front_end = front_end_cycles.get(id(row), {})
-        earliest = issue + 1
-        for register in info["executeSources"]:
-            producer = latest_producer.get(register)
-            if producer is not None and producer.get("C") is not None:
-                earliest = max(earliest, producer["C"] + 1)
-        if not speculation and resolved_branches:
-            earliest = max(earliest, max(resolved_branches) + 1)
-        if not out_of_order_execution:
-            # Multiple instructions may start together when the configured
-            # EXE width permits it, but no younger instruction may overtake
-            # an older instruction that is waiting for operands or a unit.
-            earliest = max(earliest, previous_execution_start)
-
-        execute = reserve_execution(info, earliest)
-        previous_execution_start = execute
-        execute_end = execute + info["latency"] - 1
-        memory_start = memory_end = None
-        if info["load"]:
-            memory_latency = (configuration["dataReadLatency"]
-                              if configuration["memoryMode"] == "direct"
-                              else configuration["cacheLatency"])
-            memory_start = execute_end + 1
-            while any(memory_busy[cycle] >= configuration["memoryUnits"]
-                      for cycle in range(memory_start,
-                                         memory_start + memory_latency)):
-                memory_start += 1
-            memory_end = memory_start + memory_latency - 1
-            for cycle in range(memory_start, memory_end + 1):
-                memory_busy[cycle] += 1
-
-        produces_result = info["destination"] is not None
-        cdb = (reserve_cdb((memory_end if info["load"] else execute_end) + 1,
-                           info["unit"])
-               if produces_result else None)
-        record = {
-            **info, "row": row, "I": issue, "E": execute,
-            "EEnd": execute_end, "M": memory_start, "MEnd": memory_end,
-            "C": cdb, "frontEnd": effective_front_end,
-            "storeDataProducer": latest_producer.get(info["storeData"]),
-        }
-        timing[id(row)] = record
-        if produces_result:
-            latest_producer[info["destination"]] = record
-
-        # Older instructions have already been scheduled, so the branch's
-        # in-order Commit check is known before scheduling its wrong path.
-        # This also preserves the accepted perfect-prediction Commit timing.
-        ready = cdb + 1 if cdb is not None else execute_end + 1
-        if info["store"]:
-            producer = record["storeDataProducer"]
-            if producer is not None and producer.get("C") is not None:
-                ready = max(ready, producer["C"] + 1)
-        commit = max(ready, previous_commit)
-        while commit_uses[commit] >= commit_width:
-            commit += 1
-        commit_uses[commit] += 1
-        record["W"] = commit
-        previous_commit = commit
-
-        if info["control"]:
-            resolved_branches.append(execute_end)
-            if (configuration.get("branchPredictor") != "ideal"
-                    and row.get("mispredicted")):
-                schedule_wrong_path(row, commit)
-                # The outcome is known after EXE, but the book's ROB model
-                # flushes younger work when the branch reaches the Commit
-                # check. Correct-path F starts next cycle, followed by D/R/I.
-                row["predictionPenalty"] = commit - execute_end + 4
-                fetch_floor = max(fetch_floor, commit + 1)
-                issue_floor = max(issue_floor, commit + 1)
-                pending_recovery = True
+    timing, wrong_path_by_branch, recovery_front_end = schedule_o3_ready_records(
+        committed, configuration, instruction_info, wrong_candidates)
 
     # Preserve actual architectural values but move their visible updates to
     # lecture Commit (and load/store accesses to MEM/Commit respectively).
@@ -2416,14 +2424,12 @@ def schedule_lecture_o3_pipeline(data, configuration, start_address=None):
 
 
 def configure_o3_stage_display(data, configuration):
-    """Project gem5 O3 events onto the lecture-level speculative pipeline.
+    """Filter the teaching timeline without changing execution decisions.
 
-    gem5 dispatch corresponds to the lectures' in-order Issue/Dispatch step;
-    gem5 issue starts out-of-order execution; complete is the CDB/write-result
-    event; and retire is in-order Commit. For memory operations, execution
-    cycles after address generation are labelled M. Hidden front-end stages
-    are removed from cells without changing instruction timing relative to
-    other instructions.
+    gem5 supplies dynamic identities, architectural values and prediction
+    outcomes. The ready scheduler supplies teaching EXE/MEM/CDB/Commit clocks;
+    these are not the raw gem5 transport clocks. Hidden stages are removed
+    from cells without changing instruction timing relative to other work.
     """
     if data.get("format") != "o3":
         return
@@ -3130,10 +3136,10 @@ def branch_predictor_report(result_dir, configuration, teaching_cycles=None):
         lines.append(
             f"  Detailed gem5 completion: {gem5_cycles} cycles · CPI {gem5_cpi:.3f}")
     lines.append(
-        "  The teaching pipeline uses gem5's real prediction outcomes. "
-        "BP miss labels and recovery cycles show their timing effect. "
-        "Wrong-path instruction identities come from gem5; their starred "
-        "stages use the same teaching scheduler as committed instructions. "
+        "  Instruction identities, architectural values and prediction outcomes "
+        "come from gem5. Teaching clocks use oldest-ready execution with the "
+        "configured units and CDBs, rather than raw gem5 transport delays. "
+        "Wrong-path starred stages use the same ready scheduler. "
         "X marks the squash at the branch's Commit check; the outcome "
         "is known earlier at Execute.")
     lines.append(
