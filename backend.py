@@ -1458,8 +1458,66 @@ def parse_exec_playback(lines, ordered_ticks):
     return dict(register_deltas), dict(memory_deltas)
 
 
-def parse_taken_jumps(lines, ordered_ticks):
-    """Return control-flow transfers supported by the completed instruction trace."""
+def parse_taken_jumps(lines, ordered_ticks, dynamic_rows=None):
+    """Return control-flow transfers supported by the instruction trace."""
+    control_instruction = re.compile(
+        r"^(?:c\.)?(?:b(?:eq|eqz|ne|nez|lt|ge|ltu|geu)|j|jr|jal|jalr|ret)\b",
+        re.I,
+    )
+    conditional_branch = re.compile(
+        r"^(?:c\.)?b(?:eq|eqz|ne|nez|lt|ge|ltu|geu)\b", re.I,
+    )
+    branch_offset = re.compile(
+        r",\s*([+-]?(?:0x[0-9a-f]+|\d+))\s*$", re.I,
+    )
+
+    if dynamic_rows is not None:
+        # Minor's T0 records are emitted when instructions complete. A long
+        # operation can therefore appear after a younger instruction, so
+        # adjacent T0 records do not reliably identify a branch's successor.
+        # Decode order is the architectural instruction order for this
+        # in-order CPU and skips fetches that were squashed by a redirect.
+        def first_stage(row, stage):
+            return min((int(cycle) for cycle, value in row.get("cycles", {}).items()
+                        if stage in value), default=None)
+
+        executed_rows = sorted(
+            (row for row in dynamic_rows
+             if not row.get("squashed") and row.get("address")),
+            key=lambda row: (
+                first_stage(row, "D") or first_stage(row, "F") or 10**12,
+                first_stage(row, "F") or 10**12,
+            ),
+        )
+        jumps = []
+        for branch, successor in zip(executed_rows, executed_rows[1:]):
+            instruction = display_instruction(branch.get("instruction", ""))
+            if not control_instruction.match(instruction.strip()):
+                continue
+            source_pc = int(branch["address"], 16)
+            target_pc = int(successor["address"], 16)
+            mnemonic = instruction.split(None, 1)[0].lower()
+            instruction_bytes = 2 if mnemonic.startswith(("c_", "c.")) else 4
+            if target_pc == source_pc + instruction_bytes:
+                continue
+            if conditional_branch.match(instruction):
+                offset = branch_offset.search(instruction)
+                if offset:
+                    value = offset.group(1)
+                    displacement = (int(value, 16) if "0x" in value.lower()
+                                    else int(value, 10))
+                    if target_pc != source_pc + displacement:
+                        continue
+            execute = first_stage(branch, "E")
+            if execute is None:
+                continue
+            jumps.append({
+                "fromAddress": branch["address"].lower(),
+                "toAddress": successor["address"].lower(),
+                "cycle": execute,
+            })
+        return jumps
+
     executed = []
     for line in lines:
         match = EXEC_EVENT.match(line)
@@ -1471,16 +1529,6 @@ def parse_taken_jumps(lines, ordered_ticks):
         executed.append((int(tick), address.lower(), display_instruction(instruction),
                          instruction_bytes))
     jumps = []
-    control_instruction = re.compile(
-        r"^(?:c\.)?(?:b(?:eq|eqz|ne|nez|lt|ge|ltu|geu)|j|jr|jal|jalr|ret)\b",
-        re.I,
-    )
-    conditional_branch = re.compile(
-        r"^(?:c\.)?b(?:eq|eqz|ne|nez|lt|ge|ltu|geu)\b", re.I,
-    )
-    branch_offset = re.compile(
-        r",\s*([+-]?(?:0x[0-9a-f]+|\d+))\s*$", re.I,
-    )
     for ((tick, source, instruction, instruction_bytes),
          (_next_tick, target, _next_instruction, _next_bytes)) in zip(executed, executed[1:]):
         if not control_instruction.match(instruction.strip()):
@@ -1806,7 +1854,7 @@ def parse_minor(path: Path, source_body="", include_fetch_stalls=True):
             "cycles": len(ticks), "format": "minor",
             "registerDeltas": register_deltas, "pcDeltas": pc_deltas,
             "memoryDeltas": memory_deltas,
-            "jumps": parse_taken_jumps(lines, ticks)}
+            "jumps": parse_taken_jumps(lines, ticks, rows)}
 
 
 def parse_o3(path: Path, source_body=""):

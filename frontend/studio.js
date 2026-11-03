@@ -1120,9 +1120,11 @@ function syncEditor() {
       });
     });
   }
-  const lineHeight = parseFloat(getComputedStyle(document.documentElement)
-    .getPropertyValue("--editor-line-height")) || 23;
-  $("#body").style.height = Math.max(300, lines.length * lineHeight + 20) + "px";
+  // The highlighted source is the layout mirror for the textarea. Its scroll
+  // height includes visual rows created by wrapping, while `lines.length`
+  // only counts explicit newlines and leaves wrapped content outside the
+  // editor's scrollable area.
+  $("#body").style.height = Math.max(300, $("#highlight").scrollHeight) + "px";
   if (editorArea) {
     editorArea.scrollTop = savedScrollTop;
     editorArea.scrollLeft = savedScrollLeft;
