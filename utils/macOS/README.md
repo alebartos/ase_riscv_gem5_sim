@@ -22,9 +22,10 @@ utils/macOS/build_gem5.sh                                                       
 ```
 
 `build_gem5.sh` scarica gem5 in `tools/gem5` (se manca), applica le patch di
-`gem5_patches/` e lo compila. Le patch servono: su macOS `uint_fast16_t` è a
-16 bit, e senza `0001` ogni operazione float di gem5 legge operandi troncati
-(`1.5 * 2.0` dà NaN). `build_app.py` rifiuta un `gem5.opt` che non supera
+`gem5_patches/` e lo compila. Resta solo `0002`, che serve a compilare con il
+clang recente di Apple: la correzione dei float su macOS (`uint_fast16_t` a
+16 bit, `1.5 * 2.0` dava NaN) è nel gem5 del corso da `b6ee23f`
+(cad-polito-it/gem5#9). `build_app.py` rifiuta un `gem5.opt` che non supera
 `gem5_selftest.py`.
 
 ## Da dove arriva ASE Studio
