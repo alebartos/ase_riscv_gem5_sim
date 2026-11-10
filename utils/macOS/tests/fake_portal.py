@@ -14,7 +14,7 @@ import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-STATE = {"tokens": set(), "assignments": {306839: []}, "next": 1000, "uploads": [],
+STATE = {"tokens": set(), "careers": {}, "assignments": {306839: []}, "next": 1000, "uploads": [],
          "logins": []}
 LOCK = threading.Lock()
 
@@ -52,7 +52,22 @@ class Fake(BaseHTTPRequestHandler):
                 return self.reply(400, {"code": 400, "message": "Invalid SSO key"})
             token = f"tok{len(STATE['logins'])}"
             STATE["tokens"].add(token)
-            return self.reply(200, {"data": {"username": "s123456", "type": "student",
+            # s111111 has two careers: s111111 (default, without the ASE
+            # course) and s222222 (with it).
+            # s333333 has a single career without the course.
+            career = data.get("username") if data.get("username") in {"s111111", "s333333"} else "s123456"
+            STATE["careers"][token] = career
+            return self.reply(200, {"data": {"username": career, "type": "student",
+                                             "clientId": "client-1", "token": token}})
+        if self.path == "/api/auth/switch-career":
+            if not self.authorized():
+                return
+            data = json.loads(self.body())
+            token = f"tok-{data['username']}-{len(STATE['tokens'])}"
+            STATE["tokens"].add(token)
+            STATE["careers"][token] = data["username"]
+            STATE.setdefault("switches", []).append(data["username"])
+            return self.reply(200, {"data": {"username": data["username"], "type": "student",
                                              "clientId": "client-1", "token": token}})
         match = re.fullmatch(r"/api/courses/(\d+)/assignments", self.path)
         if match:
@@ -80,9 +95,21 @@ class Fake(BaseHTTPRequestHandler):
         self.reply(404, {"code": 404, "message": "Not found"})
 
     def do_GET(self):
+        if self.path == "/api/auth/profile":
+            if not self.authorized():
+                return
+            career = STATE["careers"].get(self.headers["Authorization"].removeprefix("Bearer "))
+            names = ["S111111", "S222222"] if career in {"s111111", "s222222"} else [career.upper()]
+            return self.reply(200, {"data": {"username": career, "firstName": "Test",
+                                             "lastName": "Student", "allUsernames": names}})
         if self.path == "/api/v2/courses":
             if not self.authorized():
                 return
+            career = STATE["careers"].get(self.headers["Authorization"].removeprefix("Bearer "))
+            if career in {"s111111", "s333333"}:
+                return self.reply(200, {"data": [
+                    {"id": 101, "name": "Analisi matematica I", "shortcode": "01RKCYG",
+                     "year": 2025, "modules": []}]})
             return self.reply(200, {"data": [
                 {"id": 304038, "name": "Programmazione di sistema", "shortcode": "01GRSYG",
                  "year": 2027, "modules": [{"id": 304038, "name": "Programmazione di sistema",
@@ -98,7 +125,7 @@ class Fake(BaseHTTPRequestHandler):
                 return
             return self.reply(200, {"data": STATE["assignments"].get(int(match[1]), [])})
         if self.path == "/api/_state":
-            return self.reply(200, {"uploads": STATE["uploads"],
+            return self.reply(200, {"uploads": STATE["uploads"], "switches": STATE.get("switches", []),
                                     "assignments": STATE["assignments"],
                                     "logins": [{k: v for k, v in login.items() if k != "password"}
                                                for login in STATE["logins"]]})
